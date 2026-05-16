@@ -1,0 +1,353 @@
+{
+  "entities": {
+    "Material": {
+      "title": "Material",
+      "description": "Scrap metal material with pricing information.",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "description": "Unique material code (e.g., C1)" },
+        "name": { "type": "string", "description": "Material name (e.g., Copper #1)" },
+        "category": { "type": "string", "description": "Category (e.g., Ferrous, Non-Ferrous)" },
+        "buyPrice": { "type": "number", "description": "Current price per unit for buying" },
+        "salePrice": { "type": "number", "description": "Current price per unit for selling" },
+        "unit": { "type": "string", "enum": ["lb", "ton"], "description": "Weight unit" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["code", "name", "category", "buyPrice", "unit"]
+    },
+    "Customer": {
+      "title": "Customer",
+      "description": "Customer selling scrap metal.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "businessName": { "type": "string" },
+        "phone": { "type": "string" },
+        "secondaryPhone": { "type": "string" },
+        "email": { "type": "string" },
+        "address": { "type": "string" },
+        "idImageUrl": { "type": "string" },
+        "photoUrl": { "type": "string" },
+        "idType": { "type": "string", "description": "Type of ID (e.g., Driver License)" },
+        "idNumber": { "type": "string" },
+        "idExpiration": { "type": "string" },
+        "customerType": { "type": "string", "enum": ["individual", "business"] },
+        "verifiedStatus": { "type": "string", "enum": ["unverified", "verified"] },
+        "notes": { "type": "string" },
+        "isBuyer": { "type": "boolean", "description": "Whether this customer is a buyer for invoices" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name"]
+    },
+    "BuyTicket": {
+      "title": "Buy Ticket",
+      "description": "Record of a purchase from a customer.",
+      "type": "object",
+      "properties": {
+        "customerId": { "type": "string" },
+        "materials": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "materialId": { "type": "string" },
+              "grossWeight": { "type": "number" },
+              "tareWeight": { "type": "number" },
+              "netWeight": { "type": "number" },
+              "pricePerUnit": { "type": "number" },
+              "totalAmount": { "type": "number" }
+            }
+          }
+        },
+        "totalAmount": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "completed", "cancelled", "voided"] },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "vehiclePlate": { "type": "string" },
+        "vehicleYear": { "type": "string" },
+        "vehicleMake": { "type": "string" },
+        "vehicleModel": { "type": "string" },
+        "sellerAffirmed": { "type": "boolean" },
+        "paymentMethod": { "type": "string" },
+        "notes": { "type": "string" },
+        "customerPhotoUrl": { "type": "string" },
+        "idImageUrl": { "type": "string" }
+      },
+      "required": ["customerId", "materials", "totalAmount", "status", "timestamp"]
+    },
+    "TripTicket": {
+      "title": "Trip Ticket (BOL)",
+      "description": "Record of an outgoing shipment.",
+      "type": "object",
+      "properties": {
+        "destination": { "type": "string" },
+        "driver": { "type": "string" },
+        "vehicle": { "type": "string" },
+        "carrier": { "type": "string" },
+        "trailerNumber": { "type": "string" },
+        "sealNumber": { "type": "string" },
+        "bolNumber": { "type": "string" },
+        "buyerAddress": { "type": "string" },
+        "buyerPhone": { "type": "string" },
+        "materials": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "materialId": { "type": "string" },
+              "weight": { "type": "number" },
+              "salePrice": { "type": "number" },
+              "customName": { "type": "string", "description": "Optional custom name for this material on the document" }
+            }
+          }
+        },
+        "status": { "type": "string", "enum": ["in-transit", "delivered", "cancelled"] },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "notes": { "type": "string" },
+        "invoiceId": { "type": "string" },
+        "invoiceStatus": { "type": "string", "enum": ["pending", "matched", "disputed", "invoiced"] },
+        "totalWeight": { "type": "number" },
+        "totalValue": { "type": "number" }
+      },
+      "required": ["destination", "driver", "vehicle", "materials", "status", "timestamp"]
+    },
+    "Inventory": {
+      "title": "Inventory",
+      "description": "Real-time weight tracking for materials.",
+      "type": "object",
+      "properties": {
+        "materialId": { "type": "string" },
+        "currentWeight": { "type": "number" },
+        "lastUpdated": { "type": "string", "format": "date-time" }
+      },
+      "required": ["materialId", "currentWeight"]
+    },
+    "DoNotBuyEntry": {
+      "title": "Do-Not-Buy Entry",
+      "description": "Information about a person who is prohibited from selling scrap metal.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "idNumber": { "type": "string" },
+        "reason": { "type": "string" },
+        "addedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "idNumber"]
+    },
+    "User": {
+      "title": "User",
+      "description": "App user with role-based access and granular permissions.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["manager", "cashier"] },
+        "displayName": { "type": "string" },
+        "managerPin": { "type": "string", "description": "4-digit security PIN" },
+        "permissions": {
+          "type": "object",
+          "properties": {
+            "canManagePrices": { "type": "boolean" },
+            "canManageUsers": { "type": "boolean" },
+            "canVoidTickets": { "type": "boolean" },
+            "canDeleteData": { "type": "boolean" },
+            "canManageInventory": { "type": "boolean" },
+            "canGenerateReports": { "type": "boolean" },
+            "canManageInvoices": { "type": "boolean" },
+            "canManageCash": { "type": "boolean" },
+            "canApproveChanges": { "type": "boolean" }
+          }
+        }
+      },
+      "required": ["email", "role"]
+    },
+    "CashSession": {
+      "title": "Cash Session",
+      "description": "Daily cash reconciliation record.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "status": { "type": "string", "enum": ["open", "closed"] },
+        "openingCash": { "type": "number" },
+        "expectedCash": { "type": "number" },
+        "actualCash": { "type": "number" },
+        "overShort": { "type": "number" },
+        "openedAt": { "type": "string", "format": "date-time" },
+        "openedBy": { "type": "string" },
+        "closedAt": { "type": "string", "format": "date-time" },
+        "closedBy": { "type": "string" },
+        "notes": { "type": "string" }
+      },
+      "required": ["date", "status", "openingCash", "expectedCash", "openedAt", "openedBy"]
+    },
+    "CashTransaction": {
+      "title": "Cash Transaction",
+      "description": "A manual cash movement (inflow or expense) within a session.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string" },
+        "type": { "type": "string", "enum": ["inflow", "expense"] },
+        "category": { "type": "string" },
+        "amount": { "type": "number" },
+        "notes": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "performedBy": { "type": "string" }
+      },
+      "required": ["sessionId", "type", "category", "amount", "timestamp", "performedBy"]
+    },
+    "PricingSnapshot": {
+      "title": "Pricing Snapshot",
+      "description": "A snapshot of material prices at a specific point in time.",
+      "type": "object",
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" },
+        "source": { "type": "string", "enum": ["manual", "google_sheets"] },
+        "sheetId": { "type": "string" },
+        "prices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "materialId": { "type": "string" },
+              "materialName": { "type": "string" },
+              "buyPrice": { "type": "number" },
+              "salePrice": { "type": "number" }
+            }
+          }
+        }
+      },
+      "required": ["timestamp", "createdBy", "source", "prices"]
+    },
+    "SystemLog": {
+      "title": "System Log",
+      "description": "Error logs and system events for debugging.",
+      "type": "object",
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "level": { "type": "string", "enum": ["error", "warn", "info"] },
+        "message": { "type": "string" },
+        "details": { "type": "string" },
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "operationType": { "type": "string" },
+        "path": { "type": "string" }
+      },
+      "required": ["timestamp", "level", "message"]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "description": "Financial document for outbound shipments.",
+      "type": "object",
+      "properties": {
+        "invoiceNumber": { "type": "string" },
+        "tripTicketId": { "type": "string" },
+        "buyerName": { "type": "string" },
+        "buyerAddress": { "type": "string" },
+        "buyerPhone": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "dueDate": { "type": "string", "format": "date-time" },
+        "materials": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "materialId": { "type": "string" },
+              "weight": { "type": "number" },
+              "salePrice": { "type": "number" },
+              "customName": { "type": "string", "description": "Optional custom name for this material on the document" }
+            }
+          }
+        },
+        "totalWeight": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "paymentTerms": { "type": "string", "description": "Payment terms (e.g., Net 30, Due on Receipt)" },
+        "status": { "type": "string", "enum": ["draft", "sent", "paid", "overdue"] },
+        "notes": { "type": "string" }
+      },
+      "required": ["invoiceNumber", "buyerName", "date", "dueDate", "materials", "totalWeight", "totalAmount", "status"]
+    },
+    "ComplianceSubmission": {
+      "title": "Compliance Submission",
+      "description": "Log of automated DHS/LEADS reporting submissions.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "submittedBy": { "type": "string" },
+        "status": { "type": "string", "enum": ["success", "failed"] },
+        "ticketCount": { "type": "number" },
+        "responseMessage": { "type": "string" },
+        "payloadText": { "type": "string" }
+      },
+      "required": ["date", "timestamp", "submittedBy", "status", "ticketCount", "payloadText"]
+    },
+    "UserSession": {
+      "title": "User Session",
+      "description": "Active and historical login sessions.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "displayName": { "type": "string" },
+        "hardwareId": { "type": "string" },
+        "userAgent": { "type": "string" },
+        "loginAt": { "type": "string", "format": "date-time" },
+        "lastActiveAt": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["active", "expired", "logout"] }
+      },
+      "required": ["userId", "userEmail", "loginAt", "lastActiveAt", "status"]
+    },
+    "UserInvite": {
+      "title": "User Invite",
+      "description": "Tokens for authorizing new user registration.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["manager", "cashier"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "used": { "type": "boolean" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["role", "createdAt", "expiresAt", "used", "createdBy"]
+    },
+    "SystemConfig": {
+      "title": "System Configuration",
+      "description": "Global application state and settings.",
+      "type": "object",
+      "properties": {
+        "maintenanceMode": { "type": "boolean" },
+        "maintenanceMessage": { "type": "string" },
+        "currentVersion": { "type": "string" },
+        "minSupportedVersion": { "type": "string" },
+        "lastUpdated": { "type": "string", "format": "date-time" },
+        "announcement": {
+          "type": "object",
+          "properties": {
+            "message": { "type": "string" },
+            "type": { "type": "string", "enum": ["info", "warning", "error"] },
+            "active": { "type": "boolean" }
+          }
+        }
+      },
+      "required": ["maintenanceMode", "currentVersion", "lastUpdated"]
+    }
+  },
+  "firestore": {
+    "/materials/{materialId}": { "schema": "Material", "description": "Material definitions and pricing" },
+    "/customers/{customerId}": { "schema": "Customer", "description": "Customer database" },
+    "/buyTickets/{ticketId}": { "schema": "BuyTicket", "description": "Purchase records" },
+    "/tripTickets/{ticketId}": { "schema": "TripTicket", "description": "Shipping records" },
+    "/inventory/{materialId}": { "schema": "Inventory", "description": "Current stock levels" },
+    "/users/{userId}": { "schema": "User", "description": "User profiles and roles" },
+    "/doNotBuyList/{entryId}": { "schema": "DoNotBuyEntry", "description": "Prohibited sellers list" },
+    "/pricingSnapshots/{snapshotId}": { "schema": "PricingSnapshot", "description": "Historical snapshots of material prices" },
+    "/systemLogs/{logId}": { "schema": "SystemLog", "description": "System error logs and events" },
+    "/invoices/{invoiceId}": { "schema": "Invoice", "description": "Outbound shipment invoices" },
+    "/complianceSubmissions/{submissionId}": { "schema": "ComplianceSubmission", "description": "Automated compliance report submissions" },
+    "/userSessions/{sessionId}": { "schema": "UserSession", "description": "Tracking active and historical login sessions" },
+    "/userInvites/{inviteId}": { "schema": "UserInvite", "description": "Security tokens for inviting new users" },
+    "/cashSessions/{sessionId}": { "schema": "CashSession", "description": "Daily cash reconciliation sessions" },
+    "/cashTransactions/{transactionId}": { "schema": "CashTransaction", "description": "Manual cash transactions (bank runs, expenses)" },
+    "/system/config": { "schema": "SystemConfig", "description": "Global system configuration document" }
+  }
+}

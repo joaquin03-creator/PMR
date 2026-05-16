@@ -1,0 +1,418 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: materials
+    // Fields: name (string), category (string), buyPrice (number), salePrice (number), unit (string), updatedAt (timestamp)
+    //
+    // Collection: customers
+    // Fields: name (string), phone (string), address (string), idImageUrl (string), notes (string), createdAt (timestamp)
+    //
+    // Collection: buyTickets
+    // Fields: customerId (string), materials (array of maps), totalAmount (number), status (string), timestamp (string)
+    //
+    // Collection: tripTickets
+    // Fields: destination (string), driver (string), vehicle (string), materials (array of maps), status (string), timestamp (string)
+    //
+    // Collection: inventory
+    // Fields: materialId (string), currentWeight (number), lastUpdated (timestamp)
+    //
+    // Collection: users
+    // Fields: email (string), role (string), displayName (string)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Pricing Snapshots
+    match /pricingSnapshots/{snapshotId} {
+      allow read: if isAuthenticated() && (isManager() || isCashier());
+      allow create: if canManagePrices() && isValidSnapshot(request.resource.data);
+      allow update: if false;
+      allow delete: if canDeleteData();
+    }
+
+    match /systemLogs/{logId} {
+      allow create: if isAuthenticated();
+      allow read: if canGenerateReports();
+      allow update: if false;
+      allow delete: if canDeleteData();
+    }
+
+    match /auditLogs/{logId} {
+      allow read: if canGenerateReports();
+      allow create: if isAuthenticated();
+      allow update: if false;
+      allow delete: if canDeleteData();
+    }
+
+    // Helper Functions
+    // ===============================================================
+    // Ensure uid field is not modified on update
+    function uidNotModified() {
+       return !('uid' in request.resource.data) ||
+         request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasRequiredFields(fields) {
+       return request.resource.data.keys().hasAll(fields);
+    }
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isManager() {
+      return isAuthenticated() && (
+        request.auth.token.email == "joaquinrodriguez3333@gmail.com" ||
+        request.auth.token.email == "joaquin03@icloud.com" ||
+        request.auth.token.email == "admin@preferredmetals.com" ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'manager')
+      );
+    }
+
+    function hasPermission(perm) {
+      return isManager() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().permissions.get(perm, false) == true;
+    }
+
+    function canManagePrices() { return hasPermission('canManagePrices'); }
+    function canManageUsers() { return hasPermission('canManageUsers'); }
+    function canVoidTickets() { return hasPermission('canVoidTickets'); }
+    function canDeleteData() { return hasPermission('canDeleteData'); }
+    function canManageInventory() { return hasPermission('canManageInventory'); }
+    function canGenerateReports() { return hasPermission('canGenerateReports'); }
+    function canManageInvoices() { return hasPermission('canManageInvoices'); }
+    function canManageCash() { return hasPermission('canManageCash'); }
+
+    function isCashier() {
+      let path = /databases/$(database)/documents/users/$(request.auth.uid);
+      return isAuthenticated() && exists(path) && get(path).data.role == 'cashier';
+    }
+
+    function isStaff() {
+      return isManager() || isCashier();
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidSnapshot(data) {
+      return hasRequiredFields(['timestamp', 'createdBy', 'source', 'prices']) &&
+             data.timestamp is string &&
+             data.createdBy is string &&
+             data.source in ['manual', 'google_sheets'] &&
+             data.prices is list &&
+             data.prices.size() > 0;
+    }
+
+    function isValidMaterial(data) {
+      return data.keys().hasAll(['code', 'name', 'category', 'buyPrice', 'salePrice', 'unit']) &&
+             data.code is string && data.code.size() > 0 && data.code.size() <= 50 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.category is string && data.category.size() > 0 && data.category.size() <= 100 &&
+             data.buyPrice is number && data.buyPrice >= 0 &&
+             data.salePrice is number && data.salePrice >= 0 &&
+             data.unit in ['lb', 'ton'] &&
+             (!('description' in data) || (data.description is string && data.description.size() <= 1000)) &&
+             (!('updatedAt' in data) || (data.updatedAt is string || data.updatedAt is timestamp));
+    }
+
+    function isValidCustomer(data) {
+      return data.keys().hasAll(['name']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             (!('businessName' in data) || (data.businessName is string && data.businessName.size() <= 200)) &&
+             (!('phone' in data) || (data.phone is string && data.phone.size() <= 50)) &&
+             (!('secondaryPhone' in data) || (data.secondaryPhone is string && data.secondaryPhone.size() <= 50)) &&
+             (!('email' in data) || (data.email is string && data.email.size() <= 200)) &&
+             (!('address' in data) || (data.address is string && data.address.size() <= 500)) &&
+             (!('idImageUrl' in data) || (data.idImageUrl is string && data.idImageUrl.size() <= 2000)) &&
+             (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 2000)) &&
+             (!('idType' in data) || (data.idType is string && data.idType.size() <= 100)) &&
+             (!('idNumber' in data) || (data.idNumber is string && data.idNumber.size() <= 100)) &&
+             (!('idExpiration' in data) || (data.idExpiration is string && data.idExpiration.size() <= 50)) &&
+             (!('customerType' in data) || (data.customerType in ['individual', 'business'])) &&
+             (!('verifiedStatus' in data) || (data.verifiedStatus in ['unverified', 'verified'])) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('isBuyer' in data) || (data.isBuyer is bool)) &&
+             (!('createdAt' in data) || (data.createdAt is string || data.createdAt is timestamp));
+    }
+
+    function isValidBuyTicket(data) {
+      return data.keys().hasAll(['customerId', 'materials', 'totalAmount', 'status', 'timestamp']) &&
+             data.customerId is string &&
+             data.materials is list &&
+             data.materials.size() > 0 && data.materials.size() <= 100 &&
+             data.totalAmount is number && data.totalAmount >= 0 &&
+             data.status in ['pending', 'completed', 'cancelled', 'voided'] &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             (!('vehiclePlate' in data) || (data.vehiclePlate is string && data.vehiclePlate.size() <= 50)) &&
+             (!('vehicleYear' in data) || (data.vehicleYear is string && data.vehicleYear.size() <= 10)) &&
+             (!('vehicleMake' in data) || (data.vehicleMake is string && data.vehicleMake.size() <= 100)) &&
+             (!('vehicleModel' in data) || (data.vehicleModel is string && data.vehicleModel.size() <= 100)) &&
+             (!('sellerAffirmed' in data) || (data.sellerAffirmed is bool)) &&
+             (!('vehicleType' in data) || (data.vehicleType is string && data.vehicleType.size() <= 100)) &&
+             (!('paymentMethod' in data) || (data.paymentMethod is string && data.paymentMethod.size() <= 50)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('customerPhotoUrl' in data) || (data.customerPhotoUrl is string && data.customerPhotoUrl.size() <= 2000)) &&
+             (!('signatureUrl' in data) || (data.signatureUrl is string && data.signatureUrl.size() <= 50000)) &&
+             (!('idImageUrl' in data) || (data.idImageUrl is string && data.idImageUrl.size() <= 2000));
+    }
+
+    function isValidTripTicket(data) {
+      return data.keys().hasAll(['destination', 'driver', 'vehicle', 'materials', 'status', 'timestamp']) &&
+             data.destination is string && data.destination.size() > 0 && data.destination.size() <= 200 &&
+             data.driver is string && data.driver.size() > 0 && data.driver.size() <= 200 &&
+             data.vehicle is string && data.vehicle.size() > 0 && data.vehicle.size() <= 100 &&
+             data.materials is list && data.materials.size() > 0 && data.materials.size() <= 100 &&
+             data.status in ['in-transit', 'delivered', 'cancelled', 'voided'] &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             (!('carrier' in data) || (data.carrier is string && data.carrier.size() <= 200)) &&
+             (!('trailerNumber' in data) || (data.trailerNumber is string && data.trailerNumber.size() <= 100)) &&
+             (!('sealNumber' in data) || (data.sealNumber is string && data.sealNumber.size() <= 100)) &&
+             (!('bolNumber' in data) || (data.bolNumber is string && data.bolNumber.size() <= 100)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('invoiceStatus' in data) || (data.invoiceStatus in ['pending', 'matched', 'disputed', 'invoiced'])) &&
+             (!('invoiceId' in data) || (data.invoiceId is string)) &&
+             (!('totalWeight' in data) || (data.totalWeight is number)) &&
+             (!('totalValue' in data) || (data.totalValue is number)) &&
+             (!('buyerAddress' in data) || (data.buyerAddress is string && data.buyerAddress.size() <= 500)) &&
+             (!('buyerPhone' in data) || (data.buyerPhone is string && data.buyerPhone.size() <= 50));
+    }
+
+    function isValidInventory(data) {
+      return data.keys().hasAll(['materialId', 'currentWeight', 'lastUpdated']) &&
+             data.materialId is string &&
+             data.currentWeight is number &&
+             (data.lastUpdated is string || data.lastUpdated is timestamp);
+    }
+
+    function isValidDailySnapshot(data) {
+      return data.keys().hasAll(['date', 'timestamp', 'createdBy', 'materials', 'inventory', 'summary']) &&
+             data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             data.createdBy is string &&
+             data.materials is list &&
+             data.inventory is list &&
+             data.summary is map &&
+             data.summary.keys().hasAll(['totalBuyTickets', 'totalBuyAmount', 'totalBuyWeight', 'totalTripTickets', 'totalTripWeight', 'totalInvoices', 'totalInvoiceAmount']);
+    }
+
+    function isValidDoNotBuyEntry(data) {
+      return data.keys().hasAll(['name', 'reason']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.reason is string && data.reason.size() <= 2000;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'role', 'displayName']) &&
+             data.email is string &&
+             data.role in ['manager', 'cashier'] &&
+             data.displayName is string &&
+             (!('managerPin' in data) || (data.managerPin is string && data.managerPin.size() == 4)) &&
+             (!('permissions' in data) || (
+               data.permissions is map &&
+               data.permissions.get('canManagePrices', false) is bool &&
+               data.permissions.get('canManageUsers', false) is bool &&
+               data.permissions.get('canVoidTickets', false) is bool &&
+               data.permissions.get('canDeleteData', false) is bool &&
+               data.permissions.get('canManageInventory', false) is bool &&
+               data.permissions.get('canGenerateReports', false) is bool &&
+               data.permissions.get('canManageInvoices', false) is bool &&
+               data.permissions.get('canManageCash', false) is bool &&
+               data.permissions.get('canApproveChanges', false) is bool
+             ));
+    }
+
+    function isValidCashSession(data) {
+      return data.keys().hasAll(['date', 'status', 'openingCash', 'expectedCash', 'openedAt', 'openedBy']) &&
+             data.date is string &&
+             data.status in ['open', 'closed'] &&
+             data.openingCash is number &&
+             data.expectedCash is number &&
+             (data.openedAt is string || data.openedAt is timestamp) &&
+             data.openedBy is string &&
+             (!('actualCash' in data) || data.actualCash is number) &&
+             (!('overShort' in data) || data.overShort is number) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('closedAt' in data) || (data.closedAt is string || data.closedAt is timestamp)) &&
+             (!('closedBy' in data) || data.closedBy is string);
+    }
+
+    function isValidCashTransaction(data) {
+      return data.keys().hasAll(['sessionId', 'type', 'category', 'amount', 'timestamp', 'performedBy']) &&
+             data.sessionId is string &&
+             data.type in ['inflow', 'expense'] &&
+             data.category is string &&
+             data.amount is number &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             data.performedBy is string &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
+    }
+
+    function isValidComplianceSubmission(data) {
+      return data.keys().hasAll(['date', 'timestamp', 'submittedBy', 'status', 'ticketCount', 'payloadText']) &&
+             data.date is string &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             data.submittedBy is string &&
+             data.status in ['success', 'failed'] &&
+             data.ticketCount is number &&
+             data.payloadText is string &&
+             (!('responseMessage' in data) || (data.responseMessage is string && data.responseMessage.size() <= 2000));
+    }
+
+    function isValidInvoice(data) {
+      return data.keys().hasAll(['invoiceNumber', 'buyerName', 'date', 'dueDate', 'materials', 'totalWeight', 'totalAmount', 'status']) &&
+             data.invoiceNumber is string && data.invoiceNumber.size() > 0 && data.invoiceNumber.size() <= 100 &&
+             (!('tripTicketId' in data) || (data.tripTicketId is string)) &&
+             data.buyerName is string && data.buyerName.size() > 0 && data.buyerName.size() <= 200 &&
+             data.date is string &&
+             data.dueDate is string &&
+             data.materials is list && data.materials.size() <= 100 &&
+             data.totalWeight is number &&
+             data.totalAmount is number &&
+             data.status in ['draft', 'sent', 'paid', 'overdue'] &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('paymentTerms' in data) || (data.paymentTerms is string && data.paymentTerms.size() <= 100)) &&
+             (!('buyerAddress' in data) || (data.buyerAddress is string && data.buyerAddress.size() <= 500)) &&
+             (!('buyerPhone' in data) || (data.buyerPhone is string && data.buyerPhone.size() <= 50));
+    }
+
+    function isValidUserSession(data) {
+      return data.keys().hasAll(['userId', 'userEmail', 'loginAt', 'lastActiveAt', 'status']) &&
+             data.userId is string &&
+             data.userEmail is string &&
+             (data.loginAt is string || data.loginAt is timestamp) &&
+             (data.lastActiveAt is string || data.lastActiveAt is timestamp) &&
+             data.status in ['active', 'expired', 'logout'] &&
+             (!('displayName' in data) || (data.displayName is string)) &&
+             (!('hardwareId' in data) || (data.hardwareId is string)) &&
+             (!('userAgent' in data) || (data.userAgent is string));
+    }
+
+    function isValidUserInvite(data) {
+      return data.keys().hasAll(['role', 'createdAt', 'expiresAt', 'used', 'createdBy']) &&
+             data.role in ['manager', 'cashier'] &&
+             (data.createdAt is string || data.createdAt is timestamp) &&
+             (data.expiresAt is string || data.expiresAt is timestamp) &&
+             data.used is bool &&
+             data.createdBy is string &&
+             (!('email' in data) || (data.email is string));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /system/config {
+      allow read: if true; 
+      allow write: if isManager();
+    }
+
+    match /userInvites/{inviteId} {
+      allow get: if isAuthenticated();
+      allow list: if isAuthenticated() && isManager();
+      allow create: if isManager() && isValidUserInvite(request.resource.data);
+      allow update: if isAuthenticated() && (
+        isManager() || 
+        (request.resource.data.used == true && resource.data.used == false && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['used']))
+      ) && isValidUserInvite(request.resource.data);
+      allow delete: if isManager();
+    }
+
+    match /userSessions/{sessionId} {
+      allow read: if isAuthenticated() && (request.auth.uid == resource.data.userId || canGenerateReports() || canManageUsers());
+      allow create: if isAuthenticated() && request.auth.uid == request.resource.data.userId && isValidUserSession(request.resource.data);
+      allow update: if isAuthenticated() && (request.auth.uid == resource.data.userId || canManageUsers()) && isValidUserSession(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || canManageUsers());
+      allow create: if isAuthenticated() && (request.auth.uid == userId || canManageUsers()) && isValidUser(request.resource.data);
+      allow update: if isAuthenticated() && (canManageUsers() || (request.auth.uid == userId && request.resource.data.role == resource.data.role && isValidUser(request.resource.data)));
+    }
+
+    match /materials/{materialId} {
+      allow read: if isAuthenticated();
+      allow write: if canManagePrices() && isValidMaterial(request.resource.data);
+    }
+
+    match /customers/{customerId} {
+      allow read: if isStaff();
+      allow create: if isStaff() && isValidCustomer(request.resource.data);
+      allow update: if isStaff() && isValidCustomer(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /buyTickets/{ticketId} {
+      allow read: if isStaff();
+      allow create: if isStaff() && isValidBuyTicket(request.resource.data);
+      allow update: if (canVoidTickets() || isManager()) && isValidBuyTicket(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /tripTickets/{ticketId} {
+      allow read: if isStaff();
+      allow create: if isStaff() && isValidTripTicket(request.resource.data);
+      allow update: if (canVoidTickets() || isManager()) && isValidTripTicket(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /invoices/{invoiceId} {
+      allow read: if isStaff();
+      allow create: if canManageInvoices() && isValidInvoice(request.resource.data);
+      allow update: if canManageInvoices() && isValidInvoice(request.resource.data) &&
+                    request.resource.data.invoiceNumber == resource.data.invoiceNumber;
+      allow delete: if canDeleteData();
+    }
+
+    match /inventory/{materialId} {
+      allow read: if isStaff();
+      allow create, update: if (canManageInventory() || isStaff()) && isValidInventory(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /dailySnapshots/{snapshotId} {
+      allow read: if canGenerateReports();
+      allow create: if canGenerateReports() && isValidDailySnapshot(request.resource.data);
+      allow update: if false;
+      allow delete: if canDeleteData();
+    }
+
+    match /doNotBuyList/{entryId} {
+      allow read: if isStaff();
+      allow create: if canManageUsers() && isValidDoNotBuyEntry(request.resource.data);
+      allow update: if canManageUsers() && isValidDoNotBuyEntry(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /complianceSubmissions/{submissionId} {
+      allow read: if canGenerateReports();
+      allow create: if canGenerateReports() && isValidComplianceSubmission(request.resource.data);
+      allow update: if false;
+      allow delete: if canDeleteData();
+    }
+
+    match /cashSessions/{sessionId} {
+      allow read: if isStaff();
+      allow create: if canManageCash() && isValidCashSession(request.resource.data);
+      allow update: if canManageCash() && isValidCashSession(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /cashTransactions/{transactionId} {
+      allow read: if isStaff();
+      allow create: if canManageCash() && isValidCashTransaction(request.resource.data);
+      allow update: if canManageCash() && isValidCashTransaction(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+  }
+}

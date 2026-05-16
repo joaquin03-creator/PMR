@@ -1,0 +1,7 @@
+{
+  "name": "Preferred Metals & Recycling",
+  "description": "Professional scrap metal yard management system for buying, selling, inventory tracking, and logistics.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

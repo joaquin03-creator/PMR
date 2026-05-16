@@ -1,0 +1,28 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Helper function to check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper function to check if the user is a staff member (manager or cashier)
+    function isStaff() {
+      return isAuthenticated() && 
+        (firestore.exists(/databases/(default)/documents/users/$(request.auth.uid)) &&
+         (firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'manager' ||
+          firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'cashier'));
+    }
+
+    // Customer ID images are highly sensitive
+    match /customer-ids/{allPaths=**} {
+      // Only authenticated staff members can read or write ID images
+      allow read, write: if isStaff();
+    }
+
+    // Default deny for everything else
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
