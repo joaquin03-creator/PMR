@@ -1139,37 +1139,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
         </div>
       )}
 
-      {/* Print Styles */}
-      <style>{`
-        @media print {
-          @page {
-            size: letter;
-            margin: 0.5in;
-          }
-          body * { visibility: hidden; }
-          .print-ticket, .print-ticket * { visibility: visible; }
-          .print-ticket { 
-            position: absolute; 
-            left: 0; 
-            top: 0; 
-            right: 0;
-            width: 100% !important; 
-            height: auto !important;
-            max-height: 10.5in;
-            padding: 0;
-            box-shadow: none !important;
-            border: none !important;
-            margin: 0 !important;
-          }
-          .no-print { display: none !important; }
-          
-          /* Force single page */
-          html, body {
-            height: 100%;
-            overflow: hidden;
-          }
-        }
-      `}</style>
+      {/* Print Styles moved to index.css */}
     </div>
   );
 }

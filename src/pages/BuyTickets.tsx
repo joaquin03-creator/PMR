@@ -1470,13 +1470,7 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
         </div>
       )}
 
-      {/* Print Styles */}
-      <style>{`
-        @media print {
-          /* Everything else is handled by global index.css layer utilities */
-          .print-ticket { display: block !important; visibility: visible !important; }
-        }
-      `}</style>
+      {/* Print Styles moved to index.css */}
     </main>
   );
 }

@@ -19,39 +19,76 @@
   .print-template { display: none; }
   
   @media print {
-    @page {
-      size: landscape;
-      margin: 0.5in;
+    @page { 
+      margin: 0; 
+      size: auto; 
     }
-
-    body {
+    
+    html, body {
+      height: auto !important;
+      min-height: 100% !important;
+      overflow: visible !important;
       background: white !important;
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
+      margin: 0 !important;
+      padding: 0 !important;
     }
 
+    /* Hide EVERYTHING normally */
     body * {
-      visibility: hidden !important;
+      visibility: hidden;
     }
 
-    #printable-invoice, #printable-invoice * {
+    /* Reset layout constraints on all ancestors safely so absolute positioning anchors to body */
+    * {
+      transform: none !important;
+      transition: none !important;
+      animation: none !important;
+    }
+    
+    /* Show only the printable components */
+    .print-ticket, .print-ticket *,
+    .print-template, .print-template *,
+    #printable-invoice, #printable-invoice *,
+    .bol-container, .bol-container * {
       visibility: visible !important;
     }
 
-    #printable-invoice {
+    /* Remove clipping from common modal patterns */
+    .fixed, .absolute, .overflow-y-auto, .overflow-hidden, dialog, [role="dialog"] {
       position: static !important;
+      overflow: visible !important;
+      max-height: none !important;
+      height: auto !important;
+    }
+
+    /* Detach printable items and place them at top-left */
+    .print-ticket,
+    .print-template,
+    #printable-invoice,
+    .bol-container {
+      position: absolute !important;
+      top: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      margin: 0 !important;
+      padding: 0.5in !important;
       width: 100% !important;
       max-width: none !important;
       height: auto !important;
-      display: block !important;
+      min-height: 100vh !important;
       background: white !important;
-      margin: 0 !important;
-      padding: 0 !important;
-      box-sizing: border-box !important;
+      box-shadow: none !important;
+      border: none !important;
       overflow: visible !important;
     }
-
-    .no-print {
+    
+    /* Ensure no-print items inside printable containers stay hidden */
+    .no-print, .no-print * {
       display: none !important;
+      visibility: hidden !important;
     }
   }
-}
+} 
 
