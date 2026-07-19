@@ -24,6 +24,8 @@ export interface UserPermissions {
   canManageInvoices: boolean;
   canManageCash: boolean;
   canApproveChanges: boolean;
+  canOpenCloseSessions: boolean;
+  canRetroactivePriceAdjustments: boolean;
 }
 
 export interface UserProfile {
@@ -32,6 +34,7 @@ export interface UserProfile {
   role: UserRole;
   displayName?: string;
   managerPin?: string; // 4-digit PIN for approvals
+  cachedPassword?: string;
   permissions?: UserPermissions;
 }
 
@@ -68,6 +71,13 @@ export interface Customer {
   idExpiration?: string;
   verifiedStatus?: 'unverified' | 'verified' | 'restricted';
   customerType?: 'individual' | 'commercial' | 'industrial';
+  // Vehicle Fields for persistent profile preloading
+  vehiclePlate?: string;
+  vehicleType?: string;
+  vehicleYear?: string;
+  vehicleMake?: string;
+  vehicleModel?: string;
+  vehiclePhotoUrl?: string;
 }
 
 export interface BuyTicketMaterial {
@@ -105,13 +115,18 @@ export interface BuyTicket {
   vehiclePhotoUrl?: string; // Captured from Entrance Cam
   createdBy?: string;
   createdByName?: string;
+  ohioDatabaseStatus?: 'not_checked' | 'cleared' | 'flagged';
 }
 
 export interface TripTicketMaterial {
   materialId: string;
-  weight: number;
+  weight: number; // calculated net weight
   salePrice: number;
   customName?: string;
+  boxNumber?: string;
+  grossWeight?: number;
+  tareWeight?: number;
+  slotIndex?: number;
 }
 
 export interface TripTicket {
@@ -154,6 +169,7 @@ export interface Invoice {
   notes?: string;
   createdBy?: string;
   createdByName?: string;
+  loadPlanId?: string;
 }
 
 export interface InventoryItem {
@@ -161,6 +177,37 @@ export interface InventoryItem {
   materialId: string;
   currentWeight: number;
   lastUpdated: string;
+}
+
+export interface ExternalSale {
+  id: string;
+  materialId: string;
+  weight: number;
+  salePrice: number;
+  date: string;
+  notes?: string;
+  recordedAt: string;
+  recordedBy: string;
+}
+
+export interface LoadPlanBox {
+  slotIndex: number;
+  materialId?: string;
+  weight?: number;
+  notes?: string;
+}
+
+export interface LoadPlan {
+  id: string;
+  loadNumber: string;
+  date: string;
+  status: 'draft' | 'shipped' | 'cancelled';
+  carrier?: string;
+  notes?: string;
+  boxes: LoadPlanBox[];
+  totalWeight: number;
+  recordedAt: string;
+  recordedBy: string;
 }
 
 export interface DoNotBuyEntry {
@@ -173,9 +220,9 @@ export interface DoNotBuyEntry {
 
 export interface AuditLog {
   id: string;
-  entityType: 'material' | 'customer' | 'buyTicket' | 'tripTicket' | 'invoice' | 'inventory' | 'settings';
+  entityType: 'material' | 'customer' | 'buyTicket' | 'tripTicket' | 'invoice' | 'inventory' | 'settings' | 'cashDrawer' | 'cashTransaction' | 'externalSale' | 'loadPlan';
   entityId: string;
-  action: 'create' | 'update' | 'delete' | 'sync' | 'optimize';
+  action: 'create' | 'update' | 'delete' | 'sync' | 'optimize' | 'void' | 'override' | 'adjustment' | 'open' | 'close';
   changes?: {
     before?: any;
     after: any;
@@ -272,6 +319,36 @@ export interface CashSession {
   closedAt?: string;
   closedBy?: string;
   notes?: string;
+  openingDenominations?: {
+    hundreds: number;
+    fifties: number;
+    twenties: number;
+    tens: number;
+    fives: number;
+    ones: number;
+    dollarCoins: number;
+    halfDollars: number;
+    quarters: number;
+    dimes: number;
+    nickels: number;
+  };
+  closingDenominations?: {
+    hundreds: number;
+    fifties: number;
+    twenties: number;
+    tens: number;
+    fives: number;
+    ones: number;
+    dollarCoins: number;
+    halfDollars: number;
+    quarters: number;
+    dimes: number;
+    nickels: number;
+  };
+  verificationStatus?: 'unverified' | 'verified' | 'disputed';
+  verifiedBy?: string;
+  verifiedAt?: string;
+  verificationComment?: string;
 }
 
 export interface CashTransaction {

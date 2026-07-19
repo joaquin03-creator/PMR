@@ -48,8 +48,11 @@ async function logToFirestore(errInfo: FirestoreErrorInfo) {
 }
 
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errMsg = error instanceof Error ? error.message : String(error);
+  const isQuotaError = errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('limit exceeded');
+
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: errMsg,
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
@@ -65,6 +68,11 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     },
     operationType,
     path
+  };
+  
+  if (isQuotaError) {
+    console.warn('Firestore Quota/Limit Exceeded (gracefully bypassed logging/throwing):', errMsg);
+    return;
   }
   
   console.error('Firestore Error: ', JSON.stringify(errInfo));

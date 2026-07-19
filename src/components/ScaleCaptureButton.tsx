@@ -10,18 +10,43 @@ interface ScaleCaptureButtonProps {
 
 export const ScaleCaptureButton: React.FC<ScaleCaptureButtonProps> = ({ onCapture }) => {
   const { settings } = useSettings();
+  const brandLabel = settings.cameraBrand === 'reolink' ? 'Reolink' : settings.cameraBrand === 'swann' ? 'Swann' : 'Network';
   const [isCapturing, setIsCapturing] = useState(false);
   const [isNetworkPull, setIsNetworkPull] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  const pullFromSwann = async () => {
-    if (!settings.swannCams.material) return;
+  const getCameraUrl = () => {
+    if (settings.cameraBrand === 'reolink') {
+      const nvrIp = settings.reolinkNvrIp || '';
+      const user = settings.reolinkUsername || 'admin';
+      const pass = settings.reolinkPassword || '';
+      
+      const channels = settings.reolinkChannels || [];
+      const scaleCam = channels.find(ch => ch.isEnabled && (ch.id === 'cam1' || ch.id === 'material' || ch.channel === 0 || ch.name.toLowerCase().includes('scale') || ch.name.toLowerCase().includes('material')));
+      
+      const channelNum = scaleCam ? scaleCam.channel : 0;
+      let base = nvrIp.trim();
+      if (!base) return '';
+      if (!base.startsWith('http://') && !base.startsWith('https://')) {
+        base = `http://${base}`;
+      }
+      return `${base}/cgi-bin/api.cgi?cmd=Snap&channel=${channelNum}&user=${user}&password=${pass}`;
+    }
+    return settings.swannCams.material;
+  };
+
+  const pullFromCameraUrl = async (cameraUrl: string) => {
     setIsNetworkPull(true);
     try {
-      const cacheBustUrl = `${settings.swannCams.material}${settings.swannCams.material.includes('?') ? '&' : '?'}_t=${Date.now()}`;
+      const connectionMode = settings.cameraConnectionMode || 'direct';
+      const actualFetchUrl = connectionMode === 'proxy' 
+        ? `/api/camera-proxy?url=${encodeURIComponent(cameraUrl)}`
+        : cameraUrl;
+
+      const cacheBustUrl = `${actualFetchUrl}${actualFetchUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
       const response = await fetch(cacheBustUrl);
-      if (!response.ok) throw new Error("Failed to pull from material cam");
+      if (!response.ok) throw new Error("Failed to pull from camera");
       const blob = await response.blob();
       const reader = new FileReader();
       reader.onloadend = () => {
@@ -33,17 +58,22 @@ export const ScaleCaptureButton: React.FC<ScaleCaptureButtonProps> = ({ onCaptur
       };
       reader.readAsDataURL(blob);
     } catch (err) {
-      console.error("Swann Material Cam Error:", err);
+      console.error("Network Camera Error:", err);
       // Fallback to local if network fails
-      startCapture();
+      await startCaptureWithUrl(cameraUrl);
     }
   };
 
   const startCapture = async () => {
-    if (settings.useSwannCams && settings.swannCams.material) {
-      await pullFromSwann();
+    const cameraUrl = getCameraUrl();
+    if (settings.useSwannCams && cameraUrl) {
+      await pullFromCameraUrl(cameraUrl);
       return;
     }
+    await startCaptureWithUrl(cameraUrl);
+  };
+
+  const startCaptureWithUrl = async (cameraUrl?: string) => {
 
     setIsCapturing(true);
     try {
@@ -154,7 +184,7 @@ export const ScaleCaptureButton: React.FC<ScaleCaptureButtonProps> = ({ onCaptur
           "flex items-center gap-2 px-5 py-3.5 rounded-2xl font-black text-xs uppercase tracking-wider transition-all shadow-sm border active:scale-95",
           active 
             ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed' 
-            : settings.useSwannCams && settings.swannCams.material
+            : settings.useSwannCams && getCameraUrl()
               ? 'bg-slate-900 text-white border-slate-800 hover:bg-black hover:shadow-md'
               : 'bg-blue-600 text-white border-blue-700 hover:bg-blue-700 hover:shadow-md'
         )}
@@ -162,19 +192,19 @@ export const ScaleCaptureButton: React.FC<ScaleCaptureButtonProps> = ({ onCaptur
         {active ? (
           <>
             <Loader2 className="w-4 h-4 animate-spin" />
-            <span>{isNetworkPull ? 'Accessing Swann Cam...' : 'Stabilizing...'}</span>
+            <span>{isNetworkPull ? `Accessing ${brandLabel} Cam...` : 'Stabilizing...'}</span>
           </>
         ) : (
           <>
             <div className="flex -space-x-1 items-center">
               <Scale className="w-4 h-4" />
-              {settings.useSwannCams && settings.swannCams.material ? (
+              {settings.useSwannCams && getCameraUrl() ? (
                 <Video className="w-4 h-4 text-emerald-400" />
               ) : (
                 <Camera className="w-4 h-4" />
               )}
             </div>
-            <span>{settings.useSwannCams && settings.swannCams.material ? 'Sync Swann & Scale' : 'Weight & Photo'}</span>
+            <span>{settings.useSwannCams && getCameraUrl() ? `Sync ${brandLabel} & Scale` : 'Weight & Photo'}</span>
           </>
         )}
       </button>

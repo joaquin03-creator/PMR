@@ -4,22 +4,44 @@ type Theme = 'light' | 'dark' | 'system';
 type FontSize = 'small' | 'medium' | 'large' | 'xl';
 type FontFamily = 'inter' | 'outfit' | 'mono';
 
-interface AppSettings {
+export interface NvrCamera {
+  id: string;
+  name: string;
+  channel: number;
+  isEnabled: boolean;
+}
+
+export interface AppSettings {
   theme: Theme;
   fontSize: FontSize;
   fontFamily: FontFamily;
   compactMode: boolean;
   autoPrint: boolean;
   debugPrintMode: boolean;
+  receiptFormat: 'letter' | 'thermal';
+  thermalWidth: '80mm' | '58mm';
+  thermalFont: 'mono' | 'sans';
+  thermalShowBarcode: boolean;
+  thermalPrintDensity: 'compact' | 'normal';
   scannerEnabled: boolean;
   scannerBridgeUrl: string;
   useSwannCams: boolean;
+  cameraConnectionMode?: 'direct' | 'proxy';
   companyLogo?: string;
+  cameraBrand?: 'swann' | 'reolink' | 'universal';
   swannCams: {
     material: string;
     customer: string;
     entrance: string;
   };
+  reolinkNvrIp?: string;
+  reolinkUsername?: string;
+  reolinkPassword?: string;
+  reolinkChannels?: NvrCamera[];
+  ohioScrapPortalUrl: string;
+  ohioScrapUsername: string;
+  ohioScrapPassword?: string;
+  ohioScrapDealerId?: string;
 }
 
 interface SettingsContextType {
@@ -35,15 +57,35 @@ const defaultSettings: AppSettings = {
   compactMode: false,
   autoPrint: true,
   debugPrintMode: false,
+  receiptFormat: 'letter',
+  thermalWidth: '80mm',
+  thermalFont: 'mono',
+  thermalShowBarcode: true,
+  thermalPrintDensity: 'normal',
   scannerEnabled: false,
   scannerBridgeUrl: 'http://localhost:16272/scan', // Common default port for some scan bridges
   useSwannCams: false,
+  cameraConnectionMode: 'direct',
   companyLogo: '',
+  cameraBrand: 'swann',
   swannCams: {
     material: '',
     customer: '',
     entrance: '',
   },
+  reolinkNvrIp: 'http://192.168.1.50:80',
+  reolinkUsername: 'admin',
+  reolinkPassword: '',
+  reolinkChannels: [
+    { id: 'cam1', name: 'Scale Cam (Ch 1)', channel: 0, isEnabled: true },
+    { id: 'cam2', name: 'Customer Face Cam (Ch 2)', channel: 1, isEnabled: true },
+    { id: 'cam3', name: 'Entrance/Vehicle Cam (Ch 3)', channel: 2, isEnabled: true },
+    { id: 'cam4', name: 'Yard Cam (Ch 4)', channel: 3, isEnabled: true },
+  ],
+  ohioScrapPortalUrl: 'https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList',
+  ohioScrapUsername: 'preferredmetalsrecycling@gmail.com',
+  ohioScrapPassword: '47301b0a2d61bdf1',
+  ohioScrapDealerId: '',
 };
 
 const SettingsContext = createContext<SettingsContextType | undefined>(undefined);
@@ -51,7 +93,33 @@ const SettingsContext = createContext<SettingsContextType | undefined>(undefined
 export function SettingsProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<AppSettings>(() => {
     const saved = localStorage.getItem('app_settings');
-    return saved ? { ...defaultSettings, ...JSON.parse(saved) } : defaultSettings;
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        // Migrate legacy/registration URLs to the new direct DoNotBuyList address
+        if (
+          !parsed.ohioScrapPortalUrl || 
+          parsed.ohioScrapPortalUrl === 'https://scrapmetal.dps.ohio.gov/' ||
+          parsed.ohioScrapPortalUrl.includes('IdentityManager/Login/Index')
+        ) {
+          parsed.ohioScrapPortalUrl = 'https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList';
+        }
+
+        // Fill in default credentials if they are currently blank in saved settings
+        if (!parsed.ohioScrapUsername || parsed.ohioScrapUsername.trim() === '') {
+          parsed.ohioScrapUsername = 'preferredmetalsrecycling@gmail.com';
+        }
+        if (!parsed.ohioScrapPassword || parsed.ohioScrapPassword.trim() === '') {
+          parsed.ohioScrapPassword = '47301b0a2d61bdf1';
+        }
+
+        return { ...defaultSettings, ...parsed };
+      } catch (err) {
+        console.error('Failed to parse app_settings', err);
+        return defaultSettings;
+      }
+    }
+    return defaultSettings;
   });
 
   useEffect(() => {

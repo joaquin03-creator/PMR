@@ -1,8 +1,10 @@
 import { useState, useEffect, useMemo } from 'react';
-import { db } from '../firebase';
+import { useSearchParams } from 'react-router-dom';
+import { auth, db } from '../firebase';
+import { useSettings } from '../context/SettingsContext';
 import { collection, onSnapshot, query, orderBy, doc, deleteDoc, updateDoc, increment, writeBatch } from 'firebase/firestore';
 import { BuyTicket, Customer, Material, UserProfile } from '../types';
-import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, handleImageError } from '../constants';
+import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
 import { 
   Search, 
@@ -27,8 +29,12 @@ import {
 import { cn } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import ManagerPinModal from '../components/ManagerPinModal';
+import { printTicket } from '../lib/printTicket';
+import { BuyTicketPrint } from '../components/BuyTicketPrint';
+import { logAuditEvent } from '../lib/audit';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
+  const { settings } = useSettings();
   const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
@@ -37,6 +43,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedTicket, setSelectedTicket] = useState<BuyTicket | null>(null);
   const [showPrintPreview, setShowPrintPreview] = useState(false);
+  const [printFormat, setPrintFormat] = useState<'letter' | 'thermal'>('letter');
+  
+  useEffect(() => {
+    if (settings.receiptFormat) {
+      setPrintFormat(settings.receiptFormat);
+    }
+  }, [settings.receiptFormat, showPrintPreview]);
+
   const [autoPrint, setAutoPrint] = useState(false);
   const [confirmAction, setConfirmAction] = useState<{ type: 'void' | 'delete', ticket: BuyTicket } | null>(null);
   const [notification, setNotification] = useState<{ type: 'success' | 'error', message: string } | null>(null);
@@ -46,6 +60,23 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     key: 'timestamp',
     direction: 'desc'
   });
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Handle URL deep linking for selecting a ticket
+  useEffect(() => {
+    const ticketId = searchParams.get('id');
+    if (ticketId && buyTickets.length > 0) {
+      const targetTicket = buyTickets.find(t => t.id === ticketId);
+      if (targetTicket) {
+        setSelectedTicket(targetTicket);
+        
+        // Clear search parameter so page behavior is normal after selecting
+        const newParams = new URLSearchParams(searchParams);
+        newParams.delete('id');
+        setSearchParams(newParams, { replace: true });
+      }
+    }
+  }, [searchParams, buyTickets, setSearchParams]);
 
   useEffect(() => {
     // Session tracking
@@ -59,6 +90,8 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
   }, [notification]);
 
   useEffect(() => {
+    if (!auth.currentUser) return;
+
     const unsubBuy = onSnapshot(
       query(collection(db, 'buyTickets'), orderBy('timestamp', 'desc')), 
       (snapshot) => {
@@ -77,28 +110,17 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'materials'));
 
     return () => {
-      unsubBuy();
-      unsubCustomers();
-      unsubMaterials();
+      try { unsubBuy(); } catch (e) { console.warn('unsubBuy error', e); }
+      try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
+      try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
     };
-  }, []);
+  }, [profile]);
 
   useEffect(() => {
     if (showPrintPreview && autoPrint) {
-      const timer = setTimeout(() => {
-        if (!settings.debugPrintMode) window.print();
-        setAutoPrint(false);
-        // Automatically close after auto-print starts
-        setTimeout(() => {
-          if (!settings.debugPrintMode) {
-            setShowPrintPreview(false);
-            setSelectedTicket(null);
-          }
-        }, 500);
-      }, 1000);
-      return () => clearTimeout(timer);
+      setAutoPrint(false);
     }
-  }, [showPrintPreview, autoPrint, settings.debugPrintMode]);
+  }, [showPrintPreview, autoPrint]);
 
   const getCustomerName = (id: string) => customers.find(c => c.id === id)?.name || 'Unknown Customer';
 
@@ -171,6 +193,19 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       }
       
       await batch.commit();
+      
+      // Track action in Audit Log
+      await logAuditEvent(
+        'buyTicket',
+        ticket.id,
+        'void',
+        {
+          before: { status: ticket.status || 'open' },
+          after: { status: 'voided' }
+        },
+        `Voided Buy Ticket #${ticket.id.toUpperCase()} (Total payout: $${ticket.totalAmount ? ticket.totalAmount.toFixed(2) : '0.00'})`
+      );
+
       setSelectedTicket(null);
       setConfirmAction(null);
       setNotification({ type: 'success', message: 'Ticket voided successfully. Inventory has been adjusted.' });
@@ -206,6 +241,19 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       batch.delete(doc(db, 'buyTickets', ticket.id));
       
       await batch.commit();
+
+      // Track action in Audit Log
+      await logAuditEvent(
+        'buyTicket',
+        ticket.id,
+        'delete',
+        {
+          before: ticket,
+          after: null
+        },
+        `Deleted Buy Ticket #${ticket.id.toUpperCase()} (Total payout was: $${ticket.totalAmount ? ticket.totalAmount.toFixed(2) : '0.00'})`
+      );
+
       setSelectedTicket(null);
       setConfirmAction(null);
       setNotification({ type: 'success', message: 'Ticket permanently deleted.' });
@@ -567,9 +615,6 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
           role="dialog"
           aria-modal="true"
           aria-labelledby="ticket-details-title"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setSelectedTicket(null);
-          }}
         >
           <div className="bg-white rounded-3xl w-full max-w-2xl my-auto overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200">
             <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
@@ -677,8 +722,8 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                               <div>
                                 <p className="font-bold text-slate-900">{material?.name || 'Unknown Material'}</p>
                                 <p className="text-xs text-slate-500">
-                                  Gross: {item.grossWeight} lb | Tare: {item.tareWeight} lb
-                                  {item.deductionWeight ? ` | Ded: ${item.deductionWeight} lb (${item.deductionReason || 'No reason'})` : ''}
+                                  Net Weight: {item.netWeight} lb
+                                  {item.deductionWeight ? ` | Deduction: -${item.deductionWeight} lb ${item.deductionReason ? `(${item.deductionReason})` : ''}` : ''}
                                 </p>
                               </div>
                               {item.photoUrl && (
@@ -725,7 +770,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                 <div>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Total Weight</p>
                   <p className="text-2xl font-black text-slate-900">
-                    {(selectedTicket.materials || []).reduce((sum, m) => sum + m.netWeight, 0)} lb
+                    {(selectedTicket.materials || []).reduce((sum, m) => sum + (m.netWeight - (m.deductionWeight || 0)), 0)} lb
                   </p>
                 </div>
                 <div className="text-right">
@@ -793,15 +838,34 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
           role="dialog"
           aria-modal="true"
           aria-labelledby="print-preview-title"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setShowPrintPreview(false);
-          }}
         >
           <div className="bg-white rounded-2xl w-full max-w-lg my-auto overflow-hidden shadow-2xl flex flex-col max-h-[90vh]">
-            <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+            <div className="p-4 border-b border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-3 bg-slate-50">
               <div className="flex items-center gap-2">
                 <Printer className="w-5 h-5 text-slate-600" aria-hidden="true" />
                 <h2 id="print-preview-title" className="font-bold text-slate-900">Print Preview</h2>
+              </div>
+              <div className="flex bg-slate-200/80 p-0.5 rounded-xl border border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setPrintFormat('letter')}
+                  className={cn(
+                    "px-2.5 py-1 text-[9px] font-black uppercase rounded-lg transition-all",
+                    printFormat === 'letter' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
+                  )}
+                >
+                  Letter
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPrintFormat('thermal')}
+                  className={cn(
+                    "px-2.5 py-1 text-[9px] font-black uppercase rounded-lg transition-all",
+                    printFormat === 'thermal' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
+                  )}
+                >
+                  Thermal
+                </button>
               </div>
               <button 
                 onClick={() => setShowPrintPreview(false)}
@@ -812,14 +876,33 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
               </button>
             </div>
             
-            <div className="flex-1 overflow-y-auto p-8 bg-slate-100">
-              <div className="bg-white p-8 shadow-sm border border-slate-200 mx-auto max-w-[400px] font-mono text-sm print-ticket" aria-label="Ticket Content">
-                <div className="text-center border-b border-slate-900 pb-4 mb-6">
+            <div className="flex-1 overflow-y-auto p-8 bg-slate-100 space-y-4">
+              <div className="p-3.5 bg-blue-50/80 border border-blue-200 rounded-2xl text-left space-y-1">
+                <p className="text-xs font-extrabold text-blue-900 flex items-center gap-1.5">
+                  <span>💡</span>
+                  Browser Printing Pro-Tip
+                </p>
+                <p className="text-[10px] text-blue-800 leading-normal font-medium">
+                  If the print pop-up is blocked or does not open, make sure to click <strong>"Open in New Tab"</strong> at the top of AI Studio. Browsers block system dialogue windows within sandboxed preview frames!
+                </p>
+              </div>
+
+              <div className={cn(
+                "bg-white shadow-sm border border-slate-200 rounded-xl relative mx-auto transition-all duration-300",
+                printFormat === 'thermal' 
+                  ? "max-w-[280px] p-4 border-dashed font-mono text-slate-900 text-xs gap-y-2" 
+                  : "w-full p-8 font-sans"
+              )} aria-label="Ticket Content">
+                <div className={cn(
+                  "text-center border-b border-slate-100 pb-4 mb-4",
+                  printFormat === 'thermal' ? "border-dashed border-slate-900" : ""
+                )}>
                   <div className="flex justify-center mb-3">
                     <BrandLogo className="h-10 w-auto object-contain grayscale" grayscale />
                   </div>
-                  <h1 className="text-xl font-black uppercase tracking-tighter">{COMPANY_NAME}</h1>
-                  <p className="text-[10px] text-slate-500 font-bold">{COMPANY_ADDRESS}</p>
+                  <h1 className={cn("font-black uppercase tracking-tight", printFormat === 'thermal' ? "text-base" : "text-xl")}>{COMPANY_NAME}</h1>
+                  {printFormat !== 'thermal' && COMPANY_WEBSITE && <p className="text-[10px] text-slate-400 font-medium tracking-wide mt-0.5">{COMPANY_WEBSITE}</p>}
+                  <p className="text-[10px] text-slate-500 font-bold mt-1">{COMPANY_ADDRESS}</p>
                   <p className="text-[10px] text-slate-500">{COMPANY_PHONE}</p>
                   <div className="mt-2 pt-2 border-t border-slate-100">
                     <p className="text-[10px] text-slate-500 mt-1 uppercase">Official Buy Ticket</p>
@@ -845,7 +928,10 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                     <span className="text-right font-bold capitalize">{selectedTicket.paymentMethod || 'Cash'}</span>
                   </div>
                   
-                  <div className="border-t border-slate-100 pt-3 space-y-2">
+                  <div className={cn(
+                    "border-t border-slate-100 pt-3 space-y-2",
+                    printFormat === 'thermal' ? "border-dashed border-slate-900" : ""
+                  )}>
                     <p className="text-[10px] font-bold text-slate-400 uppercase">Items</p>
                     {(selectedTicket.materials || []).map((item, idx) => {
                       const material = materials.find(m => m.id === item.materialId);
@@ -861,7 +947,10 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                             </div>
                           </div>
                           <div className="flex justify-between text-[9px] text-slate-500 pl-5">
-                            <span>{(item.netWeight - (item.deductionWeight || 0))} lb</span>
+                            <span>
+                              {item.netWeight} lb
+                              {item.deductionWeight ? ` (Ded: -${item.deductionWeight} lb)` : ''}
+                            </span>
                             <span>@ ${item.pricePerUnit.toFixed(2)}/lb</span>
                           </div>
                           {item.notes && (
@@ -872,18 +961,27 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                     })}
                   </div>
 
-                  <div className="flex justify-between gap-4 text-base border-t border-slate-900 pt-3 mt-4">
+                  <div className={cn(
+                    "flex justify-between gap-4 text-base border-t border-slate-900 pt-3 mt-4",
+                    printFormat === 'thermal' ? "border-dashed" : ""
+                  )}>
                     <span className="font-black uppercase">Total Weight</span>
                     <span className="font-black">
                       {(selectedTicket.materials || []).reduce((sum, m) => sum + (m.netWeight - (m.deductionWeight || 0)), 0)} lb
                     </span>
                   </div>
-                  <div className="flex justify-between gap-4 text-xl border-t-2 border-slate-900 pt-4 mt-4">
+                  <div className={cn(
+                    "flex justify-between gap-4 text-xl border-t-2 border-slate-900 pt-4 mt-4",
+                    printFormat === 'thermal' ? "border-dashed" : ""
+                  )}>
                     <span className="font-black uppercase">Total Payout</span>
                     <span className="font-black">${selectedTicket.totalAmount.toFixed(2)}</span>
                   </div>
 
-                  <div className="mt-8 pt-6 border-t border-slate-200 space-y-4">
+                  <div className={cn(
+                    "mt-8 pt-6 border-t border-slate-200 space-y-4",
+                    printFormat === 'thermal' ? "border-dashed border-slate-900 mt-4 pt-4" : ""
+                  )}>
                     <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
                       <p className="text-[8px] leading-tight text-slate-500 text-center italic">
                         I, the undersigned, certify that I am the sole owner of the material described on this ticket and have the full legal right to sell it.
@@ -900,6 +998,21 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                   </div>
                 </div>
                 
+                {printFormat === 'thermal' && settings.thermalShowBarcode && (
+                  <div className="mt-4 flex flex-col items-center border-t border-dashed border-slate-900 pt-3">
+                    <div className="flex h-8 w-36 gap-0.5 bg-white px-2 py-1 border">
+                      {Array.from({ length: 30 }).map((_, i) => (
+                        <div 
+                          key={i} 
+                          className="h-full flex-1" 
+                          style={{ backgroundColor: (i * 7 + 13) % 5 === 0 || i % 3 === 0 ? 'black' : 'transparent' }} 
+                        />
+                      ))}
+                    </div>
+                    <span className="text-[8px] font-mono tracking-widest mt-1">*{selectedTicket.id.toUpperCase().slice(-8)}*</span>
+                  </div>
+                )}
+
                 <div className="mt-12 pt-8 border-t border-dashed border-slate-300 text-center space-y-2">
                   <p className="text-[10px] text-slate-400">Thank you for your business.</p>
                   <p className="text-[10px] font-bold text-slate-900 uppercase">TICKET ID: {selectedTicket.id.toUpperCase()}</p>
@@ -910,23 +1023,30 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
             <div className="p-4 bg-white border-t border-slate-100 flex gap-3">
               <button 
                 onClick={() => setShowPrintPreview(false)}
-                className="flex-1 py-3 border border-slate-200 rounded-xl font-bold text-slate-600 hover:bg-slate-50 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+                className="flex-1 py-3 border border-slate-200 rounded-xl font-bold text-slate-600 hover:bg-slate-50 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400 text-xs"
               >
                 Cancel
               </button>
               <button 
-                onClick={() => {
-                  if (!settings.debugPrintMode) window.print();
-                  if (!settings.debugPrintMode) {
-                    setShowPrintPreview(false);
-                    setSelectedTicket(null);
-                  } else {
-                    console.log('DEBUG PRINT: window.print() and reset bypassed.');
+                onClick={async () => {
+                  setShowPrintPreview(false);
+                  await new Promise(r => setTimeout(r, 150));
+                  if (selectedTicket) {
+                    await printTicket(
+                      <BuyTicketPrint 
+                        ticket={selectedTicket} 
+                        customerName={getCustomerName(selectedTicket.customerId)} 
+                        materials={materials} 
+                        format={printFormat}
+                      />,
+                      { format: printFormat, debugMode: settings.debugPrintMode }
+                    );
                   }
+                  setSelectedTicket(null);
                 }}
-                className="flex-1 py-3 bg-slate-900 text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 transition-all shadow-lg shadow-slate-200 outline-none focus-visible:ring-2 focus-visible:ring-slate-900 focus-visible:ring-offset-2"
+                className="flex-1 py-3 bg-slate-900 text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 transition-all shadow-lg shadow-slate-200 outline-none focus-visible:ring-2 focus-visible:ring-slate-900 focus-visible:ring-offset-2 text-xs uppercase tracking-widest"
               >
-                <Printer className="w-5 h-5" aria-hidden="true" />
+                <Printer className="w-4 h-4" aria-hidden="true" />
                 Print Now
               </button>
             </div>

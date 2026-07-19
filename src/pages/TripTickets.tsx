@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { db } from '../firebase';
+import { auth, db } from '../firebase';
+import { useSettings } from '../context/SettingsContext';
 import { collection, onSnapshot, addDoc, doc, getDoc, updateDoc, increment, setDoc, query, orderBy, writeBatch } from 'firebase/firestore';
 import { Material, TripTicket, TripTicketMaterial, Invoice, UserProfile } from '../types';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
@@ -28,12 +29,13 @@ import {
   Ban,
   Trash2
 } from 'lucide-react';
-import { cn } from '../lib/utils';
+import { cn, generateTicketId } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import ManagerPinModal from '../components/ManagerPinModal';
 
 export default function TripTickets({ profile }: { profile: UserProfile | null }) {
+  const { settings } = useSettings();
   const [activeTab, setActiveTab] = useState<'new' | 'history'>('new');
   const [materials, setMaterials] = useState<Material[]>([]);
   const [tripTickets, setTripTickets] = useState<TripTicket[]>([]);
@@ -79,6 +81,8 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
   }, [notification]);
 
   useEffect(() => {
+    if (!auth.currentUser) return;
+
     const unsubMaterials = onSnapshot(collection(db, 'materials'), (snapshot) => {
       setMaterials(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Material[]);
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'materials'));
@@ -101,11 +105,11 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
     );
 
     return () => {
-      unsubMaterials();
-      unsubTrips();
-      unsubInvoices();
+      try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
+      try { unsubTrips(); } catch (e) { console.warn('unsubTrips error', e); }
+      try { unsubInvoices(); } catch (e) { console.warn('unsubInvoices error', e); }
     };
-  }, []);
+  }, [profile]);
 
   const handleAddMaterial = (materialId: string) => {
     const material = materials.find(m => m.id === materialId);
@@ -256,15 +260,20 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
         status: 'in-transit',
         timestamp: new Date().toISOString(),
         invoiceStatus: linkedInvoiceId ? 'invoiced' : 'pending',
-        invoiceId: linkedInvoiceId || undefined,
         totalWeight,
         totalValue,
-        createdBy: profile?.uid,
+        createdBy: profile?.uid || '',
         createdByName: profile?.displayName || profile?.email || 'System'
       };
 
+      if (linkedInvoiceId) {
+        ticketData.invoiceId = linkedInvoiceId;
+      }
+
       try {
-        const docRef = await addDoc(collection(db, 'tripTickets'), ticketData);
+        const ticketId = generateTicketId('TRIP');
+        const docRef = doc(db, 'tripTickets', ticketId);
+        await setDoc(docRef, ticketData);
         
         // Log trip ticket creation
         await logAuditEvent(
@@ -389,7 +398,8 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
 
   return (
     <div className="max-w-6xl mx-auto space-y-8">
-      {/* Notifications */}
+      <div className={cn("space-y-8", showPrintPreview && "print:hidden")}>
+        {/* Notifications */}
       {notification && (
         <div className={cn(
           "fixed bottom-8 right-8 z-[200] px-6 py-4 rounded-2xl shadow-2xl animate-in slide-in-from-bottom-4 duration-300 border flex items-center gap-3 font-bold uppercase tracking-widest text-xs",
@@ -674,7 +684,7 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                       if (bCode.startsWith(search) && !aCode.startsWith(search)) return 1;
                       if (aName.startsWith(search) && !bName.startsWith(search)) return -1;
                       if (bName.startsWith(search) && !aName.startsWith(search)) return 1;
-                      return aCode.localeCompare(bCode);
+                      return aCode.localeCompare(bCode, undefined, { numeric: true, sensitivity: 'base' });
                     })
                     .map(m => (
                     <button
@@ -903,9 +913,6 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
       {selectedTicket && (
         <div 
           className="fixed inset-0 bg-slate-900/60 z-[100] flex items-start justify-center p-4 backdrop-blur-sm overflow-y-auto"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setSelectedTicket(null);
-          }}
         >
           <div className="bg-white rounded-[2.5rem] w-full max-w-3xl my-auto overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200">
             <div className="p-8 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
@@ -1193,17 +1200,16 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
         </div>
       )}
 
+      </div>
+
       {/* Print Preview Modal */}
       {showPrintPreview && selectedTicket && (
         <div 
-          className="fixed inset-0 bg-slate-900/80 z-[110] flex items-start justify-center p-4 backdrop-blur-sm overflow-y-auto"
+          className="fixed inset-0 bg-slate-900/80 z-[110] flex items-start justify-center p-4 backdrop-blur-sm overflow-y-auto print:bg-transparent print:backdrop-blur-none print:p-0 print:static print:overflow-visible"
           role="dialog"
           aria-modal="true"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setShowPrintPreview(false);
-          }}
         >
-          <div className="bg-white rounded-[2.5rem] w-full max-w-5xl my-auto overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200 flex flex-col">
+          <div className="bg-white rounded-[2.5rem] w-full max-w-5xl my-auto overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200 flex flex-col print:rounded-none print:shadow-none print:max-w-none print:w-full print:m-0">
             <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50 no-print">
               <div className="flex items-center gap-4">
                 <div className="p-3 bg-slate-900 rounded-2xl text-white">
@@ -1252,15 +1258,15 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
               </div>
             </div>
             
-            <div className="flex-1 overflow-y-auto p-12 bg-slate-100 no-scrollbar">
+            <div className="flex-1 overflow-y-auto p-12 bg-slate-100 no-scrollbar print:p-0 print:bg-transparent">
               {/* Landscape BOL Container */}
               <div className="bg-white shadow-2xl mx-auto w-full max-w-[1100px] min-h-[770px] p-16 font-serif text-slate-900 bol-container relative flex flex-col overflow-visible">
                 <div className="flex justify-between items-start mb-12">
                   <div className="space-y-1">
                     <h1 className="text-4xl font-black uppercase tracking-tight text-slate-900">{COMPANY_NAME}</h1>
-                    <p className="text-sm text-slate-500 font-bold">{COMPANY_ADDRESS}</p>
-                    <p className="text-sm text-slate-500">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
-                    <p className="text-sm text-slate-500">{COMPANY_WEBSITE}</p>
+                    <p className="text-sm text-slate-400 font-medium tracking-wide mt-0.5">{COMPANY_WEBSITE}</p>
+                    <p className="text-sm text-slate-500 font-bold mt-1">{COMPANY_ADDRESS}</p>
+                    <p className="text-sm text-slate-500 mt-1">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
                   </div>
                   <div className="h-14 w-auto flex items-center justify-center">
                     <BrandLogo className="h-full w-auto object-contain grayscale opacity-60" grayscale />

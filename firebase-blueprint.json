@@ -34,6 +34,9 @@
         "customerType": { "type": "string", "enum": ["individual", "business"] },
         "verifiedStatus": { "type": "string", "enum": ["unverified", "verified"] },
         "notes": { "type": "string" },
+        "vehiclePlate": { "type": "string" },
+        "vehicleType": { "type": "string" },
+        "vehiclePhotoUrl": { "type": "string" },
         "isBuyer": { "type": "boolean", "description": "Whether this customer is a buyer for invoices" },
         "createdAt": { "type": "string", "format": "date-time" }
       },
@@ -142,6 +145,7 @@
         "role": { "type": "string", "enum": ["manager", "cashier"] },
         "displayName": { "type": "string" },
         "managerPin": { "type": "string", "description": "4-digit security PIN" },
+        "cachedPassword": { "type": "string", "description": "Cached password of the user for local retrieval and reset within the app" },
         "permissions": {
           "type": "object",
           "properties": {
@@ -330,6 +334,70 @@
         }
       },
       "required": ["maintenanceMode", "currentVersion", "lastUpdated"]
+    },
+    "ExternalSale": {
+      "title": "External Sale",
+      "description": "Record of material inventory marked sold outside the app.",
+      "type": "object",
+      "properties": {
+        "materialId": { "type": "string" },
+        "weight": { "type": "number" },
+        "salePrice": { "type": "number" },
+        "date": { "type": "string", "format": "date-time" },
+        "notes": { "type": "string" },
+        "recordedAt": { "type": "string", "format": "date-time" },
+        "recordedBy": { "type": "string" }
+      },
+      "required": ["materialId", "weight", "salePrice", "date", "recordedAt", "recordedBy"]
+    },
+    "LoadPlan": {
+      "title": "Load Plan",
+      "description": "Outbound load flatbed truck planner.",
+      "type": "object",
+      "properties": {
+        "loadNumber": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "status": { "type": "string" },
+        "carrier": { "type": "string" },
+        "notes": { "type": "string" },
+        "boxes": { 
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "slotIndex": { "type": "integer" },
+              "materialId": { "type": "string" },
+              "weight": { "type": "number" },
+              "notes": { "type": "string" }
+            },
+            "required": ["slotIndex"]
+          }
+        },
+        "totalWeight": { "type": "number" },
+        "recordedAt": { "type": "string", "format": "date-time" },
+        "recordedBy": { "type": "string" }
+      },
+      "required": ["loadNumber", "date", "status", "boxes", "totalWeight", "recordedAt", "recordedBy"]
+    },
+    "TicketDraft": {
+      "title": "Ticket Draft",
+      "description": "Auto-saved ticket progress to recover from power-off or browser close.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "createdByEmail": { "type": "string" },
+        "createdByName": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "lastUpdated": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["quick", "robust"] },
+        "step": { "type": "number" },
+        "selectedCustomer": { "type": "object" },
+        "isNewCustomer": { "type": "boolean" },
+        "newCustomer": { "type": "object" },
+        "items": { "type": "array" },
+        "ticketDetails": { "type": "object" }
+      },
+      "required": ["userId", "timestamp", "lastUpdated", "step", "type"]
     }
   },
   "firestore": {
@@ -348,6 +416,9 @@
     "/userInvites/{inviteId}": { "schema": "UserInvite", "description": "Security tokens for inviting new users" },
     "/cashSessions/{sessionId}": { "schema": "CashSession", "description": "Daily cash reconciliation sessions" },
     "/cashTransactions/{transactionId}": { "schema": "CashTransaction", "description": "Manual cash transactions (bank runs, expenses)" },
-    "/system/config": { "schema": "SystemConfig", "description": "Global system configuration document" }
+    "/system/config": { "schema": "SystemConfig", "description": "Global system configuration document" },
+    "/externalSales/{saleId}": { "schema": "ExternalSale", "description": "Manual external sales records for retroactive inventory tracking" },
+    "/loadPlans/{loadId}": { "schema": "LoadPlan", "description": "Planned flatbed load blueprints" },
+    "/ticketDrafts/{draftId}": { "schema": "TicketDraft", "description": "Persistent draft of tickets in progress" }
   }
 }

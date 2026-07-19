@@ -1,9 +1,12 @@
 import { useState, useEffect } from 'react';
-import { db } from '../firebase';
+import { auth, db } from '../firebase';
+import { useSettings } from '../context/SettingsContext';
 import { collection, onSnapshot, addDoc, doc, updateDoc, query, orderBy, getDoc, deleteDoc } from 'firebase/firestore';
-import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfile } from '../types';
+import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfile, BuyTicket, LoadPlan } from '../types';
+import { logAuditEvent } from '../lib/audit';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
+import { roundNetWeight } from '../lib/weightUtils';
 import { 
   FileText, 
   Plus, 
@@ -26,10 +29,137 @@ import {
   Loader2,
   History,
   Edit2,
-  Save
+  Save,
+  ChevronDown
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
+import { useRef } from 'react';
+
+interface SearchableMaterialSelectorProps {
+  value: string;
+  onChange: (val: string) => void;
+  materials: Material[];
+  className?: string;
+  placeholder?: string;
+}
+
+function SearchableMaterialSelector({
+  value,
+  onChange,
+  materials,
+  className = '',
+  placeholder = '-- Choose Material --'
+}: SearchableMaterialSelectorProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const selectedMaterial = materials.find(m => m.id === value);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Filter materials based on search code/name
+  const filteredMaterials = materials.filter(m => {
+    const s = search.toLowerCase();
+    return m.name.toLowerCase().includes(s) || m.code.toLowerCase().includes(s);
+  }).sort((a, b) => {
+    const s = search.toLowerCase();
+    const aCode = a.code.toLowerCase();
+    const bCode = b.code.toLowerCase();
+    const aName = a.name.toLowerCase();
+    const bName = b.name.toLowerCase();
+
+    // 1. Exact code match
+    if (aCode === s && bCode !== s) return -1;
+    if (bCode === s && aCode !== s) return 1;
+
+    // 2. Code starts with search
+    if (aCode.startsWith(s) && !bCode.startsWith(s)) return -1;
+    if (bCode.startsWith(s) && !aCode.startsWith(s)) return 1;
+
+    // 3. Name starts with search
+    if (aName.startsWith(s) && !bName.startsWith(s)) return -1;
+    if (bName.startsWith(s) && !aName.startsWith(s)) return 1;
+
+    return aCode.localeCompare(bCode, undefined, { numeric: true, sensitivity: 'base' });
+  });
+
+  return (
+    <div ref={containerRef} className={cn("relative inline-block text-left", className)}>
+      <div>
+        <button
+          type="button"
+          onClick={() => {
+            setIsOpen(!isOpen);
+            setSearch('');
+          }}
+          className="w-full flex items-center justify-between px-3 py-1.5 bg-white border border-slate-200 rounded-lg font-bold text-slate-700 outline-none focus:border-blue-500 text-left text-xs"
+        >
+          <span className="truncate">
+            {selectedMaterial ? `${selectedMaterial.code} - ${selectedMaterial.name}` : placeholder}
+          </span>
+          <ChevronDown className="w-4 h-4 ml-2 text-slate-400 flex-shrink-0" />
+        </button>
+      </div>
+
+      {isOpen && (
+        <div className="absolute left-0 mt-1 w-64 rounded-xl bg-white shadow-2xl border border-slate-100 z-50 animate-in fade-in slide-in-from-top-1 duration-100">
+          <div className="p-2 border-b border-slate-100">
+            <div className="relative">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
+              <input
+                type="text"
+                autoFocus
+                className="w-full pl-8 pr-3 py-1 bg-slate-50 border border-slate-100 rounded-md text-xs outline-none focus:ring-1 focus:ring-blue-500"
+                placeholder="Search code or name..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="max-h-48 overflow-y-auto p-1 text-xs">
+            {filteredMaterials.length === 0 ? (
+              <div className="py-2 px-3 text-slate-400 font-medium italic">No material found</div>
+            ) : (
+              filteredMaterials.map(m => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => {
+                    onChange(m.id);
+                    setIsOpen(false);
+                    setSearch('');
+                  }}
+                  className={cn(
+                    "w-full text-left px-3 py-1.5 rounded-lg font-bold hover:bg-slate-50 transition-colors flex flex-col",
+                    value === m.id ? 'text-blue-600 bg-blue-50/50' : 'text-slate-700'
+                  )}
+                >
+                  <span>{m.code} - {m.name}</span>
+                  {m.salePrice !== undefined && (
+                    <span className="text-[10px] text-slate-400 font-normal">
+                      Sell: ${m.salePrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </span>
+                  )}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Reusable Invoice Document Component for both Preview and Portal Printing
 const InvoiceDocument = ({ 
@@ -53,9 +183,9 @@ const InvoiceDocument = ({
       <div className="flex justify-between items-start mb-4 text-left text-xs">
         <div className="space-y-1">
           <h1 className="text-4xl font-black uppercase tracking-tight text-slate-900">{COMPANY_NAME}</h1>
-          <p className="text-sm text-slate-500 font-bold">{COMPANY_ADDRESS}</p>
-          <p className="text-sm text-slate-500">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
-          <p className="text-sm text-slate-500">{COMPANY_WEBSITE}</p>
+          <p className="text-sm text-slate-400 font-medium tracking-wide mt-0.5">{COMPANY_WEBSITE}</p>
+          <p className="text-sm text-slate-500 font-bold mt-1">{COMPANY_ADDRESS}</p>
+          <p className="text-sm text-slate-500 mt-1">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
         </div>
         <div className="h-14 w-auto flex items-center justify-center">
           <BrandLogo className="h-full w-auto object-contain grayscale opacity-60" grayscale />
@@ -125,19 +255,33 @@ const InvoiceDocument = ({
           <tbody className="divide-y divide-slate-100 font-sans">
             {invoice.materials.map((item, idx) => {
               const material = materials.find(m => m.id === item.materialId);
+              const showBoxDetails = item.boxNumber !== undefined || item.grossWeight !== undefined || item.tareWeight !== undefined;
               return (
-                <tr key={idx} className="group">
-                  <td className="py-2 text-left">
-                    <p className="text-sm font-black text-slate-900 uppercase tracking-tight">{item.customName || material?.name || 'Unknown Material'}</p>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{material?.code || '-'}</p>
+                <tr key={idx} className="group border-b border-slate-100 last:border-none">
+                  <td className="py-3 text-left">
+                    <div className="space-y-0.5">
+                      <p className="text-sm font-black text-slate-900 uppercase tracking-tight">
+                        {item.boxNumber ? `${item.boxNumber}: ` : ''}{item.customName || material?.name || 'Unknown Material'}
+                      </p>
+                      <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
+                        Code: {material?.code || '-'} {item.slotIndex !== undefined ? `• Flatbed Slot ${item.slotIndex + 1}` : ''}
+                      </p>
+                    </div>
                   </td>
-                  <td className="py-2 text-right">
-                    <p className="text-sm font-bold text-slate-900">{item.weight.toLocaleString()} {material?.unit || 'lb'}</p>
+                  <td className="py-3 text-right">
+                    <div className="space-y-0.5 text-right font-sans">
+                      <p className="text-sm font-bold text-slate-900">{item.weight.toLocaleString()} {material?.unit || 'lb'}</p>
+                      {showBoxDetails && (
+                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">
+                          G: {item.grossWeight || 0} lb | T: {item.tareWeight || 0} lb
+                        </p>
+                      )}
+                    </div>
                   </td>
-                  <td className="py-2 text-right">
+                  <td className="py-3 text-right font-sans">
                     <p className="text-sm font-bold text-slate-500">${item.salePrice.toFixed(2)}</p>
                   </td>
-                  <td className="py-2 text-right">
+                  <td className="py-3 text-right font-sans">
                     <p className="text-sm font-black text-slate-900">${(item.weight * item.salePrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                   </td>
                 </tr>
@@ -186,11 +330,20 @@ const InvoiceDocument = ({
 };
 
 export default function Invoices({ profile }: { profile: UserProfile | null }) {
-  const [activeTab, setActiveTab] = useState<'pending' | 'history' | 'create'>('create');
+  const { settings } = useSettings();
+  const [activeTab, setActiveTab] = useState<'pending' | 'history' | 'create'>(() => {
+    const saved = localStorage.getItem('pm_invoices_active_tab');
+    return (saved as any) || 'create';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('pm_invoices_active_tab', activeTab);
+  }, [activeTab]);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [tripTickets, setTripTickets] = useState<TripTicket[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
   const [loading, setLoading] = useState(true);
   
   // Standalone Invoice Form State
@@ -202,6 +355,8 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const [materialSearch, setMaterialSearch] = useState('');
   const [notes, setNotes] = useState('');
   const [paymentTerms, setPaymentTerms] = useState('Net 30');
+  const [loadPlans, setLoadPlans] = useState<LoadPlan[]>([]);
+  const [selectedLoadPlanId, setSelectedLoadPlanId] = useState<string>('');
 
   const [selectedTicket, setSelectedTicket] = useState<TripTicket | null>(null);
   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
@@ -210,7 +365,128 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const [autoPrint, setAutoPrint] = useState(false);
   const [processing, setProcessing] = useState(false);
 
+  // Helper to calculate material bought and already invoiced weights
+  const getMaterialPurchaseSummary = (materialId: string) => {
+    // Sum net weights of this material across all completed buy tickets
+    const totalBought = buyTickets
+      .filter(t => t.status === 'completed')
+      .reduce((sum, t) => {
+        const matItems = t.materials.filter(m => m.materialId === materialId);
+        return sum + matItems.reduce((s, m) => s + (m.netWeight || 0), 0);
+      }, 0);
+
+    // Sum weights of this material across all invoices (except this draft/selected invoice if it's currently being edited, to avoid double-counting)
+    const totalInvoiced = invoices
+      .filter(inv => inv.id !== selectedInvoice?.id)
+      .reduce((sum, inv) => {
+        const matItems = inv.materials.filter(m => m.materialId === materialId);
+        return sum + matItems.reduce((s, m) => s + (m.weight || 0), 0);
+      }, 0);
+
+    const remaining = Math.max(0, totalBought - totalInvoiced);
+
+    return {
+      totalBought,
+      totalInvoiced,
+      remaining
+    };
+  };
+
+  const [draftLoaded, setDraftLoaded] = useState(false);
+
+  // Load drafts on mount
   useEffect(() => {
+    // 1. Standalone Draft
+    const savedDraft = localStorage.getItem('pm_draft_invoice');
+    if (savedDraft) {
+      try {
+        const draft = JSON.parse(savedDraft);
+        if (draft.buyerName) setBuyerName(draft.buyerName);
+        if (draft.buyerAddress) setBuyerAddress(draft.buyerAddress);
+        if (draft.buyerPhone) setBuyerPhone(draft.buyerPhone);
+        if (draft.selectedBuyerId) setSelectedBuyerId(draft.selectedBuyerId);
+        if (draft.selectedMaterials) setSelectedMaterials(draft.selectedMaterials);
+        if (draft.notes) setNotes(draft.notes);
+        if (draft.paymentTerms) setPaymentTerms(draft.paymentTerms);
+        if (draft.selectedLoadPlanId) setSelectedLoadPlanId(draft.selectedLoadPlanId);
+      } catch (e) {
+        console.error('Error loading draft invoice:', e);
+      }
+    }
+
+    // 2. Active Editing Invoice
+    const savedEditing = localStorage.getItem('pm_editing_invoice');
+    if (savedEditing) {
+      try {
+        const editingData = JSON.parse(savedEditing);
+        if (editingData.invoice) {
+          setSelectedInvoice(editingData.invoice);
+          setIsEditing(editingData.isEditing || false);
+          setShowInvoicePreview(editingData.showInvoicePreview || false);
+        }
+      } catch (e) {
+        console.error('Error loading active editing invoice:', e);
+      }
+    }
+
+    setDraftLoaded(true);
+  }, []);
+
+  // Save standalone draft on change
+  useEffect(() => {
+    if (!draftLoaded) return;
+
+    const draft = {
+      buyerName,
+      buyerAddress,
+      buyerPhone,
+      selectedBuyerId,
+      selectedMaterials,
+      notes,
+      paymentTerms,
+      selectedLoadPlanId
+    };
+
+    const isDirty = buyerName || buyerAddress || buyerPhone || selectedBuyerId || selectedMaterials.length > 0 || notes || paymentTerms !== 'Net 30' || selectedLoadPlanId;
+    if (isDirty) {
+      localStorage.setItem('pm_draft_invoice', JSON.stringify(draft));
+    } else {
+      localStorage.removeItem('pm_draft_invoice');
+    }
+  }, [buyerName, buyerAddress, buyerPhone, selectedBuyerId, selectedMaterials, notes, paymentTerms, selectedLoadPlanId, draftLoaded]);
+
+  // Save active editing invoice on change
+  useEffect(() => {
+    if (!draftLoaded) return;
+
+    if (showInvoicePreview && isEditing && selectedInvoice) {
+      localStorage.setItem('pm_editing_invoice', JSON.stringify({
+        invoice: selectedInvoice,
+        isEditing,
+        showInvoicePreview
+      }));
+    } else {
+      localStorage.removeItem('pm_editing_invoice');
+    }
+  }, [selectedInvoice, isEditing, showInvoicePreview, draftLoaded]);
+
+  const handleDiscardDraft = () => {
+    if (window.confirm('Are you sure you want to discard this draft? This will clear all entered fields.')) {
+      setBuyerName('');
+      setBuyerAddress('');
+      setBuyerPhone('');
+      setSelectedBuyerId('');
+      setSelectedMaterials([]);
+      setNotes('');
+      setPaymentTerms('Net 30');
+      setSelectedLoadPlanId('');
+      localStorage.removeItem('pm_draft_invoice');
+    }
+  };
+
+  useEffect(() => {
+    if (!auth.currentUser) return;
+
     const unsubMaterials = onSnapshot(collection(db, 'materials'), (snapshot) => {
       setMaterials(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Material[]);
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'materials'));
@@ -236,13 +512,31 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       setCustomers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Customer[]);
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'customers'));
 
+    const unsubBuyTickets = onSnapshot(
+      query(collection(db, 'buyTickets'), orderBy('timestamp', 'desc')),
+      (snapshot) => {
+        setBuyTickets(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as BuyTicket[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'buyTickets')
+    );
+
+    const unsubLoadPlans = onSnapshot(
+      query(collection(db, 'loadPlans'), orderBy('date', 'desc')),
+      (snapshot) => {
+        setLoadPlans(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as LoadPlan[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'loadPlans')
+    );
+
     return () => {
-      unsubMaterials();
-      unsubTrips();
-      unsubInvoices();
-      unsubCustomers();
+      try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
+      try { unsubTrips(); } catch (e) { console.warn('unsubTrips error', e); }
+      try { unsubInvoices(); } catch (e) { console.warn('unsubInvoices error', e); }
+      try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
+      try { unsubBuyTickets(); } catch (e) { console.warn('unsubBuyTickets error', e); }
+      try { unsubLoadPlans(); } catch (e) { console.warn('unsubLoadPlans error', e); }
     };
-  }, []);
+  }, [profile]);
 
   useEffect(() => {
     if (showInvoicePreview && autoPrint) {
@@ -261,6 +555,13 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       if (selectedInvoice && selectedInvoice.id === invoiceId) {
         setSelectedInvoice({ ...selectedInvoice, status });
       }
+      await logAuditEvent(
+        'invoice',
+        invoiceId,
+        'update',
+        { after: { status } },
+        `Updated invoice status to ${status}`
+      );
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `invoices/${invoiceId}`);
     }
@@ -282,6 +583,13 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         totalWeight: selectedInvoice.totalWeight,
         totalAmount: selectedInvoice.totalAmount
       });
+      await logAuditEvent(
+        'invoice',
+        selectedInvoice.id,
+        'update',
+        { after: selectedInvoice },
+        `Saved edited invoice ${selectedInvoice.invoiceNumber}`
+      );
       setIsEditing(false);
       setAutoPrint(true);
     } catch (error) {
@@ -299,14 +607,38 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const updateInvoiceMaterial = (index: number, field: keyof TripTicketMaterial, value: any) => {
     if (!selectedInvoice) return;
     const newMaterials = [...selectedInvoice.materials];
-    newMaterials[index] = { 
-      ...newMaterials[index], 
-      [field]: (field === 'weight' || field === 'salePrice') ? (Number(value) || 0) : value 
+    
+    // Convert value appropriately
+    let val = value;
+    if (field === 'weight' || field === 'salePrice' || field === 'grossWeight' || field === 'tareWeight') {
+      val = value === '' ? 0 : Number(value);
+    }
+    
+    const updatedItem = {
+      ...newMaterials[index],
+      [field]: val
     };
+
+    // If materialId changes, pre-populate the salePrice
+    if (field === 'materialId') {
+      const mat = materials.find(m => m.id === value);
+      if (mat) {
+        updatedItem.salePrice = mat.salePrice;
+      }
+    }
+
+    // Recalculate Net Weight if grossWeight or tareWeight changes
+    if (field === 'grossWeight' || field === 'tareWeight') {
+      const gross = Number(updatedItem.grossWeight || 0);
+      const tare = Number(updatedItem.tareWeight || 0);
+      updatedItem.weight = roundNetWeight(Math.max(0, gross - tare));
+    }
+
+    newMaterials[index] = updatedItem;
     
     // Recalculate totals
-    const totalWeight = newMaterials.reduce((sum, m) => sum + m.weight, 0);
-    const totalAmount = newMaterials.reduce((sum, m) => sum + (m.weight * m.salePrice), 0);
+    const totalWeight = newMaterials.reduce((sum, m) => sum + (m.weight || 0), 0);
+    const totalAmount = newMaterials.reduce((sum, m) => sum + ((m.weight || 0) * (m.salePrice || 0)), 0);
     
     setSelectedInvoice({ 
       ...selectedInvoice, 
@@ -319,29 +651,154 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const handleAddMaterial = (materialId: string) => {
     const material = materials.find(m => m.id === materialId);
     if (!material) return;
-    if (selectedMaterials.some(m => m.materialId === materialId)) return;
 
     setSelectedMaterials(prev => [...prev, {
       materialId,
       weight: 0,
-      salePrice: material.salePrice
+      salePrice: material.salePrice,
+      boxNumber: `Box #${prev.length + 1}`,
+      grossWeight: 0,
+      tareWeight: 0
     }]);
   };
 
-  const handleRemoveMaterial = (materialId: string) => {
-    setSelectedMaterials(prev => prev.filter(m => m.materialId !== materialId));
+  const handleRemoveLineItem = (index: number) => {
+    setSelectedMaterials(prev => prev.filter((_, idx) => idx !== index));
   };
 
-  const handleWeightChange = (materialId: string, weight: number) => {
-    setSelectedMaterials(prev => prev.map(m => 
-      m.materialId === materialId ? { ...m, weight } : m
-    ));
+  const handleAddEmptyLineItem = () => {
+    setSelectedMaterials(prev => [...prev, {
+      materialId: '',
+      weight: 0,
+      salePrice: 0,
+      boxNumber: `Box #${prev.length + 1}`,
+      grossWeight: 0,
+      tareWeight: 0
+    }]);
+  };
+
+  const handleUpdateLineItem = (index: number, field: keyof TripTicketMaterial, value: any) => {
+    setSelectedMaterials(prev => prev.map((item, idx) => {
+      if (idx !== index) return item;
+      
+      const updated = { ...item, [field]: value };
+      
+      // If materialId changes, pre-populate the salePrice
+      if (field === 'materialId') {
+        const mat = materials.find(m => m.id === value);
+        if (mat) {
+          updated.salePrice = mat.salePrice;
+        }
+      }
+      
+      // If grossWeight or tareWeight changes, re-calculate Net Weight (weight)
+      if (field === 'grossWeight' || field === 'tareWeight') {
+        const gross = Number(updated.grossWeight || 0);
+        const tare = Number(updated.tareWeight || 0);
+        updated.weight = roundNetWeight(Math.max(0, gross - tare));
+      }
+      
+      return updated;
+    }));
+  };
+
+  const handlePreloadFromLoadPlan = (loadPlanId: string) => {
+    setSelectedLoadPlanId(loadPlanId);
+    if (!loadPlanId) return;
+
+    const lp = loadPlans.find(p => p.id === loadPlanId);
+    if (!lp) return;
+
+    if (lp.carrier) {
+      setBuyerName(lp.carrier);
+    }
+    if (lp.notes) {
+      setNotes(`Flatbed Load Plan: ${lp.loadNumber}\nNotes: ${lp.notes}`);
+    }
+
+    const preloadedItems: TripTicketMaterial[] = [];
+    lp.boxes.forEach(box => {
+      if (box.materialId) {
+        const mat = materials.find(m => m.id === box.materialId);
+        preloadedItems.push({
+          materialId: box.materialId,
+          weight: box.weight || 0,
+          salePrice: mat?.salePrice || 0,
+          boxNumber: `Box #${box.slotIndex + 1}`,
+          grossWeight: box.weight || 0,
+          tareWeight: 0,
+          slotIndex: box.slotIndex
+        });
+      }
+    });
+
+    if (preloadedItems.length > 0) {
+      setSelectedMaterials(preloadedItems);
+    }
+  };
+
+  const handleSyncBackToLoadPlan = async () => {
+    if (!selectedLoadPlanId) return;
+    const lp = loadPlans.find(p => p.id === selectedLoadPlanId);
+    if (!lp) return;
+
+    setProcessing(true);
+    try {
+      const updatedBoxes = Array.from({ length: 8 }).map((_, idx) => {
+        const matchedItem = selectedMaterials.find(item => item.slotIndex === idx);
+        if (matchedItem && matchedItem.materialId) {
+          return {
+            slotIndex: idx,
+            materialId: matchedItem.materialId,
+            weight: Number(matchedItem.weight || 0),
+            notes: `${matchedItem.boxNumber || `Box #${idx + 1}`}${matchedItem.customName ? ` - ${matchedItem.customName}` : ''}`
+          };
+        }
+        return {
+          slotIndex: idx,
+          materialId: '',
+          weight: 0,
+          notes: ''
+        };
+      });
+
+      const totalWeightNum = updatedBoxes.reduce((sum, b) => sum + (b.materialId ? b.weight : 0), 0);
+
+      const updatedData = {
+        ...lp,
+        boxes: updatedBoxes,
+        totalWeight: totalWeightNum,
+        recordedAt: new Date().toISOString(),
+        recordedBy: profile?.email || 'System'
+      };
+
+      await updateDoc(doc(db, 'loadPlans', lp.id), {
+        boxes: updatedBoxes,
+        totalWeight: totalWeightNum,
+        recordedAt: new Date().toISOString(),
+        recordedBy: profile?.email || 'System'
+      });
+
+      await logAuditEvent(
+        'loadPlan',
+        lp.id,
+        'update',
+        { before: lp, after: updatedData },
+        `Synced invoice boxes back to flatbed load plan ${lp.loadNumber}`
+      );
+
+      alert(`Successfully synced ${selectedMaterials.filter(m => m.slotIndex !== undefined).length} boxes back to Flatbed Load Plan ${lp.loadNumber}!`);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, 'loadPlans');
+    } finally {
+      setProcessing(false);
+    }
   };
 
   const calculateDueDate = (date: string, terms: string) => {
     const baseDate = new Date(date);
     let days = 30;
-    if (terms === 'Due on Receipt') days = 0;
+    if (terms === 'Due on Receipt' || terms === 'Via Check on Receipt' || terms === 'Via ACH on Receipt') days = 0;
     if (terms === 'Net 15') days = 15;
     if (terms === 'Net 30') days = 30;
     if (terms === 'Net 45') days = 45;
@@ -375,12 +832,21 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         paymentTerms,
         status: 'draft',
         notes,
-        createdBy: profile?.uid,
-        createdByName: profile?.displayName || profile?.email || 'System'
+        createdBy: profile?.uid || '',
+        createdByName: profile?.displayName || profile?.email || 'System',
+        loadPlanId: selectedLoadPlanId || ''
       };
 
       const docRef = await addDoc(collection(db, 'invoices'), invoiceData);
       
+      await logAuditEvent(
+        'invoice',
+        docRef.id,
+        'create',
+        { after: invoiceData },
+        `Created standalone invoice ${invoiceNumber} for buyer ${buyerName}`
+      );
+
       // Reset Form
       setBuyerName('');
       setBuyerAddress('');
@@ -388,6 +854,8 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       setSelectedBuyerId('');
       setSelectedMaterials([]);
       setNotes('');
+      setSelectedLoadPlanId('');
+      localStorage.removeItem('pm_draft_invoice');
       
       setSelectedInvoice({ id: docRef.id, ...invoiceData });
       setIsEditing(false);
@@ -422,12 +890,20 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         totalAmount,
         paymentTerms,
         status: 'draft',
-        createdBy: profile?.uid,
+        createdBy: profile?.uid || '',
         createdByName: profile?.displayName || profile?.email || 'System'
       };
 
       const docRef = await addDoc(collection(db, 'invoices'), invoiceData);
       
+      await logAuditEvent(
+        'invoice',
+        docRef.id,
+        'create',
+        { after: invoiceData },
+        `Created invoice ${invoiceNumber} from Trip Ticket ${ticket.id}`
+      );
+
       // Update Trip Ticket status
       await updateDoc(doc(db, 'tripTickets', ticket.id), {
         invoiceId: docRef.id,
@@ -450,6 +926,14 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
     
     setProcessing(true);
     try {
+      await logAuditEvent(
+        'invoice',
+        invoiceId,
+        'delete',
+        undefined,
+        `Deleted invoice ${selectedInvoice?.invoiceNumber || invoiceId} linked to Trip Ticket ${tripTicketId || 'none'}`
+      );
+
       await deleteDoc(doc(db, 'invoices', invoiceId));
       
       // If it was linked to a trip ticket, update the ticket status back to pending
@@ -472,7 +956,8 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
 
   return (
     <div className="max-w-7xl mx-auto space-y-8">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+      <div className={cn("space-y-8", showInvoicePreview && "print:hidden")}>
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
         <div>
           <h1 className="text-4xl font-black text-slate-900 tracking-tight font-display">Invoicing</h1>
           <p className="text-slate-500 font-medium mt-1">Generate and manage invoices for outbound shipments.</p>
@@ -516,14 +1001,24 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
           {/* Left Column: Invoice Details */}
           <div className="lg:col-span-2 space-y-8">
             <div className="bg-white rounded-[2.5rem] p-10 border border-slate-200 shadow-sm space-y-8">
-              <div className="flex items-center gap-4">
-                <div className="p-4 bg-blue-600 rounded-2xl text-white shadow-lg shadow-blue-200">
-                  <FileText className="w-6 h-6" />
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-4">
+                  <div className="p-4 bg-blue-600 rounded-2xl text-white shadow-lg shadow-blue-200">
+                    <FileText className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Invoice Details</h2>
+                    <p className="text-xs text-slate-500 font-black uppercase tracking-widest">Create a standalone invoice</p>
+                  </div>
                 </div>
-                <div>
-                  <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Invoice Details</h2>
-                  <p className="text-xs text-slate-500 font-black uppercase tracking-widest">Create a standalone invoice</p>
-                </div>
+                {(buyerName || buyerAddress || buyerPhone || selectedBuyerId || selectedMaterials.length > 0 || notes || paymentTerms !== 'Net 30') && (
+                  <button
+                    onClick={handleDiscardDraft}
+                    className="sm:ml-auto px-4 py-2 border border-red-200 hover:border-red-300 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all shadow-sm"
+                  >
+                    Discard Draft
+                  </button>
+                )}
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -601,6 +1096,8 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                       onChange={(e) => setPaymentTerms(e.target.value)}
                     >
                       <option value="Due on Receipt">Due on Receipt</option>
+                      <option value="Via Check on Receipt">Via Check on Receipt</option>
+                      <option value="Via ACH on Receipt">Via ACH on Receipt</option>
                       <option value="Net 15">Net 15</option>
                       <option value="Net 30">Net 30</option>
                       <option value="Net 45">Net 45</option>
@@ -611,11 +1108,45 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                 </div>
               </div>
 
+              {/* Flatbed Planner Integration Widget */}
+              <div className="bg-slate-50 border border-slate-200/60 p-6 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="space-y-1 text-left">
+                  <h3 className="text-sm font-black text-slate-800 uppercase tracking-tight">Flatbed Planner Integration</h3>
+                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Pre-load gaylord boxes directly from an active truck layout</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <select
+                    className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all cursor-pointer shadow-sm"
+                    value={selectedLoadPlanId}
+                    onChange={(e) => handlePreloadFromLoadPlan(e.target.value)}
+                  >
+                    <option value="">-- Select Flatbed Load Plan --</option>
+                    {loadPlans
+                      .filter(lp => lp.status === 'draft')
+                      .map(lp => (
+                        <option key={lp.id} value={lp.id}>
+                          {lp.loadNumber} - {lp.carrier || 'No Carrier'} ({lp.boxes.filter(b => b.materialId).length} boxes)
+                        </option>
+                      ))}
+                  </select>
+                  {selectedLoadPlanId && (
+                    <button
+                      type="button"
+                      onClick={handleSyncBackToLoadPlan}
+                      className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all active:scale-95 flex items-center gap-1.5 shadow-md shadow-blue-100"
+                      title="Save the current boxes, weights, and materials back to the active Flatbed load plan in Firestore"
+                    >
+                      🔄 Sync to Flatbed
+                    </button>
+                  )}
+                </div>
+              </div>
+
               <div className="space-y-4">
                 <div className="flex items-center justify-between px-1">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Materials & Weights</label>
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Box # / Line Items</label>
                   <span className="text-[10px] font-black text-blue-600 uppercase tracking-widest bg-blue-50 px-2 py-1 rounded-md">
-                    {selectedMaterials.length} Items Selected
+                    {selectedMaterials.length} Boxes Selected
                   </span>
                 </div>
                 
@@ -625,41 +1156,138 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                       <div className="w-12 h-12 bg-slate-50 rounded-full flex items-center justify-center mx-auto">
                         <Plus className="w-6 h-6 text-slate-300" />
                       </div>
-                      <p className="text-xs text-slate-400 font-bold uppercase tracking-widest">No materials added yet</p>
+                      <p className="text-xs text-slate-400 font-bold uppercase tracking-widest">No box line items added yet</p>
                     </div>
                   ) : (
-                    selectedMaterials.map((item, idx) => {
-                      const material = materials.find(m => m.id === item.materialId);
-                      return (
-                        <div key={idx} className="flex items-center gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-100 group animate-in zoom-in-95 duration-200">
-                          <div className="w-10 h-10 bg-white rounded-lg flex items-center justify-center font-bold text-slate-400 border border-slate-200 shrink-0">
-                            {material?.code}
-                          </div>
-                          <div className="flex-1">
-                            <p className="text-sm font-black text-slate-900 uppercase tracking-tight">{material?.name}</p>
-                            <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Sale Price: ${item.salePrice.toFixed(2)}</p>
-                          </div>
-                          <div className="w-32 relative">
-                            <input
-                              type="number"
-                              className="w-full pl-4 pr-10 py-2 bg-white border border-slate-200 rounded-xl text-sm font-black outline-none focus:ring-2 focus:ring-blue-500"
-                              value={item.weight || ''}
-                              onChange={(e) => handleWeightChange(item.materialId, Number(e.target.value))}
-                              placeholder="0"
-                            />
-                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-black text-slate-400 uppercase">{material?.unit}</span>
-                          </div>
-                          <button 
-                            onClick={() => handleRemoveMaterial(item.materialId)}
-                            className="w-11 h-11 flex items-center justify-center text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all active:scale-95"
-                            aria-label="Remove material"
-                          >
-                            <X className="w-5 h-5" />
-                          </button>
-                        </div>
-                      );
-                    })
+                    <div className="overflow-x-auto bg-slate-50/50 rounded-2xl border border-slate-100 p-4">
+                      <table className="w-full text-left border-collapse text-xs min-w-[750px]">
+                        <thead>
+                          <tr className="border-b border-slate-200 text-slate-400 font-black uppercase tracking-widest text-[9px]">
+                            <th className="py-3 px-2">Box Label</th>
+                            <th className="py-3 px-2">Flatbed Slot</th>
+                            <th className="py-3 px-2">Material</th>
+                            <th className="py-3 px-2 text-right">Gross (lb)</th>
+                            <th className="py-3 px-2 text-right">Tare (lb)</th>
+                            <th className="py-3 px-2 text-right">Net (lb)</th>
+                            <th className="py-3 px-2 text-right">Sell Price ($)</th>
+                            <th className="py-3 px-2 text-right">Total ($)</th>
+                            <th className="py-3 px-2 text-center"></th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {selectedMaterials.map((item, idx) => {
+                            const material = materials.find(m => m.id === item.materialId);
+                            const net = item.weight || 0;
+                            const total = net * (item.salePrice || 0);
+
+                            return (
+                              <tr key={idx} className="hover:bg-slate-50/50 transition-colors">
+                                <td className="py-3 px-2">
+                                  <input
+                                    type="text"
+                                    className="w-20 px-2 py-1.5 bg-white border border-slate-200 rounded-lg font-black text-slate-800 outline-none focus:border-blue-500"
+                                    placeholder="Box #"
+                                    value={item.boxNumber || ''}
+                                    onChange={(e) => handleUpdateLineItem(idx, 'boxNumber', e.target.value)}
+                                  />
+                                </td>
+                                <td className="py-3 px-2">
+                                  <select
+                                    className="w-28 px-2 py-1.5 bg-white border border-slate-200 rounded-lg font-bold text-slate-700 outline-none focus:border-blue-500"
+                                    value={item.slotIndex !== undefined ? item.slotIndex : ''}
+                                    onChange={(e) => {
+                                      const val = e.target.value;
+                                      handleUpdateLineItem(idx, 'slotIndex', val === '' ? undefined : Number(val));
+                                    }}
+                                  >
+                                    <option value="">No Match</option>
+                                    {Array.from({ length: 8 }).map((_, sIdx) => (
+                                      <option key={sIdx} value={sIdx}>Slot {sIdx + 1}</option>
+                                    ))}
+                                  </select>
+                                </td>
+                                <td className="py-3 px-2">
+                                  <div className="flex flex-col gap-1.5">
+                                    <SearchableMaterialSelector
+                                      value={item.materialId}
+                                      onChange={(val) => handleUpdateLineItem(idx, 'materialId', val)}
+                                      materials={materials}
+                                      className="w-44"
+                                    />
+                                    {item.materialId && (
+                                      <input
+                                        type="text"
+                                        placeholder={`Rename: ${material?.name || ''}`}
+                                        value={item.customName || ''}
+                                        onChange={(e) => handleUpdateLineItem(idx, 'customName', e.target.value)}
+                                        className="w-44 px-2 py-1 bg-slate-100 border border-slate-200 rounded text-[11px] font-bold text-slate-700 outline-none focus:bg-white focus:border-blue-500 transition-all placeholder:text-slate-400 placeholder:font-normal"
+                                      />
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="py-3 px-2 text-right">
+                                  <input
+                                    type="number"
+                                    className="w-20 px-2 py-1.5 bg-white border border-slate-200 rounded-lg font-black text-right outline-none focus:border-blue-500"
+                                    placeholder="0"
+                                    value={item.grossWeight || ''}
+                                    onChange={(e) => handleUpdateLineItem(idx, 'grossWeight', Number(e.target.value))}
+                                  />
+                                </td>
+                                <td className="py-3 px-2 text-right">
+                                  <input
+                                    type="number"
+                                    step="0.5"
+                                    className="w-16 px-2 py-1.5 bg-white border border-slate-200 rounded-lg font-black text-right outline-none focus:border-blue-500"
+                                    placeholder="0.0"
+                                    value={item.tareWeight || ''}
+                                    onChange={(e) => handleUpdateLineItem(idx, 'tareWeight', Number(e.target.value))}
+                                  />
+                                </td>
+                                <td className="py-3 px-2 text-right font-black text-slate-800">
+                                  {net.toLocaleString()}
+                                </td>
+                                <td className="py-3 px-2 text-right">
+                                  <div className="relative inline-block">
+                                    <span className="absolute left-1 top-1/2 -translate-y-1/2 text-slate-400">$</span>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      className="w-20 pl-4 pr-1.5 py-1.5 bg-white border border-slate-200 rounded-lg font-black text-right outline-none focus:border-blue-500"
+                                      placeholder="0.00"
+                                      value={item.salePrice || ''}
+                                      onChange={(e) => handleUpdateLineItem(idx, 'salePrice', Number(e.target.value))}
+                                    />
+                                  </div>
+                                </td>
+                                <td className="py-3 px-2 text-right font-black text-blue-600">
+                                  ${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                </td>
+                                <td className="py-3 px-2 text-center">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemoveLineItem(idx)}
+                                    className="text-slate-300 hover:text-red-500 p-1"
+                                  >
+                                    <X className="w-4 h-4" />
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
                   )}
+                  
+                  <button
+                    type="button"
+                    onClick={handleAddEmptyLineItem}
+                    className="w-full py-3.5 border-2 border-dashed border-slate-200 rounded-2xl font-black text-xs uppercase tracking-widest text-slate-500 hover:text-blue-600 hover:border-blue-300 hover:bg-blue-50/20 transition-all flex items-center justify-center gap-2 mt-4"
+                  >
+                    <Plus className="w-4 h-4" />
+                    Add Box Line Item
+                  </button>
                 </div>
               </div>
 
@@ -709,33 +1337,32 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                       if (bCode.startsWith(search) && !aCode.startsWith(search)) return 1;
                       if (aName.startsWith(search) && !bName.startsWith(search)) return -1;
                       if (bName.startsWith(search) && !aName.startsWith(search)) return 1;
-                      return aCode.localeCompare(bCode);
+                      return aCode.localeCompare(bCode, undefined, { numeric: true, sensitivity: 'base' });
                     })
-                    .map((material) => (
-                      <button
-                        key={material.id}
-                        onClick={() => handleAddMaterial(material.id)}
-                        disabled={selectedMaterials.some(sm => sm.materialId === material.id)}
-                        className={cn(
-                          "w-full flex items-center gap-4 p-4 rounded-2xl border transition-all text-left group",
-                          selectedMaterials.some(sm => sm.materialId === material.id)
-                            ? "bg-slate-50 border-slate-100 opacity-50 cursor-not-allowed"
-                            : "bg-white border-slate-100 hover:border-blue-200 hover:shadow-md hover:shadow-blue-50"
-                        )}
-                      >
-                        <div className="w-10 h-10 bg-slate-100 rounded-lg flex items-center justify-center font-bold text-slate-600 border border-slate-200 group-hover:bg-blue-50 group-hover:text-blue-600 group-hover:border-blue-100 transition-all shrink-0">
-                          {material.code}
-                        </div>
-                        <div className="flex-1">
-                          <p className="text-xs font-black text-slate-900 uppercase tracking-tight">{material.name}</p>
-                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">${material.salePrice.toFixed(2)} / {material.unit}</p>
-                        </div>
-                        <Plus className={cn(
-                          "w-4 h-4 transition-all",
-                          selectedMaterials.some(sm => sm.materialId === material.id) ? "text-slate-300" : "text-blue-600 group-hover:scale-110"
-                        )} />
-                      </button>
-                    ))}
+                    .map((material) => {
+                      const count = selectedMaterials.filter(sm => sm.materialId === material.id).length;
+                      return (
+                        <button
+                          key={material.id}
+                          onClick={() => handleAddMaterial(material.id)}
+                          className="w-full flex items-center gap-4 p-4 rounded-2xl border transition-all text-left group bg-white border-slate-100 hover:border-blue-200 hover:shadow-md hover:shadow-blue-50"
+                        >
+                          <div className="w-10 h-10 bg-slate-100 rounded-lg flex items-center justify-center font-bold text-slate-600 border border-slate-200 group-hover:bg-blue-50 group-hover:text-blue-600 group-hover:border-blue-100 transition-all shrink-0">
+                            {material.code}
+                          </div>
+                          <div className="flex-1">
+                            <p className="text-xs font-black text-slate-900 uppercase tracking-tight">{material.name}</p>
+                            <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">${material.salePrice.toFixed(2)} / {material.unit}</p>
+                            {count > 0 && (
+                              <span className="inline-block mt-1 text-[8px] font-black text-blue-600 uppercase bg-blue-50 px-1.5 py-0.5 rounded">
+                                {count} box(es) added
+                              </span>
+                            )}
+                          </div>
+                          <Plus className="w-4 h-4 transition-all text-blue-600 group-hover:scale-110" />
+                        </button>
+                      );
+                    })}
                 </div>
               </div>
 
@@ -953,15 +1580,14 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         </div>
       )}
 
+      </div>
+
       {/* Invoice Preview Modal */}
       {showInvoicePreview && selectedInvoice && (
         <div 
-          className="fixed inset-0 bg-slate-900/80 z-[100] flex items-start justify-center p-4 backdrop-blur-sm overflow-y-auto"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setShowInvoicePreview(false);
-          }}
+          className="fixed inset-0 bg-slate-900/80 z-[100] flex items-start justify-center p-4 backdrop-blur-sm overflow-y-auto print:bg-transparent print:backdrop-blur-none print:p-0 print:static print:overflow-visible"
         >
-          <div className="bg-white rounded-[2.5rem] w-full max-w-5xl my-auto overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200 flex flex-col">
+          <div className="bg-white rounded-[2.5rem] w-full max-w-5xl my-auto overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200 flex flex-col print:rounded-none print:shadow-none print:max-w-none print:w-full print:m-0">
             <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50 no-print">
               <div className="flex items-center gap-4">
                 <div className="p-3 bg-slate-900 rounded-2xl text-white">
@@ -1033,7 +1659,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-12 bg-slate-100 no-scrollbar">
+            <div className="flex-1 overflow-y-auto p-12 bg-slate-100 no-scrollbar print:p-0 print:bg-transparent">
               {/* Landscape Invoice Container */}
               <div id="printable-invoice" className="bg-white shadow-2xl mx-auto w-full max-w-[1000px] min-h-[650px] print:shadow-none print:max-w-none print:w-full print:m-0 font-sans text-slate-900 relative flex flex-col overflow-visible">
                 {isEditing ? (
@@ -1114,6 +1740,8 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                             onChange={(e) => updateInvoiceField('paymentTerms', e.target.value)}
                           >
                             <option value="Due on Receipt">Due on Receipt</option>
+                            <option value="Via Check on Receipt">Via Check on Receipt</option>
+                            <option value="Via ACH on Receipt">Via ACH on Receipt</option>
                             <option value="Net 15">Net 15</option>
                             <option value="Net 30">Net 30</option>
                             <option value="Net 45">Net 45</option>
@@ -1140,41 +1768,87 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                         {selectedInvoice.materials.map((item, idx) => {
                           const material = materials.find(m => m.id === item.materialId);
                           return (
-                            <tr key={idx} className="group">
-                              <td className="py-2 text-left">
-                                <div className="space-y-1">
+                            <tr key={idx} className="group border-b border-slate-100 last:border-none">
+                              <td className="py-3 text-left space-y-2">
+                                <div className="flex items-center gap-2">
                                   <input 
                                     type="text"
-                                    value={item.customName || material?.name || ''}
-                                    onChange={(e) => updateInvoiceMaterial(idx, 'customName', e.target.value)}
-                                    placeholder="Enter custom description..."
-                                    className="w-full text-sm font-black text-slate-900 uppercase tracking-tight bg-slate-50 border border-slate-200 px-2 py-1 rounded outline-none focus:ring-2 focus:ring-blue-500"
+                                    value={item.boxNumber || ''}
+                                    onChange={(e) => updateInvoiceMaterial(idx, 'boxNumber', e.target.value)}
+                                    placeholder="Box #"
+                                    className="w-20 text-xs font-black text-slate-900 bg-slate-50 border border-slate-200 px-2 py-1 rounded outline-none"
                                   />
-                                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Original Code: {material?.code || '-'}</p>
+                                  <select
+                                    className="w-28 text-xs font-bold text-slate-700 bg-slate-50 border border-slate-200 px-2 py-1 rounded outline-none"
+                                    value={item.slotIndex !== undefined ? item.slotIndex : ''}
+                                    onChange={(e) => {
+                                      const val = e.target.value;
+                                      updateInvoiceMaterial(idx, 'slotIndex', val === '' ? undefined : Number(val));
+                                    }}
+                                  >
+                                    <option value="">No Match</option>
+                                    {Array.from({ length: 8 }).map((_, sIdx) => (
+                                      <option key={sIdx} value={sIdx}>Slot {sIdx + 1}</option>
+                                    ))}
+                                  </select>
+                                  <SearchableMaterialSelector
+                                    value={item.materialId}
+                                    onChange={(val) => updateInvoiceMaterial(idx, 'materialId', val)}
+                                    materials={materials}
+                                    className="w-36"
+                                  />
                                 </div>
-                              </td>
-                              <td className="py-2 text-right">
                                 <input 
-                                  type="number"
-                                  value={item.weight}
-                                  onChange={(e) => updateInvoiceMaterial(idx, 'weight', e.target.value)}
-                                  className="w-24 bg-slate-50 border border-slate-200 px-2 py-1 rounded text-sm text-right outline-none"
+                                  type="text"
+                                  value={item.customName || ''}
+                                  onChange={(e) => updateInvoiceMaterial(idx, 'customName', e.target.value)}
+                                  placeholder={material ? `Rename material (default: ${material.name})` : "Enter custom description..."}
+                                  className="w-full text-xs font-medium text-slate-600 bg-slate-50 border border-slate-200 px-2 py-1.5 rounded outline-none"
                                 />
                               </td>
-                              <td className="py-2 text-right">
+                              <td className="py-3 text-right">
+                                <div className="flex flex-col items-end gap-1.5">
+                                  <div className="flex items-center gap-1">
+                                    <span className="text-[10px] text-slate-400 font-bold">G:</span>
+                                    <input 
+                                      type="number"
+                                      value={item.grossWeight || ''}
+                                      onChange={(e) => updateInvoiceMaterial(idx, 'grossWeight', e.target.value)}
+                                      placeholder="Gross"
+                                      className="w-16 bg-slate-50 border border-slate-200 px-1.5 py-1 rounded text-xs text-right outline-none"
+                                    />
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                    <span className="text-[10px] text-slate-400 font-bold">T:</span>
+                                    <input 
+                                      type="number"
+                                      step="0.5"
+                                      value={item.tareWeight || ''}
+                                      onChange={(e) => updateInvoiceMaterial(idx, 'tareWeight', e.target.value)}
+                                      placeholder="Tare"
+                                      className="w-16 bg-slate-50 border border-slate-200 px-1.5 py-1 rounded text-xs text-right outline-none"
+                                    />
+                                  </div>
+                                  <div className="text-[11px] font-black text-slate-900">
+                                    Net: {item.weight} lb
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="py-3 text-right">
                                 <div className="inline-flex items-center gap-1">
-                                  <span className="text-slate-400 text-sm">$</span>
+                                  <span className="text-slate-400 text-xs">$</span>
                                   <input 
                                     type="number"
                                     step="0.01"
                                     value={item.salePrice}
                                     onChange={(e) => updateInvoiceMaterial(idx, 'salePrice', e.target.value)}
-                                    className="w-24 bg-slate-50 border border-slate-200 px-2 py-1 rounded text-sm text-right outline-none"
+                                    disabled={profile?.role !== 'manager'}
+                                    className="w-20 bg-slate-50 border border-slate-200 px-1.5 py-1 rounded text-xs text-right outline-none disabled:opacity-60 disabled:cursor-not-allowed"
                                   />
                                 </div>
                               </td>
-                              <td className="py-2 text-right">
-                                <p className="text-sm font-black text-slate-900">${(item.weight * item.salePrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                              <td className="py-3 text-right">
+                                <p className="text-xs font-black text-slate-900">${(item.weight * item.salePrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                               </td>
                             </tr>
                           );

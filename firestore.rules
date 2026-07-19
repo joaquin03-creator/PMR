@@ -70,16 +70,25 @@ service cloud.firestore {
 
     function isManager() {
       return isAuthenticated() && (
-        request.auth.token.email == "joaquinrodriguez3333@gmail.com" ||
-        request.auth.token.email == "joaquin03@icloud.com" ||
-        request.auth.token.email == "admin@preferredmetals.com" ||
+        ('email' in request.auth.token && (
+          request.auth.token.email == "joaquinrodriguez3333@gmail.com" ||
+          request.auth.token.email == "joaquin03@icloud.com" ||
+          request.auth.token.email == "info@preferredmetalsrecycling.com"
+        )) ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'manager')
       );
     }
 
     function hasPermission(perm) {
-      return isManager() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().permissions.get(perm, false) == true;
+      return isAuthenticated() && (
+        ('email' in request.auth.token && (
+          request.auth.token.email == "joaquinrodriguez3333@gmail.com" ||
+          request.auth.token.email == "joaquin03@icloud.com" ||
+          request.auth.token.email == "info@preferredmetalsrecycling.com"
+        )) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().permissions.get(perm, false) == true)
+      );
     }
 
     function canManagePrices() { return hasPermission('canManagePrices'); }
@@ -92,8 +101,9 @@ service cloud.firestore {
     function canManageCash() { return hasPermission('canManageCash'); }
 
     function isCashier() {
-      let path = /databases/$(database)/documents/users/$(request.auth.uid);
-      return isAuthenticated() && exists(path) && get(path).data.role == 'cashier';
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'cashier';
     }
 
     function isStaff() {
@@ -133,14 +143,17 @@ service cloud.firestore {
              (!('secondaryPhone' in data) || (data.secondaryPhone is string && data.secondaryPhone.size() <= 50)) &&
              (!('email' in data) || (data.email is string && data.email.size() <= 200)) &&
              (!('address' in data) || (data.address is string && data.address.size() <= 500)) &&
-             (!('idImageUrl' in data) || (data.idImageUrl is string && data.idImageUrl.size() <= 2000)) &&
-             (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 2000)) &&
+             (!('idImageUrl' in data) || (data.idImageUrl is string && data.idImageUrl.size() <= 1048576)) &&
+             (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 1048576)) &&
              (!('idType' in data) || (data.idType is string && data.idType.size() <= 100)) &&
              (!('idNumber' in data) || (data.idNumber is string && data.idNumber.size() <= 100)) &&
              (!('idExpiration' in data) || (data.idExpiration is string && data.idExpiration.size() <= 50)) &&
              (!('customerType' in data) || (data.customerType in ['individual', 'business'])) &&
              (!('verifiedStatus' in data) || (data.verifiedStatus in ['unverified', 'verified'])) &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('vehiclePlate' in data) || (data.vehiclePlate is string && data.vehiclePlate.size() <= 50)) &&
+             (!('vehicleType' in data) || (data.vehicleType is string && data.vehicleType.size() <= 100)) &&
+             (!('vehiclePhotoUrl' in data) || (data.vehiclePhotoUrl is string && data.vehiclePhotoUrl.size() <= 1048576)) &&
              (!('isBuyer' in data) || (data.isBuyer is bool)) &&
              (!('createdAt' in data) || (data.createdAt is string || data.createdAt is timestamp));
     }
@@ -161,9 +174,12 @@ service cloud.firestore {
              (!('vehicleType' in data) || (data.vehicleType is string && data.vehicleType.size() <= 100)) &&
              (!('paymentMethod' in data) || (data.paymentMethod is string && data.paymentMethod.size() <= 50)) &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
-             (!('customerPhotoUrl' in data) || (data.customerPhotoUrl is string && data.customerPhotoUrl.size() <= 2000)) &&
-             (!('signatureUrl' in data) || (data.signatureUrl is string && data.signatureUrl.size() <= 50000)) &&
-             (!('idImageUrl' in data) || (data.idImageUrl is string && data.idImageUrl.size() <= 2000));
+             (!('customerPhotoUrl' in data) || (data.customerPhotoUrl is string && data.customerPhotoUrl.size() <= 1048576)) &&
+             (!('vehiclePhotoUrl' in data) || (data.vehiclePhotoUrl is string && data.vehiclePhotoUrl.size() <= 1048576)) &&
+             (!('signatureUrl' in data) || (data.signatureUrl is string && data.signatureUrl.size() <= 1048576)) &&
+             (!('idImageUrl' in data) || (data.idImageUrl is string && data.idImageUrl.size() <= 1048576)) &&
+             (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 100)) &&
+             (!('createdByName' in data) || (data.createdByName is string && data.createdByName.size() <= 200));
     }
 
     function isValidTripTicket(data) {
@@ -194,6 +210,30 @@ service cloud.firestore {
              (data.lastUpdated is string || data.lastUpdated is timestamp);
     }
 
+    function isValidExternalSale(data) {
+      return data.keys().hasAll(['materialId', 'weight', 'salePrice', 'date', 'recordedAt', 'recordedBy']) &&
+             data.materialId is string &&
+             data.weight is number && data.weight >= 0 &&
+             data.salePrice is number && data.salePrice >= 0 &&
+             data.date is string &&
+             data.recordedAt is string &&
+             data.recordedBy is string &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
+    }
+
+    function isValidLoadPlan(data) {
+      return data.keys().hasAll(['loadNumber', 'date', 'status', 'boxes', 'totalWeight', 'recordedAt', 'recordedBy']) &&
+             data.loadNumber is string &&
+             data.date is string &&
+             data.status is string &&
+             data.boxes is list &&
+             data.totalWeight is number &&
+             data.recordedAt is string &&
+             data.recordedBy is string &&
+             (!('carrier' in data) || (data.carrier is string && data.carrier.size() <= 200)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
+    }
+
     function isValidDailySnapshot(data) {
       return data.keys().hasAll(['date', 'timestamp', 'createdBy', 'materials', 'inventory', 'summary']) &&
              data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
@@ -217,6 +257,7 @@ service cloud.firestore {
              data.role in ['manager', 'cashier'] &&
              data.displayName is string &&
              (!('managerPin' in data) || (data.managerPin is string && data.managerPin.size() == 4)) &&
+             (!('cachedPassword' in data) || (data.cachedPassword is string && data.cachedPassword.size() >= 6 && data.cachedPassword.size() <= 200)) &&
              (!('permissions' in data) || (
                data.permissions is map &&
                data.permissions.get('canManagePrices', false) is bool &&
@@ -257,6 +298,22 @@ service cloud.firestore {
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
     }
 
+    function isValidTicketDraft(data) {
+      return data.keys().hasAll(['userId', 'timestamp', 'lastUpdated', 'step', 'type']) &&
+             data.userId is string &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             (data.lastUpdated is string || data.lastUpdated is timestamp) &&
+             data.step is number &&
+             data.type in ['quick', 'robust'] &&
+             (!('createdByEmail' in data) || (data.createdByEmail is string)) &&
+             (!('createdByName' in data) || (data.createdByName is string)) &&
+             (!('selectedCustomer' in data) || (data.selectedCustomer is map || data.selectedCustomer == null)) &&
+             (!('isNewCustomer' in data) || (data.isNewCustomer is bool)) &&
+             (!('newCustomer' in data) || (data.newCustomer is map)) &&
+             (!('items' in data) || (data.items is list)) &&
+             (!('ticketDetails' in data) || (data.ticketDetails is map));
+    }
+
     function isValidComplianceSubmission(data) {
       return data.keys().hasAll(['date', 'timestamp', 'submittedBy', 'status', 'ticketCount', 'payloadText']) &&
              data.date is string &&
@@ -286,15 +343,9 @@ service cloud.firestore {
     }
 
     function isValidUserSession(data) {
-      return data.keys().hasAll(['userId', 'userEmail', 'loginAt', 'lastActiveAt', 'status']) &&
+      return data.keys().hasAll(['userId', 'status']) &&
              data.userId is string &&
-             data.userEmail is string &&
-             (data.loginAt is string || data.loginAt is timestamp) &&
-             (data.lastActiveAt is string || data.lastActiveAt is timestamp) &&
-             data.status in ['active', 'expired', 'logout'] &&
-             (!('displayName' in data) || (data.displayName is string)) &&
-             (!('hardwareId' in data) || (data.hardwareId is string)) &&
-             (!('userAgent' in data) || (data.userAgent is string));
+             data.status in ['active', 'expired', 'logout'];
     }
 
     function isValidUserInvite(data) {
@@ -316,6 +367,11 @@ service cloud.firestore {
       allow write: if isManager();
     }
 
+    match /systemSettings/{docId} {
+      allow read: if true;
+      allow write: if isManager();
+    }
+
     match /userInvites/{inviteId} {
       allow get: if isAuthenticated();
       allow list: if isAuthenticated() && isManager();
@@ -328,21 +384,39 @@ service cloud.firestore {
     }
 
     match /userSessions/{sessionId} {
-      allow read: if isAuthenticated() && (request.auth.uid == resource.data.userId || canGenerateReports() || canManageUsers());
-      allow create: if isAuthenticated() && request.auth.uid == request.resource.data.userId && isValidUserSession(request.resource.data);
-      allow update: if isAuthenticated() && (request.auth.uid == resource.data.userId || canManageUsers()) && isValidUserSession(request.resource.data);
-      allow delete: if canDeleteData();
+      allow get, list, read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid || 
+        (resource != null && 'userId' in resource.data && resource.data.userId == request.auth.uid) ||
+        isManager()
+      );
+      allow delete: if isAuthenticated() && (
+        (resource != null && 'userId' in resource.data && resource.data.userId == request.auth.uid) || 
+        isStaff() || 
+        canDeleteData()
+      );
     }
 
     match /users/{userId} {
-      allow read: if isAuthenticated() && (request.auth.uid == userId || canManageUsers());
+      allow read: if isAuthenticated() && (
+        request.auth.uid == userId || 
+        canManageUsers() || 
+        ('email' in request.auth.token && userId == 'temp_' + request.auth.token.email) ||
+        (resource != null && 'email' in request.auth.token && 'email' in resource.data && resource.data.email == request.auth.token.email)
+      );
       allow create: if isAuthenticated() && (request.auth.uid == userId || canManageUsers()) && isValidUser(request.resource.data);
       allow update: if isAuthenticated() && (canManageUsers() || (request.auth.uid == userId && request.resource.data.role == resource.data.role && isValidUser(request.resource.data)));
+      allow delete: if isAuthenticated() && (
+        canManageUsers() || 
+        isManager() || 
+        (resource != null && 'email' in request.auth.token && 'email' in resource.data && resource.data.email == request.auth.token.email)
+      );
     }
 
     match /materials/{materialId} {
       allow read: if isAuthenticated();
-      allow write: if canManagePrices() && isValidMaterial(request.resource.data);
+      allow create, update: if canManagePrices() && isValidMaterial(request.resource.data);
+      allow delete: if canManagePrices();
     }
 
     match /customers/{customerId} {
@@ -380,6 +454,18 @@ service cloud.firestore {
       allow delete: if canDeleteData();
     }
 
+    match /externalSales/{saleId} {
+      allow read: if isStaff();
+      allow create, update: if (canManageInventory() || isStaff()) && isValidExternalSale(request.resource.data);
+      allow delete: if canDeleteData() || isManager();
+    }
+
+    match /loadPlans/{loadId} {
+      allow read: if isStaff();
+      allow create, update: if (canManageInventory() || isStaff()) && isValidLoadPlan(request.resource.data);
+      allow delete: if canDeleteData() || isManager();
+    }
+
     match /dailySnapshots/{snapshotId} {
       allow read: if canGenerateReports();
       allow create: if canGenerateReports() && isValidDailySnapshot(request.resource.data);
@@ -413,6 +499,13 @@ service cloud.firestore {
       allow create: if canManageCash() && isValidCashTransaction(request.resource.data);
       allow update: if canManageCash() && isValidCashTransaction(request.resource.data);
       allow delete: if canDeleteData();
+    }
+
+    match /ticketDrafts/{draftId} {
+      allow read: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow create: if isAuthenticated() && (isStaff() || request.resource.data.userId == request.auth.uid) && isValidTicketDraft(request.resource.data);
+      allow update: if isAuthenticated() && (isStaff() || (resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid)) && isValidTicketDraft(request.resource.data);
+      allow delete: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
     }
   }
 }

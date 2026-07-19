@@ -8,6 +8,7 @@ import {
   Scale, 
   DollarSign, 
   CheckCircle2, 
+  Database,
   Loader2, 
   AlertCircle, 
   Plus, 
@@ -20,37 +21,52 @@ import {
   ShieldCheck,
   ChevronDown,
   Printer,
-  AlertTriangle
+  AlertTriangle,
+  Fingerprint,
+  Check,
+  ExternalLink,
+  Copy
 } from 'lucide-react';
-import { db } from '../firebase';
-import { collection, onSnapshot, addDoc, doc, getDoc, updateDoc, increment, setDoc, query, where, orderBy, limit, getDocs } from 'firebase/firestore';
+import { auth, db } from '../firebase';
+import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, setDoc, query, where, orderBy, limit, getDocs, deleteDoc } from 'firebase/firestore';
 import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, UserProfile } from '../types';
-import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, handleImageError } from '../constants';
+import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from './BrandLogo';
-import { cn } from '../lib/utils';
+import { cn, generateTicketId } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { useSettings } from '../context/SettingsContext';
 import ManagerPinModal from './ManagerPinModal';
 import { ScaleCaptureButton } from './ScaleCaptureButton';
 import { CameraCapture } from './CameraCapture';
 import SignaturePad from './SignaturePad';
+import { printTicket } from '../lib/printTicket';
+import { BuyTicketPrint } from './BuyTicketPrint';
+import { logAuditEvent } from '../lib/audit';
+import { roundNetWeight } from '../lib/weightUtils';
 
 interface BuyTicketModalProps {
   isOpen: boolean;
   onClose: () => void;
   profile: UserProfile | null;
+  resumeDraftId?: string | null;
 }
 
-export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketModalProps) {
+export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId }: BuyTicketModalProps) {
   const [step, setStep] = useState(1);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [doNotBuyList, setDoNotBuyList] = useState<DoNotBuyEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // Auto-save and draft states
+  const [activeDraftId, setActiveDraftId] = useState<string | null>(resumeDraftId || null);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
   // Ticket State
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
-  const [newCustomer, setNewCustomer] = useState({ name: '', phone: '', address: '', businessName: '' });
+  const [customerSearch, setCustomerSearch] = useState('');
+  const [isCustomerLookupOpen, setIsCustomerLookupOpen] = useState(false);
+  const [newCustomer, setNewCustomer] = useState({ name: '', phone: '', address: '', businessName: '', idNumber: '', idType: '', idExpiration: '' });
   const [isNewCustomer, setIsNewCustomer] = useState(false);
   
   const [items, setItems] = useState<(BuyTicketMaterial & { id: string, material: Material | null, materialSearch?: string, isDropdownOpen?: boolean })[]>([
@@ -63,39 +79,295 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
     paymentMethod: 'cash' as 'cash' | 'check' | 'other',
     notes: '',
     customerPhotoUrl: '',
-    signatureUrl: ''
+    signatureUrl: '',
+    idImageUrl: '',
+    vehiclePhotoUrl: '',
+    ohioDatabaseStatus: 'not_checked' as 'not_checked' | 'cleared' | 'flagged'
   });
 
   const [processing, setQtProcessing] = useState(false);
+  const [isReadingID, setIsReadingID] = useState(false);
+
+  const handleReadIDFromPhoto = async (imageUrl: string) => {
+    setIsReadingID(true);
+    try {
+      const response = await fetch("/api/read-id", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ idImageUrl: imageUrl }),
+      });
+      if (!response.ok) {
+        throw new Error("Failed to read ID from photo");
+      }
+      const resData = await response.json();
+      if (resData.success && resData.data) {
+        const result = resData.data;
+        if (selectedCustomer) {
+          // If a customer is already selected, do NOT overwrite the customer selection!
+          // We can merge the OCR details if they are missing
+          setSelectedCustomer(prev => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              idNumber: prev.idNumber || result.idNumber || '',
+              idType: prev.idType || result.idType || "Driver's License",
+              idExpiration: prev.idExpiration || result.idExpiration || '',
+              address: prev.address || result.address || '',
+            };
+          });
+        } else if (isNewCustomer) {
+          setNewCustomer(prev => ({
+            ...prev,
+            name: result.name || prev.name,
+            address: result.address || prev.address,
+            idType: result.idType || prev.idType || "Driver's License",
+            idNumber: result.idNumber || prev.idNumber,
+            idExpiration: result.idExpiration || prev.idExpiration
+          }));
+        } else {
+          const existing = customers.find(c => c.idNumber === result.idNumber);
+          if (existing) {
+            setSelectedCustomer(existing);
+          } else {
+            setIsNewCustomer(true);
+            setNewCustomer(prev => ({
+              ...prev,
+              name: result.name || prev.name,
+              address: result.address || prev.address,
+              idType: result.idType || prev.idType || "Driver's License",
+              idNumber: result.idNumber || prev.idNumber,
+              idExpiration: result.idExpiration || prev.idExpiration
+            }));
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error performing AI OCR on ID in BuyTicketModal:", error);
+    } finally {
+      setIsReadingID(false);
+    }
+  };
+  const [isCheckingOhioPortal, setIsCheckingOhioPortal] = useState(false);
+  const [ohioCheckMessage, setOhioCheckMessage] = useState<string | null>(null);
+
+  const runOhioCheck = async (customerName?: string, idNum?: string) => {
+    const nameToCheck = customerName || selectedCustomer?.name || newCustomer.name || '';
+    if (!nameToCheck || nameToCheck.trim() === '') return;
+
+    setIsCheckingOhioPortal(true);
+    setOhioCheckMessage(null);
+    try {
+      const response = await fetch("/api/check-ohio-db", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: nameToCheck,
+          idNumber: idNum || selectedCustomer?.idNumber || newCustomer.idNumber || '',
+          username: settings.ohioScrapUsername,
+          password: settings.ohioScrapPassword
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error("Portal check API responded with an error");
+      }
+
+      const res = await response.json();
+      if (res.success) {
+        setTicketDetails(prev => ({
+          ...prev,
+          ohioDatabaseStatus: res.status
+        }));
+        setOhioCheckMessage(`${res.message} (${res.source === 'state_portal' ? 'Live State Database' : 'Local Offline Database Sync'})`);
+      }
+    } catch (err) {
+      console.error("Error executing auto Ohio check in BuyTicketModal:", err);
+      setOhioCheckMessage("Unable to connect to state portal or offline fallback. Please check manually.");
+    } finally {
+      setIsCheckingOhioPortal(false);
+    }
+  };
+
+  // Automatically trigger Ohio Homeland Security check when customer is selected or name is updated
+  useEffect(() => {
+    const activeName = selectedCustomer?.name || newCustomer.name;
+    if (activeName && activeName.trim() !== '') {
+      const activeId = selectedCustomer?.idNumber || newCustomer.idNumber;
+      
+      const timer = setTimeout(() => {
+        if (ticketDetails.ohioDatabaseStatus === 'not_checked') {
+          runOhioCheck(activeName, activeId);
+        }
+      }, 800);
+      return () => clearTimeout(timer);
+    }
+  }, [selectedCustomer?.id, newCustomer.name, ticketDetails.ohioDatabaseStatus]);
+
   const [success, setQtSuccess] = useState(false);
+  const [qtVerificationStatus, setQtVerificationStatus] = useState<'idle' | 'verifying' | 'verified' | 'failed' | 'offline-saved'>('idle');
   const [lastCreatedTicket, setLastCreatedTicket] = useState<BuyTicket | null>(null);
   const [showPrintPreview, setShowPrintPreview] = useState(false);
   const [isPreviewOnly, setIsPreviewOnly] = useState(false);
   const [idCheckResult, setIdCheckResult] = useState<{ prohibited: boolean, reason?: string } | null>(null);
   const [showPinModal, setShowPinModal] = useState(false);
+  const [dbHistoryAlert, setDbHistoryAlert] = useState<{
+    isOpen: boolean;
+    ticketId: string;
+    customerName: string;
+    totalAmount: number;
+    timestamp: string;
+  } | null>(null);
   const [showVehicleConfirm, setShowVehicleConfirm] = useState(false);
+  const [showIdConfirm, setShowIdConfirm] = useState(false);
   const { settings } = useSettings();
 
   // Auto-print effect
   useEffect(() => {
-    if (success && settings.autoPrint) {
+    if (success && settings.autoPrint && lastCreatedTicket) {
       setShowPrintPreview(true);
-      const timer = setTimeout(() => {
-        if (!settings.debugPrintMode) window.print();
-        // Automatically close after auto-print starts
-        setTimeout(() => {
-          if (!settings.debugPrintMode) {
-            onClose();
-            reset();
-          }
-        }, 500);
-      }, 1000);
-      return () => clearTimeout(timer);
     }
-  }, [success, settings.autoPrint, settings.debugPrintMode]);
+  }, [success, settings.autoPrint, lastCreatedTicket]);
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (resumeDraftId) {
+      setActiveDraftId(resumeDraftId);
+    } else {
+      setActiveDraftId(null);
+    }
+  }, [resumeDraftId]);
+
+  useEffect(() => {
+    if (!resumeDraftId || !isOpen || materials.length === 0) return;
+    const loadDraft = async () => {
+      try {
+        const docRef = doc(db, 'ticketDrafts', resumeDraftId);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const draft = docSnap.data();
+          setStep(draft.step || 1);
+          setSelectedCustomer(draft.selectedCustomer);
+          setIsNewCustomer(draft.isNewCustomer || false);
+          if (draft.newCustomer) {
+            setNewCustomer(draft.newCustomer);
+          }
+          if (draft.items) {
+            setItems(draft.items.map((i: any) => ({
+              id: Math.random().toString(36).substr(2, 9),
+              materialId: i.materialId || '',
+              material: materials.find(m => m.id === i.materialId) || null,
+              grossWeight: i.grossWeight || 0,
+              tareWeight: i.tareWeight || 0,
+              netWeight: i.netWeight || 0,
+              pricePerUnit: i.pricePerUnit || 0,
+              totalAmount: i.totalAmount || 0,
+              materialSearch: materials.find(m => m.id === i.materialId)?.name || '',
+              isDropdownOpen: false,
+              photoUrl: i.photoUrl || ''
+            })));
+          }
+          if (draft.ticketDetails) {
+            setTicketDetails(draft.ticketDetails);
+          }
+          setSaveStatus('saved');
+        }
+      } catch (err) {
+        console.error("Error loading draft in modal:", err);
+      }
+    };
+    loadDraft();
+  }, [resumeDraftId, isOpen, materials]);
+
+  const saveDraftToFirestore = async () => {
+    if (!auth.currentUser || !isOpen) return;
+    const hasCustomer = selectedCustomer || isNewCustomer || newCustomer.name;
+    const hasMaterials = items.some(i => i.materialId || i.grossWeight > 0 || i.netWeight > 0);
+    const hasVehicle = ticketDetails.vehiclePlate || ticketDetails.vehicleType;
+    if (!hasCustomer && !hasMaterials && !hasVehicle) {
+      return;
+    }
+
+    setSaveStatus('saving');
+    try {
+      const draftData = {
+        userId: auth.currentUser.uid,
+        createdByEmail: auth.currentUser.email || '',
+        createdByName: profile?.displayName || '',
+        timestamp: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+        type: 'robust',
+        step,
+        selectedCustomer: selectedCustomer ? {
+          id: selectedCustomer.id,
+          name: selectedCustomer.name,
+          phone: selectedCustomer.phone || '',
+          address: selectedCustomer.address || '',
+          businessName: selectedCustomer.businessName || '',
+          idType: selectedCustomer.idType || '',
+          idNumber: selectedCustomer.idNumber || '',
+          idExpiration: selectedCustomer.idExpiration || ''
+        } : null,
+        isNewCustomer,
+        newCustomer,
+        items: items.map(i => ({
+          materialId: i.materialId || '',
+          grossWeight: i.grossWeight || 0,
+          tareWeight: i.tareWeight || 0,
+          netWeight: i.netWeight || 0,
+          pricePerUnit: i.pricePerUnit || 0,
+          totalAmount: i.totalAmount || 0,
+          photoUrl: i.photoUrl || ''
+        })),
+        ticketDetails: {
+          vehiclePlate: ticketDetails.vehiclePlate || '',
+          vehicleType: ticketDetails.vehicleType || '',
+          paymentMethod: ticketDetails.paymentMethod || 'cash',
+          notes: ticketDetails.notes || '',
+          customerPhotoUrl: ticketDetails.customerPhotoUrl || '',
+          idImageUrl: ticketDetails.idImageUrl || '',
+          vehiclePhotoUrl: ticketDetails.vehiclePhotoUrl || '',
+          signatureUrl: ticketDetails.signatureUrl || '',
+          ohioDatabaseStatus: ticketDetails.ohioDatabaseStatus || 'not_checked'
+        }
+      };
+
+      let draftId = activeDraftId;
+      if (draftId) {
+        await setDoc(doc(db, 'ticketDrafts', draftId), draftData);
+      } else {
+        const docRef = await addDoc(collection(db, 'ticketDrafts'), draftData);
+        draftId = docRef.id;
+        setActiveDraftId(draftId);
+      }
+      setSaveStatus('saved');
+    } catch (err) {
+      console.error("Error saving draft in modal:", err);
+      setSaveStatus('error');
+    }
+  };
+
+  useEffect(() => {
+    if (loading || success || processing || !isOpen) return;
+
+    const hasCustomer = selectedCustomer || isNewCustomer || newCustomer.name;
+    const hasMaterials = items.some(i => i.materialId || i.grossWeight > 0 || i.netWeight > 0);
+    const hasVehicle = ticketDetails.vehiclePlate || ticketDetails.vehicleType;
+    if (!hasCustomer && !hasMaterials && !hasVehicle) {
+      if (activeDraftId) {
+        deleteDoc(doc(db, 'ticketDrafts', activeDraftId)).catch(console.error);
+        setActiveDraftId(null);
+      }
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      saveDraftToFirestore();
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [step, selectedCustomer, newCustomer, items, ticketDetails, isNewCustomer, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || !auth.currentUser) return;
 
     const unsubMaterials = onSnapshot(collection(db, 'materials'), (snapshot) => {
       setMaterials(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Material[]);
@@ -111,9 +383,9 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'doNotBuyList'));
 
     return () => {
-      unsubMaterials();
-      unsubCustomers();
-      unsubDNB();
+      try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
+      try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
+      try { unsubDNB(); } catch (e) { console.warn('unsubDNB error', e); }
     };
   }, [isOpen]);
 
@@ -174,9 +446,9 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
   };
 
   const calculateItem = (item: typeof items[0]) => {
-    const physicalNet = Math.max(0, item.grossWeight - item.tareWeight);
+    const physicalNet = roundNetWeight(Math.max(0, item.grossWeight - item.tareWeight));
     const paidWeight = Math.max(0, physicalNet - (item.deductionWeight || 0));
-    const total = paidWeight * item.pricePerUnit;
+    const total = Math.round((paidWeight * item.pricePerUnit) * 100) / 100;
     return { ...item, netWeight: physicalNet, totalAmount: total };
   };
 
@@ -227,16 +499,24 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
       const match = doNotBuyList.find(entry => entry.name.toLowerCase() === nameToCheck.toLowerCase());
       if (match) {
         setIdCheckResult({ prohibited: true, reason: match.reason });
-      } else {
-        setIdCheckResult({ prohibited: false });
+        return; // Block progression if prohibited
       }
+      
+      // Compliance check: government ID photo copy captured
+      if (!ticketDetails.idImageUrl && !showIdConfirm) {
+        setShowIdConfirm(true);
+        return;
+      }
+      
+      setShowIdConfirm(false);
+      setIdCheckResult({ prohibited: false });
       setStep(2);
     } else if (step === 2) {
       if (items.some(i => !i.material || i.netWeight <= 0)) return;
       setStep(3);
     } else if (step === 3) {
-      // Check for vehicle details
-      if (!ticketDetails.vehiclePlate && !ticketDetails.vehicleType && !showVehicleConfirm) {
+      // Compliance check: vehicle license plate and vehicle photo captured
+      if ((!ticketDetails.vehiclePlate || !ticketDetails.vehiclePhotoUrl || !ticketDetails.vehicleType) && !showVehicleConfirm) {
         setShowVehicleConfirm(true);
         return;
       }
@@ -246,14 +526,20 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
   };
 
   const handleBack = () => {
+    setShowVehicleConfirm(false);
+    setShowIdConfirm(false);
     if (step > 1) setStep(step - 1);
   };
 
   const handleSubmit = async () => {
     // Check for price overrides
-    const hasOverrides = items.some(item => 
-      item.pricePerUnit !== item.material?.buyPrice
-    );
+    const hasOverrides = items.some(item => {
+      const originalPrice = item.material?.buyPrice || 0;
+      const newPrice = item.pricePerUnit;
+      const diff = Math.abs(newPrice - originalPrice);
+      // Only require manager pin if override is more than 12% of material's price
+      return originalPrice === 0 ? (diff > 0) : (diff / originalPrice > 0.12);
+    });
 
     if (hasOverrides && profile?.role === 'cashier') {
       setShowPinModal(true);
@@ -307,17 +593,66 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
         paymentMethod: ticketDetails.paymentMethod || 'cash',
         notes: ticketDetails.notes || '',
         customerPhotoUrl: ticketDetails.customerPhotoUrl || '',
+        vehiclePhotoUrl: ticketDetails.vehiclePhotoUrl || '',
         signatureUrl: ticketDetails.signatureUrl || '',
-        createdBy: profile?.uid,
+        ohioDatabaseStatus: ticketDetails.ohioDatabaseStatus || 'not_checked',
+        createdBy: profile?.uid || '',
         createdByName: profile?.displayName || profile?.email || 'System'
       };
 
-      const docRef = await addDoc(collection(db, 'buyTickets'), ticketData);
+      const ticketId = generateTicketId('BUY');
+      const docRef = doc(db, 'buyTickets', ticketId);
+      await setDoc(docRef, ticketData);
+
+      // Track action in Audit Log
+      await logAuditEvent(
+        'buyTicket',
+        docRef.id,
+        'create',
+        { after: ticketData },
+        `Buy Ticket created (Modal) for ${selectedCustomer?.name || 'Customer'}`
+      );
+
+      // Check and log price overrides
+      for (const item of ticketMaterials) {
+        const mat = materials.find(m => m.id === item.materialId);
+        if (mat && item.pricePerUnit !== mat.buyPrice) {
+          await logAuditEvent(
+            'buyTicket',
+            docRef.id,
+            'override',
+            {
+              before: { price: mat.buyPrice },
+              after: { price: item.pricePerUnit }
+            },
+            `Price override approved for ${mat.name} in Buy Ticket #${docRef.id.toUpperCase()}: $${mat.buyPrice.toFixed(2)}/lb to $${item.pricePerUnit.toFixed(2)}/lb`
+          );
+        }
+      }
       
-      // Update customer photo if one was taken
-      if (ticketDetails.customerPhotoUrl) {
+      // Update customer profile with any and all annotated data from this ticket (photos, vehicle info, and profile info)
+      const customerUpdate: any = {};
+      if (ticketDetails.customerPhotoUrl) customerUpdate.photoUrl = ticketDetails.customerPhotoUrl;
+      if (ticketDetails.idImageUrl) customerUpdate.idImageUrl = ticketDetails.idImageUrl;
+      if (ticketDetails.vehiclePlate) customerUpdate.vehiclePlate = ticketDetails.vehiclePlate;
+      if (ticketDetails.vehicleType) customerUpdate.vehicleType = ticketDetails.vehicleType;
+      if (ticketDetails.vehiclePhotoUrl) customerUpdate.vehiclePhotoUrl = ticketDetails.vehiclePhotoUrl;
+
+      if (selectedCustomer) {
+        customerUpdate.phone = selectedCustomer.phone || '';
+        customerUpdate.secondaryPhone = selectedCustomer.secondaryPhone || '';
+        customerUpdate.email = selectedCustomer.email || '';
+        customerUpdate.address = selectedCustomer.address || '';
+        customerUpdate.businessName = selectedCustomer.businessName || '';
+        customerUpdate.idType = selectedCustomer.idType || '';
+        customerUpdate.idNumber = selectedCustomer.idNumber || '';
+        customerUpdate.idExpiration = selectedCustomer.idExpiration || '';
+      }
+
+      if (Object.keys(customerUpdate).length > 0) {
         await updateDoc(doc(db, 'customers', customerId), {
-          photoUrl: ticketDetails.customerPhotoUrl
+          ...customerUpdate,
+          updatedAt: new Date().toISOString()
         });
       }
       setLastCreatedTicket({ id: docRef.id, ...ticketData });
@@ -325,26 +660,112 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
       // Update Inventory
       for (const item of ticketMaterials) {
         const invRef = doc(db, 'inventory', item.materialId);
-        const invDoc = await getDoc(invRef);
-        if (invDoc.exists()) {
-          await updateDoc(invRef, {
-            currentWeight: increment(item.netWeight),
-            lastUpdated: new Date().toISOString()
-          });
-        } else {
-          await setDoc(invRef, {
-            materialId: item.materialId,
-            currentWeight: item.netWeight,
-            lastUpdated: new Date().toISOString()
-          });
+        let exists = false;
+        let oldWeight = 0;
+
+        try {
+          const fetchPromise = getDoc(invRef);
+          const timeoutPromise = new Promise<null>((_, reject) => setTimeout(() => reject(new Error('timeout')), 1200));
+          const invDoc = await Promise.race([fetchPromise, timeoutPromise]) as any;
+          if (invDoc && invDoc.exists()) {
+            exists = true;
+            oldWeight = invDoc.data().currentWeight || 0;
+          }
+        } catch (err) {
+          console.warn(`Could not fetch inventory from server, checking local cache:`, err);
+          try {
+            const cachedDoc = await getDocFromCache(invRef);
+            if (cachedDoc.exists()) {
+              exists = true;
+              oldWeight = cachedDoc.data().currentWeight || 0;
+            }
+          } catch (cacheErr) {
+            console.warn(`Inventory not found in local cache:`, cacheErr);
+          }
         }
+
+        // Perform write/merge locally - sets or merges currentWeight increment atomically
+        await setDoc(invRef, {
+          materialId: item.materialId,
+          currentWeight: increment(item.netWeight),
+          lastUpdated: new Date().toISOString()
+        }, { merge: true });
+
+        // Log the audit event with the available information
+        await logAuditEvent(
+          'inventory',
+          item.materialId,
+          exists ? 'update' : 'create',
+          { 
+            before: { weight: exists ? oldWeight : 0, isOfflineFallback: !exists },
+            after: { weight: oldWeight + item.netWeight }
+          },
+          exists 
+            ? `Inventory updated via Buy Ticket ${docRef.id}`
+            : `Initial inventory created via Buy Ticket ${docRef.id}`
+        );
       }
 
+      setQtVerificationStatus('verifying');
+      
+      // Verification Step: read back the document to ensure it's in the DB/local cache
+      let isVerified = false;
+      let isOfflineMode = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            isOfflineMode = true;
+            const cachedSnap = await getDocFromCache(doc(db, 'buyTickets', docRef.id));
+            if (cachedSnap.exists()) {
+              isVerified = true;
+              break;
+            }
+          } else {
+            const fetchPromise = getDoc(doc(db, 'buyTickets', docRef.id));
+            const timeoutPromise = new Promise<null>((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000));
+            const docSnap = await Promise.race([fetchPromise, timeoutPromise]) as any;
+            if (docSnap && docSnap.exists()) {
+              isVerified = true;
+              break;
+            }
+          }
+        } catch (err) {
+          console.warn(`Firestore verification attempt ${attempt} failed, checking cache:`, err);
+          try {
+            const cachedSnap = await getDocFromCache(doc(db, 'buyTickets', docRef.id));
+            if (cachedSnap.exists()) {
+              isVerified = true;
+              break;
+            }
+          } catch (cacheErr) {
+            // ignore
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+
+      const statusValue = isVerified 
+        ? ((typeof navigator !== 'undefined' && !navigator.onLine) || isOfflineMode ? 'offline-saved' : 'verified')
+        : 'failed';
+
+      setQtVerificationStatus(statusValue);
+      if (activeDraftId) {
+        await deleteDoc(doc(db, 'ticketDrafts', activeDraftId));
+        setActiveDraftId(null);
+      }
       setQtSuccess(true);
       
-      // Print handled by useEffect
+      // Open the Database confirmation popup dialogue!
+      setDbHistoryAlert({
+        isOpen: true,
+        ticketId: docRef.id,
+        customerName: selectedCustomer?.name || newCustomer.name || 'Unknown Customer',
+        totalAmount: totalAmount || 0,
+        timestamp: new Date().toISOString()
+      });
     } catch (error) {
       console.error('Error creating ticket:', error);
+      setQtVerificationStatus('failed');
       handleFirestoreError(error, OperationType.CREATE, 'buyTickets');
     } finally {
       setQtProcessing(false);
@@ -352,13 +773,19 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
   };
 
   const reset = () => {
+    if (activeDraftId) {
+      deleteDoc(doc(db, 'ticketDrafts', activeDraftId)).catch(console.error);
+      setActiveDraftId(null);
+    }
     setStep(1);
     setSelectedCustomer(null);
-    setNewCustomer({ name: '', phone: '', address: '', businessName: '' });
+    setCustomerSearch('');
+    setNewCustomer({ name: '', phone: '', address: '', businessName: '', idNumber: '', idType: '', idExpiration: '' });
     setIsNewCustomer(false);
     setItems([{ id: Math.random().toString(36).substr(2, 9), materialId: '', material: null, grossWeight: 0, tareWeight: 0, netWeight: 0, pricePerUnit: 0, totalAmount: 0, materialSearch: '', isDropdownOpen: false }]);
-    setTicketDetails({ vehiclePlate: '', vehicleType: '', paymentMethod: 'cash', notes: '', customerPhotoUrl: '', signatureUrl: '' });
+    setTicketDetails({ vehiclePlate: '', vehicleType: '', paymentMethod: 'cash', notes: '', customerPhotoUrl: '', signatureUrl: '', idImageUrl: '', vehiclePhotoUrl: '', ohioDatabaseStatus: 'not_checked' });
     setQtSuccess(false);
+    setQtVerificationStatus('idle');
     setLastCreatedTicket(null);
     setShowPrintPreview(false);
     setIdCheckResult(null);
@@ -398,26 +825,81 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
         {/* Body */}
         <div className="p-8 overflow-y-auto flex-1 custom-scrollbar">
           {success ? (
-            <div className="py-12 text-center space-y-4">
-              <div className="w-20 h-20 bg-green-100 text-green-600 rounded-full flex items-center justify-center mx-auto mb-6">
+            <div className="py-12 text-center space-y-6">
+              <div className={cn(
+                "w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4 animate-bounce",
+                qtVerificationStatus === 'offline-saved'
+                  ? "bg-amber-100 text-amber-655 font-bold"
+                  : "bg-green-100 text-green-600"
+              )}>
                 <CheckCircle2 className="w-10 h-10" />
               </div>
-              <h3 className="text-2xl font-bold text-slate-900">Ticket Completed!</h3>
-              <p className="text-slate-500">The payout has been recorded and inventory updated.</p>
-              
+              <div className="space-y-2">
+                <h3 className="text-2xl font-black text-slate-900 tracking-tight font-display uppercase">
+                  {qtVerificationStatus === 'offline-saved' ? 'Saved Locally!' : 'Ticket Completed!'}
+                </h3>
+                <p className="text-slate-500 max-w-md mx-auto text-sm font-medium">
+                  {qtVerificationStatus === 'offline-saved'
+                    ? "Saved to local offline queue. Once internet connection is restored, this ticket will automatically synchronize with cloud servers."
+                    : "The payout has been recorded, inventory recalculated, and the transaction securely verified."
+                  }
+                </p>
+              </div>
+
+              <div className="max-w-md mx-auto bg-slate-50 border border-slate-200 rounded-3xl p-5 text-left space-y-4 shadow-sm">
+                <div className="flex items-center justify-between border-b border-slate-200 pb-2.5">
+                  <span className="text-xs font-black text-slate-400 uppercase tracking-widest">Database Integrity &amp; Sync</span>
+                  {qtVerificationStatus === 'verifying' && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-black bg-amber-100 text-amber-800 rounded-full">
+                      <Loader2 className="w-3 animate-spin" /> VERIFYING...
+                    </span>
+                  )}
+                  {qtVerificationStatus === 'verified' && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-black bg-green-100 text-green-800 rounded-full">
+                      <div className="w-1.5 h-1.5 bg-green-600 rounded-full inline-block animate-pulse" /> SECURELY STORED
+                    </span>
+                  )}
+                  {qtVerificationStatus === 'offline-saved' && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-black bg-amber-100 text-amber-800 rounded-full">
+                      <div className="w-1.5 h-1.5 bg-amber-600 rounded-full inline-block animate-pulse" /> OFFLINE SAVED
+                    </span>
+                  )}
+                  {qtVerificationStatus === 'failed' && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-black bg-red-100 text-red-800 rounded-full">
+                      UNCONFIRMED
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-y-3 text-sm">
+                  <span className="text-slate-400">Verified Ticket ID:</span>
+                  <span className="font-mono font-bold text-right text-slate-800 break-all">{lastCreatedTicket?.id || 'Writing to DB...'}</span>
+                  
+                  <span className="text-slate-400">Customer:</span>
+                  <span className="font-bold text-right text-slate-800">{selectedCustomer?.name || newCustomer.name || 'Unknown'}</span>
+                  
+                  <span className="text-slate-400">Total Net Weight:</span>
+                  <span className="font-bold text-right text-slate-800">
+                    {items.reduce((sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 0)} lb
+                  </span>
+                  
+                  <span className="text-slate-400">Total Payout:</span>
+                  <span className="font-mono font-black text-right text-green-600">${totalAmount.toFixed(2)}</span>
+                </div>
+              </div>
+
               <div className="flex flex-col sm:flex-row gap-3 justify-center pt-6">
                 <button
                   onClick={() => setShowPrintPreview(true)}
-                  className="px-8 py-3 bg-slate-900 text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 transition-all shadow-lg"
+                  className="px-8 py-4 bg-slate-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 transition-all shadow-md text-xs uppercase tracking-wider active:scale-95"
                 >
                   <Printer className="w-5 h-5" />
-                  Print Ticket
+                  Print Ticket Receipt
                 </button>
                 <button
                   onClick={() => { onClose(); reset(); }}
-                  className="px-8 py-3 border border-slate-200 text-slate-600 rounded-xl font-bold hover:bg-slate-50 transition-all"
+                  className="px-8 py-4 bg-white border-2 border-slate-200 text-slate-700 rounded-2xl font-bold hover:bg-slate-50 hover:border-slate-300 transition-all text-xs uppercase tracking-wider active:scale-95"
                 >
-                  Done
+                  Done &amp; Reset Form
                 </button>
               </div>
             </div>
@@ -440,68 +922,357 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                   </div>
 
                   {isNewCustomer ? (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-6 bg-slate-50 rounded-2xl border border-slate-200">
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-slate-500 uppercase">Full Name</label>
-                        <input 
-                          className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
-                          value={newCustomer.name}
-                          onChange={e => setNewCustomer({...newCustomer, name: e.target.value})}
-                          placeholder="John Doe"
-                        />
+                    <div className="p-6 bg-slate-50 rounded-2xl border border-slate-200 space-y-4 animate-in fade-in duration-200">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-bold text-slate-500 uppercase">Full Name</label>
+                          <input 
+                            className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                            value={newCustomer.name}
+                            onChange={e => setNewCustomer({...newCustomer, name: e.target.value})}
+                            placeholder="John Doe"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-bold text-slate-500 uppercase">Business Name (Optional)</label>
+                          <input 
+                            className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                            value={newCustomer.businessName}
+                            onChange={e => setNewCustomer({...newCustomer, businessName: e.target.value})}
+                            placeholder="Acme Scrap"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-bold text-slate-500 uppercase">Phone</label>
+                          <input 
+                            className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                            value={newCustomer.phone}
+                            onChange={e => setNewCustomer({...newCustomer, phone: e.target.value})}
+                            placeholder="(555) 000-0000"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-bold text-slate-500 uppercase">Address</label>
+                          <input 
+                            className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                            value={newCustomer.address}
+                            onChange={e => setNewCustomer({...newCustomer, address: e.target.value})}
+                            placeholder="123 Main St"
+                          />
+                        </div>
                       </div>
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-slate-500 uppercase">Business Name (Optional)</label>
-                        <input 
-                          className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
-                          value={newCustomer.businessName}
-                          onChange={e => setNewCustomer({...newCustomer, businessName: e.target.value})}
-                          placeholder="Acme Scrap"
+
+                      <div className="pt-4 border-t border-slate-200 space-y-2">
+                        <h5 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                          <span>Driver's License / Official ID Copy</span>
+                          {ticketDetails.idImageUrl ? (
+                            <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-black uppercase">Captured</span>
+                          ) : (
+                            <span className="text-[8px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-black uppercase">Important Check</span>
+                          )}
+                        </h5>
+                        <p className="text-[10px] text-slate-500">Ohio ORC 4737.04 photo copy compliance of identity.</p>
+                        <CameraCapture 
+                          label="Capture ID Document Copy"
+                          onCapture={(url) => {
+                            setTicketDetails({ ...ticketDetails, idImageUrl: url });
+                            setShowIdConfirm(false);
+                            if (url) {
+                              handleReadIDFromPhoto(url);
+                            }
+                          }}
+                          networkUrl={settings.useSwannCams ? settings.swannCams.customer : undefined}
+                          className="aspect-video w-full rounded-xl overflow-hidden"
                         />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-slate-500 uppercase">Phone</label>
-                        <input 
-                          className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
-                          value={newCustomer.phone}
-                          onChange={e => setNewCustomer({...newCustomer, phone: e.target.value})}
-                          placeholder="(555) 000-0000"
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold text-slate-500 uppercase">Address</label>
-                        <input 
-                          className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500"
-                          value={newCustomer.address}
-                          onChange={e => setNewCustomer({...newCustomer, address: e.target.value})}
-                          placeholder="123 Main St"
-                        />
+                        {isReadingID && (
+                          <div className="p-3 bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl flex items-center gap-2.5 animate-pulse mt-2">
+                            <Loader2 className="w-4.5 h-4.5 animate-spin text-blue-600 shrink-0" />
+                            <div className="flex-1">
+                              <p className="text-[10px] font-extrabold text-blue-900 uppercase tracking-wider">AI OCR Reading ID...</p>
+                              <p className="text-[9px] text-blue-600 font-medium">Extracting customer information and auto-filling...</p>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   ) : (
                     <div className="space-y-4">
-                      <div className="relative">
-                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
-                        <select 
-                          className="w-full pl-10 pr-4 py-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all appearance-none font-bold text-slate-900"
-                          value={selectedCustomer?.id || ''}
-                          onChange={(e) => setSelectedCustomer(customers.find(c => c.id === e.target.value) || null)}
-                        >
-                          <option value="">Select an existing customer...</option>
-                          {customers.map(c => (
-                            <option key={c.id} value={c.id}>{c.name} {c.businessName ? `(${c.businessName})` : ''}</option>
-                          ))}
-                        </select>
-                        <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 pointer-events-none" />
-                      </div>
-                      {selectedCustomer && (
-                        <div className="p-4 bg-blue-50 border border-blue-100 rounded-xl flex items-center gap-4">
-                          <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center text-blue-600 shadow-sm">
+                      {!selectedCustomer && (
+                        <div className="flex flex-col items-center justify-center py-10 px-4 bg-slate-50 border-2 border-dashed border-slate-200 rounded-2xl text-center space-y-4 animate-in fade-in duration-200">
+                          <div className="w-12 h-12 bg-blue-50 rounded-full flex items-center justify-center text-blue-600 shadow-inner">
                             <User className="w-6 h-6" />
                           </div>
+                          <div className="max-w-xs space-y-1">
+                            <h4 className="font-black text-slate-900 text-sm">No Seller Selected</h4>
+                            <p className="text-xs text-slate-500 font-semibold leading-relaxed">
+                              Find an existing customer from our database directory or register a new customer profile.
+                            </p>
+                          </div>
+                          <div className="flex flex-col sm:flex-row gap-3 w-full max-w-xs pt-1">
+                            <button
+                              type="button"
+                              onClick={() => setIsCustomerLookupOpen(true)}
+                              className="flex-1 px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-wider shadow-sm transition-all active:scale-95 flex items-center justify-center gap-1.5"
+                            >
+                              <Search className="w-3.5 h-3.5" />
+                              Search Previous
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsNewCustomer(true);
+                              }}
+                              className="flex-1 px-4 py-3 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-xl text-xs font-black uppercase tracking-wider transition-all active:scale-95 flex items-center justify-center gap-1.5"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              Add New
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {selectedCustomer && (
+                        <div className="space-y-4 animate-in fade-in duration-250">
+                          <div className="p-4 bg-blue-50 border border-blue-100 rounded-xl flex items-center justify-between gap-4">
+                            <div className="flex items-center gap-4">
+                              <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center text-blue-600 shadow-sm">
+                                <User className="w-6 h-6" />
+                              </div>
+                              <div>
+                                <p className="font-bold text-blue-900">{selectedCustomer.name}</p>
+                                <p className="text-xs text-blue-600">{selectedCustomer.phone || 'No phone'} • {selectedCustomer.address || 'No address'}</p>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedCustomer(null);
+                                setCustomerSearch('');
+                              }}
+                              className="p-1.5 text-slate-400 hover:text-slate-600 bg-white hover:bg-slate-50 border border-slate-200 rounded-full transition-colors shrink-0"
+                              title="Clear customer"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          </div>
+
+                          <div className="p-6 bg-slate-50 rounded-2xl border border-slate-200 space-y-2">
+                            <h5 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                              <span>Driver's License / Official ID Copy</span>
+                              {ticketDetails.idImageUrl ? (
+                                <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-black uppercase">Captured</span>
+                              ) : (
+                                <span className="text-[8px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-black uppercase">Important Check</span>
+                              )}
+                            </h5>
+                            <p className="text-[10px] text-slate-500">Scan or snapshot of state-issued ID for official records record-keeping.</p>
+                            <CameraCapture 
+                              label="Capture ID Document Copy"
+                              onCapture={(url) => {
+                                setTicketDetails({ ...ticketDetails, idImageUrl: url });
+                                setShowIdConfirm(false);
+                                if (url) {
+                                  handleReadIDFromPhoto(url);
+                                }
+                              }}
+                              networkUrl={settings.useSwannCams ? settings.swannCams.customer : undefined}
+                              className="aspect-video w-full rounded-xl overflow-hidden"
+                            />
+                            {isReadingID && (
+                              <div className="p-3 bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl flex items-center gap-2.5 animate-pulse mt-2">
+                                <Loader2 className="w-4.5 h-4.5 animate-spin text-blue-600 shrink-0" />
+                                <div className="flex-1">
+                                  <p className="text-[10px] font-extrabold text-blue-900 uppercase tracking-wider">AI OCR Reading ID...</p>
+                                  <p className="text-[9px] text-blue-600 font-medium">Extracting customer information and auto-filling...</p>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {showIdConfirm && (
+                    <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl flex gap-3 items-center animate-in zoom-in-95 mt-4" role="alert">
+                      <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
+                      <div className="flex-1 text-xs">
+                        <p className="font-extrabold text-amber-900 text-sm">Bypass State ID Warning</p>
+                        <p className="text-amber-700 font-medium">Ohio state ORC § 4737.04 compliance regulates active capture of state ID copies. To ignore, click Bypass.</p>
+                      </div>
+                      <button 
+                        type="button"
+                        onClick={() => {
+                          setShowIdConfirm(false);
+                          setIdCheckResult({ prohibited: false });
+                          setStep(2);
+                        }}
+                        className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black shadow-lg shadow-amber-200/50 transition-all hover:scale-102"
+                      >
+                        Bypass Check
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Ohio Dept of Homeland Security Scrap Database Check */}
+                  {(selectedCustomer || (isNewCustomer && newCustomer.name)) && (
+                    <div className="mt-6 pt-6 border-t border-slate-200 space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2.5">
+                          <div className="p-1.5 bg-amber-100 text-amber-700 rounded-lg">
+                            <Fingerprint className="w-4 h-4" />
+                          </div>
                           <div>
-                            <p className="font-bold text-blue-900">{selectedCustomer.name}</p>
-                            <p className="text-xs text-blue-600">{selectedCustomer.phone || 'No phone'} • {selectedCustomer.address || 'No address'}</p>
+                            <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Ohio Homeland Security Check</h4>
+                            <p className="text-[10px] text-slate-500 font-medium">Verify seller against the state scrap database</p>
+                          </div>
+                        </div>
+                        {ticketDetails.ohioDatabaseStatus === 'cleared' ? (
+                          <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[8px] font-black uppercase rounded border border-emerald-200 flex items-center gap-0.5 font-sans">
+                            <Check className="w-2.5 h-2.5" /> Cleared
+                          </span>
+                        ) : ticketDetails.ohioDatabaseStatus === 'flagged' ? (
+                          <span className="px-2 py-0.5 bg-red-100 text-red-800 text-[8px] font-black uppercase rounded border border-red-200 flex items-center gap-0.5 font-sans">
+                            <AlertTriangle className="w-2.5 h-2.5 animate-pulse" /> Flagged
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 bg-amber-100 text-amber-800 text-[8px] font-black uppercase rounded border border-amber-200 font-sans">
+                            Pending
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="bg-slate-100/75 border border-slate-200 rounded-xl p-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {/* Copy info helper */}
+                        <div className="space-y-1.5">
+                          <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Seller Details (Click to copy)</p>
+                          <div className="grid grid-cols-1 gap-1 text-[11px]">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const name = selectedCustomer?.name || newCustomer.name || '';
+                                navigator.clipboard.writeText(name);
+                              }}
+                              className="flex items-center justify-between px-2.5 py-1.5 bg-white hover:bg-slate-50 rounded-lg border border-slate-200 text-left font-bold transition-all text-slate-700 w-full"
+                            >
+                              <span className="truncate">Name: <span className="text-slate-900 font-mono">{selectedCustomer?.name || newCustomer.name || 'N/A'}</span></span>
+                              <Copy className="w-3 h-3 text-slate-400 shrink-0 ml-1.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const addressStr = selectedCustomer?.address || newCustomer.address || '';
+                                navigator.clipboard.writeText(addressStr);
+                              }}
+                              className="flex items-center justify-between px-2.5 py-1.5 bg-white hover:bg-slate-50 rounded-lg border border-slate-200 text-left font-bold transition-all text-slate-700 w-full"
+                            >
+                              <span className="truncate">Address: <span className="text-slate-900 font-mono font-normal">{selectedCustomer?.address || newCustomer.address || 'N/A'}</span></span>
+                              <Copy className="w-3 h-3 text-slate-400 shrink-0 ml-1.5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Credentials helper */}
+                        <div className="space-y-1.5 border-t sm:border-t-0 sm:border-l border-slate-200 sm:pl-3 pt-3 sm:pt-0">
+                          <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Portal Credentials (Click to copy)</p>
+                          <div className="grid grid-cols-1 gap-1 text-[11px]">
+                            <div className="flex items-center justify-between px-2.5 py-1.5 bg-white rounded-lg border border-slate-200 font-semibold text-slate-700">
+                              <span className="truncate">User: <span className="font-mono font-bold text-slate-900">{settings.ohioScrapUsername || 'Not Configured'}</span></span>
+                              {settings.ohioScrapUsername && (
+                                <button
+                                  type="button"
+                                  onClick={() => navigator.clipboard.writeText(settings.ohioScrapUsername)}
+                                  className="p-0.5 hover:bg-slate-100 rounded border border-slate-200 text-slate-500 hover:text-slate-700 transition-all shrink-0 ml-1.5"
+                                  title="Copy Username"
+                                >
+                                  <Copy className="w-2.5 h-2.5" />
+                                </button>
+                              )}
+                            </div>
+                            <div className="flex items-center justify-between px-2.5 py-1.5 bg-white rounded-lg border border-slate-200 font-semibold text-slate-700">
+                              <span className="truncate">Pass: <span className="font-mono font-bold text-slate-900">{settings.ohioScrapPassword ? '••••••••' : 'Not Configured'}</span></span>
+                              {settings.ohioScrapPassword && (
+                                <button
+                                  type="button"
+                                  onClick={() => navigator.clipboard.writeText(settings.ohioScrapPassword)}
+                                  className="p-0.5 hover:bg-slate-100 rounded border border-slate-200 text-slate-500 hover:text-slate-700 transition-all shrink-0 ml-1.5"
+                                  title="Copy Password"
+                                >
+                                  <Copy className="w-2.5 h-2.5" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => runOhioCheck()}
+                          disabled={isCheckingOhioPortal}
+                          className="px-3 py-2 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white rounded-lg text-[9px] font-black uppercase tracking-widest transition-all flex items-center gap-1"
+                        >
+                          {isCheckingOhioPortal ? (
+                            <>
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                              Checking...
+                            </>
+                          ) : (
+                            <>
+                              <Fingerprint className="w-3 h-3" />
+                              Automated Check
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => window.open(settings.ohioScrapPortalUrl, '_blank')}
+                          className="px-3 py-2 bg-slate-900 hover:bg-blue-600 text-white rounded-lg text-[9px] font-black uppercase tracking-widest transition-all flex items-center gap-1"
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          Open Portal
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTicketDetails(prev => ({ ...prev, ohioDatabaseStatus: 'cleared' }));
+                            setOhioCheckMessage("Manually marked as CLEARED.");
+                          }}
+                          className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest border transition-all ${
+                            ticketDetails.ohioDatabaseStatus === 'cleared'
+                              ? 'bg-emerald-100 border-emerald-200 text-emerald-800'
+                              : 'bg-white hover:bg-emerald-50 border-slate-200 text-slate-700 hover:text-emerald-700'
+                          }`}
+                        >
+                          Mark Cleared
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTicketDetails(prev => ({ ...prev, ohioDatabaseStatus: 'flagged' }));
+                            setOhioCheckMessage("Manually marked as FLAGGED / HOLD.");
+                          }}
+                          className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest border transition-all ${
+                            ticketDetails.ohioDatabaseStatus === 'flagged'
+                              ? 'bg-red-100 border-red-200 text-red-800'
+                              : 'bg-white hover:bg-red-50 border-slate-200 text-slate-700 hover:text-red-700'
+                          }`}
+                        >
+                          Mark Flagged
+                        </button>
+                      </div>
+
+                      {ohioCheckMessage && (
+                        <div className={`p-2.5 rounded-lg border text-[10px] font-semibold flex items-start gap-1.5 mt-2 ${
+                          ticketDetails.ohioDatabaseStatus === 'flagged'
+                            ? 'bg-rose-50 border-rose-200 text-rose-800'
+                            : ticketDetails.ohioDatabaseStatus === 'cleared'
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                            : 'bg-amber-50 border-amber-200 text-amber-800'
+                        }`}>
+                          <div className="flex-1">
+                            <p className="font-extrabold uppercase text-[8px] tracking-wider mb-0.5">Ohio Portal Check Status</p>
+                            <p className="leading-relaxed font-mono">{ohioCheckMessage}</p>
                           </div>
                         </div>
                       )}
@@ -577,9 +1348,41 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                                   }
                                 }}
                                 onFocus={() => updateItem(item.id, { isDropdownOpen: true })}
+                                onBlur={() => {
+                                  // Delay to allow onMouseDown/onTouchStart to fire first
+                                  setTimeout(() => {
+                                    setItems(currentItems => currentItems.map(i => {
+                                      if (i.id === item.id) {
+                                        if (i.isDropdownOpen) {
+                                          const search = (i.materialSearch || '').toLowerCase();
+                                          if (search && !i.material) {
+                                            const filtered = materials.filter(m => 
+                                              m.name.toLowerCase().includes(search) || 
+                                              m.code.toLowerCase().includes(search)
+                                            );
+                                            if (filtered.length > 0) {
+                                              return {
+                                                ...i,
+                                                material: filtered[0],
+                                                materialSearch: '',
+                                                isDropdownOpen: false,
+                                                materialId: filtered[0].id,
+                                                pricePerUnit: filtered[0].buyPrice
+                                              };
+                                            }
+                                          }
+                                          return { ...i, isDropdownOpen: false };
+                                        }
+                                      }
+                                      return i;
+                                    }));
+                                  }, 150);
+                                }}
                                 onKeyDown={(e) => {
                                   if (e.key === 'Tab' || e.key === 'Enter') {
+                                    if (item.material && !(item.materialSearch || '').trim()) return;
                                     const search = (item.materialSearch || '').toLowerCase();
+                                    if (!search) return;
                                     const filtered = materials.filter(m => 
                                       m.name.toLowerCase().includes(search) || 
                                       m.code.toLowerCase().includes(search)
@@ -595,7 +1398,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                                       if (bCode.startsWith(search) && !aCode.startsWith(search)) return 1;
                                       if (aName.startsWith(search) && !bName.startsWith(search)) return -1;
                                       if (bName.startsWith(search) && !aName.startsWith(search)) return 1;
-                                      return aCode.localeCompare(bCode);
+                                      return aCode.localeCompare(bCode, undefined, { numeric: true, sensitivity: 'base' });
                                     });
                                     
                                     if (filtered.length > 0) {
@@ -637,12 +1440,16 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                                         if (bCode.startsWith(search) && !aCode.startsWith(search)) return 1;
                                         if (aName.startsWith(search) && !bName.startsWith(search)) return -1;
                                         if (bName.startsWith(search) && !aName.startsWith(search)) return 1;
-                                        return aCode.localeCompare(bCode);
+                                        return aCode.localeCompare(bCode, undefined, { numeric: true, sensitivity: 'base' });
                                       })
                                       .map(m => (
                                         <button
                                           key={m.id}
                                           onMouseDown={(e) => {
+                                            e.preventDefault();
+                                            updateItem(item.id, { material: m, isDropdownOpen: false, materialSearch: '', pricePerUnit: m.buyPrice });
+                                          }}
+                                          onTouchStart={(e) => {
                                             e.preventDefault();
                                             updateItem(item.id, { material: m, isDropdownOpen: false, materialSearch: '', pricePerUnit: m.buyPrice });
                                           }}
@@ -681,6 +1488,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                             <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Tare (lb)</label>
                             <input 
                               type="number"
+                              step="0.5"
                               className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 font-black shadow-sm"
                               value={item.tareWeight || ''}
                               onChange={e => updateItem(item.id, { tareWeight: Number(e.target.value) })}
@@ -704,11 +1512,9 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                               <input 
                                 type="number"
                                 step="0.01"
-                                className="w-full pl-9 pr-4 py-3 bg-white border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 font-bold disabled:bg-slate-50 disabled:text-slate-400"
+                                className="w-full pl-9 pr-4 py-3 bg-white border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 font-bold"
                                 value={item.pricePerUnit || ''}
                                 onChange={e => updateItem(item.id, { pricePerUnit: Number(e.target.value) })}
-                                readOnly={!profile?.permissions?.canManagePrices}
-                                disabled={!profile?.permissions?.canManagePrices}
                               />
                             </div>
                           </div>
@@ -778,16 +1584,19 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                     Additional Ticket Details
                   </h4>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                     <div className="space-y-4">
                       <div className="space-y-1">
                         <label className="text-[10px] font-bold text-slate-500 uppercase">Vehicle Plate</label>
                         <div className="relative">
                           <Truck className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                           <input 
-                            className="w-full pl-9 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 font-bold uppercase"
+                            className="w-full pl-9 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 font-bold uppercase text-slate-900"
                             value={ticketDetails.vehiclePlate}
-                            onChange={e => setTicketDetails({...ticketDetails, vehiclePlate: e.target.value})}
+                            onChange={e => {
+                              setTicketDetails({...ticketDetails, vehiclePlate: e.target.value});
+                              setShowVehicleConfirm(false);
+                            }}
                             placeholder="ABC-1234"
                           />
                         </div>
@@ -795,12 +1604,35 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                       <div className="space-y-1">
                         <label className="text-[10px] font-bold text-slate-500 uppercase">Vehicle Type</label>
                         <input 
-                          className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500"
+                          className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 text-slate-900"
                           value={ticketDetails.vehicleType}
-                          onChange={e => setTicketDetails({...ticketDetails, vehicleType: e.target.value})}
+                          onChange={e => {
+                            setTicketDetails({...ticketDetails, vehicleType: e.target.value});
+                            setShowVehicleConfirm(false);
+                          }}
                           placeholder="F-150, Silverado, etc."
                         />
                       </div>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-bold text-slate-500 uppercase flex items-center justify-between">
+                        <span>Gate / Entrance Photo</span>
+                        {ticketDetails.vehiclePhotoUrl ? (
+                          <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-black uppercase">Captured</span>
+                        ) : (
+                          <span className="text-[8px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-black uppercase">Required</span>
+                        )}
+                      </label>
+                      <CameraCapture 
+                        label="Take Entrance Photo"
+                        onCapture={(url) => {
+                          setTicketDetails({ ...ticketDetails, vehiclePhotoUrl: url });
+                          setShowVehicleConfirm(false);
+                        }}
+                        networkUrl={settings.useSwannCams ? settings.swannCams.entrance : undefined}
+                        className="aspect-video w-full rounded-xl overflow-hidden"
+                      />
                     </div>
 
                     <div className="space-y-4">
@@ -809,10 +1641,11 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                         <div className="grid grid-cols-3 gap-2">
                           {(['cash', 'check', 'other'] as const).map(method => (
                             <button
+                              type="button"
                               key={method}
                               onClick={() => setTicketDetails({...ticketDetails, paymentMethod: method})}
                               className={cn(
-                                "py-3 rounded-xl border text-xs font-bold capitalize transition-all",
+                                "py-3 rounded-xl border text-xs font-bold capitalize transition-all outline-none focus:ring-2 focus:ring-blue-500",
                                 ticketDetails.paymentMethod === method 
                                   ? "bg-blue-600 border-blue-600 text-white shadow-md" 
                                   : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
@@ -839,17 +1672,18 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                     <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl flex gap-3 items-center animate-in zoom-in-95 duration-200">
                       <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
                       <div className="flex-1">
-                        <p className="text-sm font-bold text-amber-900">Missing Transportation Details</p>
-                        <p className="text-xs text-amber-700">Vehicle information is recommended for compliance. Are you sure you want to proceed without it?</p>
+                        <p className="text-sm font-bold text-amber-900">Missing Transportation Compliance details</p>
+                        <p className="text-xs text-amber-700">Ohio law advises capturing active transportation credentials (license plate text, vehicle model, and gate entrance photos). Are you sure you want to bypass select checks?</p>
                       </div>
                       <button 
+                        type="button"
                         onClick={() => {
                           setShowVehicleConfirm(false);
                           setStep(4);
                         }}
-                        className="px-4 py-2 bg-amber-600 text-white text-xs font-bold rounded-lg hover:bg-amber-700 transition-colors"
+                        className="px-4 py-2 bg-amber-600 text-white text-xs font-black rounded-xl shadow-lg shadow-amber-200 hover:bg-amber-700 transition-all hover:scale-102"
                       >
-                        Yes, Proceed
+                        Bypass &amp; Review
                       </button>
                     </div>
                   )}
@@ -923,6 +1757,21 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
 
                   <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200">
                     <h5 className="text-[10px] font-bold text-slate-400 uppercase mb-2">Digital Signature</h5>
+                    
+                    <div className="mb-4 p-4 bg-white rounded-2xl border border-slate-200 text-left space-y-2">
+                      <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">SMS Communication Consent</span>
+                      <p className="text-[10px] text-slate-500 font-medium leading-relaxed">
+                        Do you agree to receive text messages from Preferred Metals & Recycling? Message frequency varies. Message and data rates may apply. Reply STOP to opt out and HELP for help. No mobile information will be shared with third parties or affiliates for marketing or promotional purposes. All OPT-IN requests include text messaging originator opt-in data and consent; this information will not be shared with third parties.
+                      </p>
+                      <div className="flex items-center gap-2 pt-1">
+                        <span className="text-xs font-bold text-slate-900">Customer:</span>
+                        <span className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-green-50 text-green-700 text-[10px] font-black uppercase rounded-md border border-green-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                          Yes
+                        </span>
+                      </div>
+                    </div>
+
                     <SignaturePad 
                       onCapture={(url) => setTicketDetails({ ...ticketDetails, signatureUrl: url })}
                       onClear={() => setTicketDetails({ ...ticketDetails, signatureUrl: '' })}
@@ -952,7 +1801,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
           <div className="p-6 bg-slate-50 border-t border-slate-100 flex items-center justify-between shrink-0">
             <button
               onClick={handleBack}
-              disabled={step === 1 || processing}
+              disabled={(step === 1 && !showIdConfirm) || processing}
               className="px-6 py-3 text-slate-600 font-bold hover:bg-slate-200 rounded-xl transition-all disabled:opacity-0"
             >
               Back
@@ -963,11 +1812,13 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                   onClick={handleNext}
                   disabled={
                     (step === 1 && !selectedCustomer && (!isNewCustomer || !newCustomer.name)) ||
-                    (step === 2 && items.some(i => !i.material || i.netWeight <= 0))
+                    (step === 2 && items.some(i => !i.material || i.netWeight <= 0)) ||
+                    showIdConfirm ||
+                    showVehicleConfirm
                   }
                   className="px-8 py-3 bg-slate-900 text-white rounded-xl font-bold hover:bg-slate-800 transition-all shadow-lg shadow-slate-200 flex items-center gap-2 disabled:opacity-50"
                 >
-                  Continue <ChevronRight className="w-4 h-4" />
+                  {(showIdConfirm || showVehicleConfirm) ? 'Acknowledge Warning' : <>Continue <ChevronRight className="w-4 h-4" /></>}
                 </button>
               ) : (
                 <button
@@ -989,6 +1840,67 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
         onSuccess={() => saveTicket()}
       />
 
+      {dbHistoryAlert && dbHistoryAlert.isOpen && (
+        <div id="db-history-alert-modal" className="fixed inset-0 bg-slate-900/80 z-[250] flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white rounded-3xl w-full max-w-sm p-6 shadow-2xl border-2 border-green-500 text-center space-y-6">
+            <div className="w-16 h-16 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto">
+              <Database className="w-8 h-8 animate-pulse text-green-600" />
+            </div>
+            <div className="space-y-2">
+              <h3 className="text-xl font-extrabold text-slate-900">Stored in History</h3>
+              <p className="text-sm text-slate-500">
+                This ticket has been successfully stored in the Firestore database history.
+              </p>
+            </div>
+            
+            <div className="bg-slate-50 rounded-2xl p-4 text-left border border-slate-100 text-xs font-mono space-y-2">
+              <div className="flex justify-between">
+                <span className="text-slate-400">STATUS:</span>
+                <span className="text-green-600 font-bold">WRITTEN &amp; VERIFIED</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">TICKET ID:</span>
+                <span className="text-slate-900 font-black break-all">{dbHistoryAlert.ticketId}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">CUSTOMER:</span>
+                <span className="text-slate-900 font-bold">{dbHistoryAlert.customerName}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">PAYOUT:</span>
+                <span className="text-green-600 font-bold">${dbHistoryAlert.totalAmount.toFixed(2)}</span>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                id="btn-confirm-alert-ok"
+                onClick={() => {
+                  setDbHistoryAlert(null);
+                  if (settings.autoPrint) {
+                    setShowPrintPreview(true);
+                  }
+                }}
+                className="flex-1 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl transition-all shadow-md active:scale-95 text-sm"
+              >
+                Close &amp; OK
+              </button>
+              <button
+                id="btn-confirm-alert-print"
+                onClick={async () => {
+                  setDbHistoryAlert(null);
+                  await new Promise(r => setTimeout(r, 100));
+                  setShowPrintPreview(true);
+                }}
+                className="px-4 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition-all text-sm flex items-center justify-center gap-1.5"
+              >
+                <Printer className="w-4 h-4" /> Print
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Print Preview Modal */}
       {showPrintPreview && lastCreatedTicket && (
         <div className="fixed inset-0 bg-slate-900/80 z-[200] flex items-center justify-center p-4 backdrop-blur-md animate-in fade-in duration-300">
@@ -1009,7 +1921,17 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
               </button>
             </div>
             
-            <div className="p-8 overflow-y-auto flex-1 bg-slate-50">
+            <div className="p-8 overflow-y-auto flex-1 bg-slate-50 space-y-4">
+              <div className="p-3.5 bg-blue-50/80 border border-blue-200 rounded-2xl text-left space-y-1">
+                <p className="text-xs font-extrabold text-blue-900 flex items-center gap-1.5">
+                  <span>💡</span>
+                  Browser Printing Pro-Tip
+                </p>
+                <p className="text-[10px] text-blue-800 leading-normal font-medium">
+                  If the print pop-up is blocked or does not open, make sure to click <strong>"Open in New Tab"</strong> at the top of AI Studio. Browsers block system dialogue windows within sandboxed preview frames!
+                </p>
+              </div>
+
               {isPreviewOnly && (
                 <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-center">
                   <p className="text-[10px] font-bold text-amber-800 uppercase tracking-widest">Draft Preview Only - Not Saved</p>
@@ -1026,7 +1948,8 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                     <BrandLogo className="h-10 w-auto object-contain grayscale" grayscale />
                   </div>
                   <h1 className="text-xl font-black uppercase tracking-tight">{COMPANY_NAME}</h1>
-                  <p className="text-[10px] text-slate-500 font-bold">{COMPANY_ADDRESS}</p>
+                  <p className="text-[10px] text-slate-400 font-medium tracking-wide mt-0.5">{COMPANY_WEBSITE}</p>
+                  <p className="text-[10px] text-slate-500 font-bold mt-1">{COMPANY_ADDRESS}</p>
                   <p className="text-[10px] text-slate-500">{COMPANY_PHONE}</p>
                   <div className="mt-2 pt-2 border-t border-slate-50">
                     <p className="text-[10px] text-slate-500 mt-1 uppercase font-bold tracking-widest">Official Buy Ticket</p>
@@ -1068,7 +1991,10 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                             </div>
                           </div>
                           <div className="flex justify-between text-[9px] text-slate-500 pl-5">
-                            <span>{(item.netWeight - (item.deductionWeight || 0))} lb</span>
+                            <span>
+                              {item.netWeight} lb
+                              {item.deductionWeight ? ` (Ded: -${item.deductionWeight} lb)` : ''}
+                            </span>
                             <span>@ ${item.pricePerUnit.toFixed(2)}/lb</span>
                           </div>
                           {item.notes && (
@@ -1117,16 +2043,23 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                 Cancel
               </button>
               <button 
-                onClick={() => {
-                  if (!settings.debugPrintMode) window.print();
-                  if (!settings.debugPrintMode) {
-                    setShowPrintPreview(false);
-                    if (!isPreviewOnly) {
-                      onClose();
-                      reset();
-                    }
-                  } else {
-                    console.log('DEBUG PRINT: window.print() and reset bypassed.');
+                onClick={async () => {
+                  setShowPrintPreview(false);
+                  await new Promise(r => setTimeout(r, 150));
+                  if (lastCreatedTicket) {
+                    await printTicket(
+                      <BuyTicketPrint 
+                        ticket={lastCreatedTicket} 
+                        customerName={getCustomerName(lastCreatedTicket.customerId)} 
+                        materials={materials} 
+                        format={settings.receiptFormat}
+                      />,
+                      { format: settings.receiptFormat, debugMode: settings.debugPrintMode }
+                    );
+                  }
+                  if (!isPreviewOnly) {
+                    onClose();
+                    reset();
                   }
                 }}
                 className="flex-1 py-3 bg-slate-900 text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 transition-all shadow-lg shadow-slate-200"
@@ -1134,6 +2067,126 @@ export default function BuyTicketModal({ isOpen, onClose, profile }: BuyTicketMo
                 <Printer className="w-5 h-5" />
                 Print Now
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Customer Lookup Directory Modal */}
+      {isCustomerLookupOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-[300] p-4 animate-in fade-in duration-200" role="dialog" aria-modal="true">
+          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-xl max-h-[80vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+            {/* Header */}
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-black text-slate-900 uppercase tracking-tight flex items-center gap-2">
+                  <Search className="w-5 h-5 text-blue-600" />
+                  Previous Customers Directory
+                </h3>
+                <p className="text-xs text-slate-500 font-semibold">Select a customer from database list or type to filter</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsCustomerLookupOpen(false);
+                  setCustomerSearch('');
+                }}
+                className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all"
+                aria-label="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Search Input (No Autocomplete or Dropdown) */}
+            <div className="p-5 bg-slate-50 border-b border-slate-100">
+              <div className="relative">
+                <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4.5 h-4.5 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Search by name, phone, or business name..."
+                  className="w-full pl-10 pr-10 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all font-bold text-slate-900 text-sm"
+                  value={customerSearch}
+                  onChange={(e) => setCustomerSearch(e.target.value)}
+                  autoFocus
+                />
+                {customerSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setCustomerSearch('')}
+                    className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1 bg-slate-200 rounded-full transition-colors"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Scrollable Customer List */}
+            <div className="flex-1 overflow-y-auto p-5 space-y-2.5 custom-scrollbar">
+              {(() => {
+                const search = customerSearch.toLowerCase().trim();
+                const filtered = customers.filter(c => {
+                  if (!search) return true; // Show all by default in the modal directory
+                  return (
+                    c.name.toLowerCase().includes(search) ||
+                    (c.phone || '').includes(search) ||
+                    (c.businessName || '').toLowerCase().includes(search)
+                  );
+                });
+
+                if (filtered.length === 0) {
+                  return (
+                    <div className="py-10 text-center space-y-3">
+                      <p className="text-slate-500 font-semibold text-xs">No customers found matching "{customerSearch}"</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNewCustomer(prev => ({ ...prev, name: customerSearch }));
+                          setIsNewCustomer(true);
+                          setIsCustomerLookupOpen(false);
+                          setCustomerSearch('');
+                        }}
+                        className="px-4 py-2 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-xl text-[10px] font-black uppercase tracking-wider transition-colors inline-flex items-center gap-1.5"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Register "{customerSearch}" as New Customer
+                      </button>
+                    </div>
+                  );
+                }
+
+                return filtered.map(c => (
+                  <div
+                    key={c.id}
+                    className="p-3 border border-slate-100 hover:border-slate-200 rounded-xl hover:bg-slate-50 flex items-center justify-between transition-all"
+                  >
+                    <div>
+                      <h4 className="font-black text-slate-900 text-xs">{c.name}</h4>
+                      <p className="text-[10px] text-slate-500 font-semibold mt-0.5">
+                        {c.phone || 'No Phone'} {c.address ? `• ${c.address}` : ''}
+                      </p>
+                      {c.businessName && (
+                        <div className="mt-1">
+                          <span className="px-1.5 py-0.5 bg-slate-100 text-slate-600 text-[8px] font-black uppercase rounded border border-slate-200">
+                            {c.businessName}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedCustomer(c);
+                        setIsCustomerLookupOpen(false);
+                        setCustomerSearch('');
+                      }}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 shadow-sm"
+                    >
+                      Select
+                    </button>
+                  </div>
+                ));
+              })()}
             </div>
           </div>
         </div>

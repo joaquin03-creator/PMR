@@ -18,77 +18,128 @@
   }
   .print-template { display: none; }
   
-  @media print {
-    @page { 
-      margin: 0; 
-      size: auto; 
+  @media screen {
+    #print-root {
+      display: none !important;
     }
+  }
+  
+  @media print {
+    @page { margin: 0.5in; size: letter portrait; }
+    @page landscape-document { size: letter landscape; margin: 0.5in; }
     
     html, body {
-      height: auto !important;
-      min-height: 100% !important;
-      overflow: visible !important;
       background: white !important;
+      color: black !important;
+      height: auto !important;
+      min-height: 0 !important;
+      max-height: none !important;
+      overflow: visible !important;
+      position: static !important;
       -webkit-print-color-adjust: exact !important;
       print-color-adjust: exact !important;
-      margin: 0 !important;
-      padding: 0 !important;
-    }
-
-    /* Hide EVERYTHING normally */
-    body * {
-      visibility: hidden;
-    }
-
-    /* Reset layout constraints on all ancestors safely so absolute positioning anchors to body */
-    * {
-      transform: none !important;
-      transition: none !important;
-      animation: none !important;
     }
     
-    /* Show only the printable components */
-    .print-ticket, .print-ticket *,
-    .print-template, .print-template *,
-    #printable-invoice, #printable-invoice *,
-    .bol-container, .bol-container * {
-      visibility: visible !important;
+    /* Reset all layout containers' height and overflow for clean multi-page document flow */
+    body:not(.printing-via-print-root) #root,
+    body:not(.printing-via-print-root) #root > div,
+    body:not(.printing-via-print-root) #root > div > div,
+    body:not(.printing-via-print-root) #root > div > div > main,
+    body:not(.printing-via-print-root) main {
+      display: block !important;
+      height: auto !important;
+      min-height: 0 !important;
+      max-height: none !important;
+      overflow: visible !important;
+      position: static !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      transform: none !important;
+      animation: none !important;
+      box-shadow: none !important;
+    }
+    
+    /* Conditionally hide root only when printing a ticket via print-root */
+    body.printing-via-print-root > * { display: none !important; }
+    body.printing-via-print-root #root,
+    body.printing-via-print-root > #root { display: none !important; }
+    body.printing-via-print-root > #print-root { display: block !important; }
+    
+    /* Hide print-root when printing standard pages from root */
+    body:not(.printing-via-print-root) > #print-root { display: none !important; }
+    
+    #print-root { display: block !important; visibility: visible !important; overflow: visible !important; position: static !important; transform: none !important; animation: none !important; }
+    #print-root * { visibility: visible !important; }
+    
+    /* Global table scale and wrap tuning to force fitting in Portrait mode */
+    body:not(.printing-via-print-root) table, 
+    body:not(.printing-via-print-root) thead, 
+    body:not(.printing-via-print-root) tbody, 
+    body:not(.printing-via-print-root) tr {
+      width: 100% !important;
+      max-width: 100% !important;
+      min-width: 0 !important;
+      table-layout: auto !important;
     }
 
-    /* Remove clipping from common modal patterns */
-    .fixed, .absolute, .overflow-y-auto, .overflow-hidden, dialog, [role="dialog"] {
-      position: static !important;
+    /* Reset elements using min-w-[...] tailwind values within printed layouts */
+    body:not(.printing-via-print-root) [class*="min-w-"] {
+      min-width: 0 !important;
+    }
+
+    /* Ensure scroll containers don't clip horizontal page content */
+    body:not(.printing-via-print-root) .overflow-x-auto, 
+    body:not(.printing-via-print-root) .overflow-y-auto, 
+    body:not(.printing-via-print-root) .overflow-auto,
+    body:not(.printing-via-print-root) .overflow-hidden {
       overflow: visible !important;
       max-height: none !important;
-      height: auto !important;
+      min-height: 0 !important;
     }
 
-    /* Detach printable items and place them at top-left */
-    .print-ticket,
-    .print-template,
-    #printable-invoice,
-    .bol-container {
-      position: absolute !important;
-      top: 0 !important;
-      left: 0 !important;
-      right: 0 !important;
-      margin: 0 !important;
-      padding: 0.5in !important;
-      width: 100% !important;
-      max-width: none !important;
+    /* Target standard table headings and cells to shrink paddings, wrap text, and scale down typography */
+    body:not(.printing-via-print-root) th, 
+    body:not(.printing-via-print-root) td {
+      white-space: normal !important;
+      word-break: break-word !important;
+      overflow-wrap: break-word !important;
+      padding: 6px 4px !important;
+      font-size: 8pt !important;
+      line-height: 1.2 !important;
+    }
+
+    /* Hide redundant elements in table headers such as sorting arrows */
+    body:not(.printing-via-print-root) th svg,
+    body:not(.printing-via-print-root) td svg {
+      display: none !important;
+    }
+
+    /* Disable line-clamping on printed elements so they can wrap naturally and present full data */
+    body:not(.printing-via-print-root) [class*="line-clamp-"] {
+      display: block !important;
+      -webkit-line-clamp: unset !important;
+      line-clamp: unset !important;
+      text-overflow: clip !important;
+      white-space: normal !important;
+    }
+
+    /* Document replicas should display as clean, non-absolute relative blocks inside page flow */
+    #printable-invoice, .bol-container { 
+      page: landscape-document !important;
+      visibility: visible !important; 
+      position: relative !important; 
+      display: flex !important;
+      width: 100% !important; 
+      max-width: 100% !important;
       height: auto !important;
-      min-height: 100vh !important;
-      background: white !important;
+      min-height: 0 !important;
+      padding: 0 !important; 
+      margin: 0 !important;
+      background: white !important; 
       box-shadow: none !important;
       border: none !important;
-      overflow: visible !important;
     }
-    
-    /* Ensure no-print items inside printable containers stay hidden */
-    .no-print, .no-print * {
-      display: none !important;
-      visibility: hidden !important;
-    }
+    .no-print, .no-print * { display: none !important; }
   }
 } 
 

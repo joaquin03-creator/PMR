@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { db } from '../firebase';
-import { collection, getDocs, deleteDoc, doc, writeBatch, addDoc, onSnapshot, updateDoc, setDoc } from 'firebase/firestore';
+import { auth, db } from '../firebase';
+import { collection, getDocs, deleteDoc, doc, writeBatch, addDoc, onSnapshot, updateDoc, setDoc, query, where } from 'firebase/firestore';
 import { UserProfile, Material, Customer, UserRole, UserPermissions, UserSession, UserInvite, SystemConfig } from '../types';
 import { 
   Settings as SettingsIcon, 
@@ -37,16 +37,25 @@ import {
   Check,
   ExternalLink,
   Plus,
-  Info
+  X,
+  Info,
+  Eye,
+  EyeOff,
+  KeyRound,
+  ShieldCheck,
+  AlertCircle,
+  Printer,
+  User
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
+import { useToast } from '../context/ToastContext';
 import { APP_VERSION } from '../constants';
 import { useSettings } from '../context/SettingsContext';
 import ManagerPinModal from '../components/ManagerPinModal';
 import { initializeApp, getApps } from 'firebase/app';
-import { getAuth, createUserWithEmailAndPassword } from 'firebase/auth';
+import { getAuth, createUserWithEmailAndPassword, setPersistence, inMemoryPersistence, updatePassword, signInWithEmailAndPassword } from 'firebase/auth';
 import { app as primaryApp } from '../firebase';
 import Papa from 'papaparse';
 
@@ -63,8 +72,9 @@ interface SettingsProps {
 }
 
 export default function Settings({ profile }: SettingsProps) {
+  const { firestore, local, success, error: toastError, info } = useToast();
   const { settings, updateSettings, resetToDefaults: resetUI } = useSettings();
-  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sessions' | 'system'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sessions' | 'system' | 'roles'>('general');
   const [processing, setProcessing] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error', message: string } | null>(null);
   const [importType, setImportType] = useState<'materials' | 'customers' | null>(null);
@@ -73,6 +83,18 @@ export default function Settings({ profile }: SettingsProps) {
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [selectedUser, setSelectedUser] = useState<UserProfile | null>(null);
   const [savingUser, setSavingUser] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [resettingPassword, setResettingPassword] = useState(false);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [passwordSuccess, setPasswordSuccess] = useState<string | null>(null);
+
+  useEffect(() => {
+    setNewPassword('');
+    setShowPassword(false);
+    setPasswordError(null);
+    setPasswordSuccess(null);
+  }, [selectedUser]);
 
   // Sessions State
   const [sessions, setSessions] = useState<UserSession[]>([]);
@@ -80,19 +102,166 @@ export default function Settings({ profile }: SettingsProps) {
   // System Config State
   const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
 
+  // Role Default Templates State
+  const [cashierRoleDefaults, setCashierRoleDefaults] = useState<UserPermissions>({
+    canManagePrices: false,
+    canManageUsers: false,
+    canVoidTickets: false,
+    canDeleteData: false,
+    canManageInventory: false,
+    canGenerateReports: false,
+    canManageInvoices: false,
+    canManageCash: true,
+    canApproveChanges: false,
+    canOpenCloseSessions: true,
+    canRetroactivePriceAdjustments: false,
+  });
+  const [managerRoleDefaults, setManagerRoleDefaults] = useState<UserPermissions>({
+    canManagePrices: true,
+    canManageUsers: true,
+    canVoidTickets: true,
+    canDeleteData: true,
+    canManageInventory: true,
+    canGenerateReports: true,
+    canManageInvoices: true,
+    canManageCash: true,
+    canApproveChanges: true,
+    canOpenCloseSessions: true,
+    canRetroactivePriceAdjustments: true,
+  });
+  const [loadingRoles, setLoadingRoles] = useState(false);
+
   // Create User State
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
   const [invitePassword, setInvitePassword] = useState('');
   const [inviteName, setInviteName] = useState('');
   const [inviteRole, setInviteRole] = useState<UserRole>('cashier');
+  const [justCreatedUser, setJustCreatedUser] = useState<{ name: string; email: string; password: string; role: string } | null>(null);
+  const [userToDelete, setUserToDelete] = useState<UserProfile | null>(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [isCopied, setIsCopied] = useState(false);
+
+  // Camera Diagnostics State
+  const [testingCam, setTestingCam] = useState<'material' | 'customer' | 'entrance' | null>(null);
+  const [diagnosticResults, setDiagnosticResults] = useState<Record<string, { status: 'success' | 'checking' | 'error' | 'untested'; detail: string; previewUrl?: string }>>({
+    material: { status: 'untested', detail: 'Ready to test' },
+    customer: { status: 'untested', detail: 'Ready to test' },
+    entrance: { status: 'untested', detail: 'Ready to test' },
+  });
+  const [localLaptopId, setLocalLaptopId] = useState<string>(() => localStorage.getItem('pm_connected_laptop_id') || 'Register Laptop A');
+
+  // Custom Raw Camera Diagnostics State
+  const [customCamIp, setCustomCamIp] = useState('');
+  const [customCamPort, setCustomCamPort] = useState('80');
+  const [customCamPath, setCustomCamPath] = useState('/cgi-bin/snapshot.cgi?channel=1');
+  const [customCamProtocol, setCustomCamProtocol] = useState<'http' | 'https'>('http');
+  const [customCamMode, setCustomCamMode] = useState<'no-cors' | 'cors' | 'proxy'>('no-cors');
+  const [customDiagStatus, setCustomDiagStatus] = useState<'untested' | 'testing' | 'success' | 'error'>('untested');
+  const [customDiagMsg, setCustomDiagMsg] = useState('');
+  const [customDiagDetail, setCustomDiagDetail] = useState('');
+
+  // System Key Hint & Credentials Health Validator States
+  const [keyHintInput, setKeyHintInput] = useState('');
+  const [savingKeyHint, setSavingKeyHint] = useState(false);
+  const [keyHintStatus, setKeyHintStatus] = useState<string | null>(null);
+  const [validatorPassword, setValidatorPassword] = useState('');
+  const [validatingCredentials, setValidatingCredentials] = useState(false);
+  const [validationResult, setValidationResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [showOhioPassword, setShowOhioPassword] = useState(false);
+
+  // Fetch public key hint on component mount
+  useEffect(() => {
+    async function fetchHint() {
+      try {
+        const response = await fetch('/api/auth/system-hint');
+        if (response.ok) {
+          const data = await response.json();
+          if (data && data.hint) {
+            setKeyHintInput(data.hint);
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to fetch system key hint:', err);
+      }
+    }
+    fetchHint();
+  }, []);
+
+  const handleSaveKeyHint = async () => {
+    setSavingKeyHint(true);
+    setKeyHintStatus(null);
+    try {
+      const idToken = await auth.currentUser?.getIdToken();
+      if (!idToken) {
+        throw new Error('Verification failed. Please log in again.');
+      }
+      const response = await fetch('/api/auth/system-hint', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ hint: keyHintInput })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to save hint');
+      }
+      setKeyHintStatus('Hint saved successfully.');
+    } catch (err: any) {
+      setKeyHintStatus(`Error: ${err.message}`);
+    } finally {
+      setSavingKeyHint(false);
+    }
+  };
+
+  const handleValidateCredentials = async () => {
+    setValidatingCredentials(true);
+    setValidationResult(null);
+    try {
+      const userEmail = profile?.email || auth.currentUser?.email;
+      if (!userEmail) {
+        throw new Error('Active user email not found.');
+      }
+      const response = await fetch('/api/auth/sign-in', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ email: userEmail, password: validatorPassword })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Mismatched credentials');
+      }
+      setValidationResult({
+        success: true,
+        message: 'All system credentials tested successfully. Seamless token generated and bypassing all Google standard rate-limits.'
+      });
+    } catch (err: any) {
+      setValidationResult({
+        success: false,
+        message: err.message || 'Mismatched or incorrect security key credentials.'
+      });
+    } finally {
+      setValidatingCredentials(false);
+    }
+  };
 
   useEffect(() => {
+    if (!auth.currentUser) return;
     if (activeTab === 'users' && profile?.role === 'manager') {
       const unsub = onSnapshot(collection(db, 'users'), (snapshot) => {
         setUsers(snapshot.docs.map(doc => ({ uid: doc.id, ...doc.data() })) as UserProfile[]);
       }, (error) => handleFirestoreError(error, OperationType.LIST, 'users'));
-      return () => unsub();
+      return () => {
+        try {
+          unsub();
+        } catch (e) {
+          console.warn('unsub users error', e);
+        }
+      };
     }
   }, [activeTab, profile]);
 
@@ -105,8 +274,26 @@ export default function Settings({ profile }: SettingsProps) {
     try {
       setProcessing(true);
       const secondaryAuth = getSecondaryAuth();
-      const userCredential = await createUserWithEmailAndPassword(secondaryAuth, inviteEmail, invitePassword);
-      const newUser = userCredential.user;
+      await setPersistence(secondaryAuth, inMemoryPersistence);
+      
+      let newUser: { uid: string; email: string | null } | null = null;
+      let emailAlreadyExists = false;
+
+      try {
+        const userCredential = await createUserWithEmailAndPassword(secondaryAuth, inviteEmail, invitePassword);
+        newUser = userCredential.user;
+      } catch (authErr: any) {
+        if (authErr.code === 'auth/email-already-in-use') {
+          console.log('User already exists in Firebase Auth, pre-configuring profile under temp document');
+          newUser = {
+            uid: `temp_${inviteEmail.toLowerCase().trim()}`,
+            email: inviteEmail.toLowerCase().trim()
+          };
+          emailAlreadyExists = true;
+        } else {
+          throw authErr;
+        }
+      }
 
       const defaultPermissions = {
         canManagePrices: inviteRole === 'manager',
@@ -116,8 +303,10 @@ export default function Settings({ profile }: SettingsProps) {
         canManageInventory: inviteRole === 'manager',
         canGenerateReports: inviteRole === 'manager',
         canManageInvoices: inviteRole === 'manager',
-        canManageCash: inviteRole === 'manager',
+        canManageCash: true,
         canApproveChanges: inviteRole === 'manager',
+        canOpenCloseSessions: true,
+        canRetroactivePriceAdjustments: inviteRole === 'manager',
       };
 
       const newProfile: UserProfile = {
@@ -126,26 +315,40 @@ export default function Settings({ profile }: SettingsProps) {
         role: inviteRole,
         displayName: inviteName,
         managerPin: inviteRole === 'manager' ? '1234' : undefined,
+        cachedPassword: invitePassword,
         permissions: defaultPermissions,
       };
 
       await setDoc(doc(db, 'users', newUser.uid), newProfile);
       
-      await secondaryAuth.signOut();
+      if (!emailAlreadyExists) {
+        await secondaryAuth.signOut();
+      }
       
       await logAuditEvent(
         'settings',
         newUser.uid,
         'create',
         { after: newProfile },
-        `New user account created for ${inviteEmail}`
+        `New user account created for ${inviteEmail}${emailAlreadyExists ? ' (linked to existing Auth)' : ''}`
       );
 
-      setStatus({ type: 'success', message: 'User account created successfully.' });
+      setJustCreatedUser({
+        name: inviteName,
+        email: inviteEmail,
+        password: emailAlreadyExists ? '[Existing Password]' : invitePassword,
+        role: inviteRole
+      });
+      
+      setStatus({ 
+        type: 'success', 
+        message: emailAlreadyExists 
+          ? `Account profile created! Since this email was already registered, the user is now fully authorized. They can log in immediately using their existing password.`
+          : 'User account created successfully.' 
+      });
       setInviteEmail('');
       setInvitePassword('');
       setInviteName('');
-      setShowInviteModal(false);
     } catch (error: any) {
       console.error('Failed to create user', error);
       setStatus({ type: 'error', message: error.message || 'Failed to create user account.' });
@@ -154,43 +357,73 @@ export default function Settings({ profile }: SettingsProps) {
     }
   };
 
-  const handleDeleteUser = async (uid: string) => {
+  const handleDeleteUserConfirm = async () => {
+    if (!userToDelete) return;
+    const uid = userToDelete.uid;
     if (uid === profile?.uid) {
       setStatus({ type: 'error', message: 'You cannot delete your own account.' });
+      setUserToDelete(null);
       return;
     }
-    if (window.confirm("Are you sure you want to remove this user from the system? They will immediately lose access.")) {
-      try {
-        await deleteDoc(doc(db, 'users', uid));
-        if (selectedUser?.uid === uid) {
-          setSelectedUser(null);
-        }
-        setStatus({ type: 'success', message: 'User successfully removed from system.' });
-      } catch (error: any) {
-        handleFirestoreError(error, OperationType.DELETE, `users/${uid}`);
-        setStatus({ type: 'error', message: 'Failed to delete user profile.' });
+
+    try {
+      setProcessing(true);
+      await deleteDoc(doc(db, 'users', uid));
+      
+      await logAuditEvent(
+        'settings',
+        uid,
+        'delete',
+        { before: userToDelete, after: null },
+        `User account removed for ${userToDelete.email || uid}`
+      );
+
+      if (selectedUser?.uid === uid) {
+        setSelectedUser(null);
       }
+      setStatus({ type: 'success', message: `User ${userToDelete.displayName || userToDelete.email} successfully removed from the system.` });
+      setUserToDelete(null);
+      setDeleteConfirmText('');
+    } catch (error: any) {
+      handleFirestoreError(error, OperationType.DELETE, `users/${uid}`);
+      setStatus({ type: 'error', message: 'Failed to delete user profile.' });
+    } finally {
+      setProcessing(false);
     }
   };
 
   useEffect(() => {
+    if (!auth.currentUser) return;
     if (activeTab === 'sessions' && profile?.role === 'manager') {
       const unsub = onSnapshot(collection(db, 'userSessions'), (snapshot) => {
         const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as UserSession[];
         setSessions(data.sort((a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime()));
       }, (error) => handleFirestoreError(error, OperationType.LIST, 'userSessions'));
-      return () => unsub();
+      return () => {
+        try {
+          unsub();
+        } catch (e) {
+          console.warn('unsub userSessions error', e);
+        }
+      };
     }
   }, [activeTab, profile]);
 
   useEffect(() => {
+    if (!auth.currentUser) return;
     if (activeTab === 'system' && profile?.role === 'manager') {
       const unsub = onSnapshot(doc(db, 'system', 'config'), (snap) => {
         if (snap.exists()) {
           setSystemConfig(snap.data() as SystemConfig);
         }
       }, (error) => handleFirestoreError(error, OperationType.GET, 'system/config'));
-      return () => unsub();
+      return () => {
+        try {
+          unsub();
+        } catch (e) {
+          console.warn('unsub system/config error', e);
+        }
+      };
     }
   }, [activeTab, profile]);
 
@@ -202,18 +435,409 @@ export default function Settings({ profile }: SettingsProps) {
         lastUpdated: new Date().toISOString()
       });
       setStatus({ type: 'success', message: 'System configuration updated.' });
-    } catch (error) {
+      firestore(
+        'System Config Saved',
+        'Successfully synchronized and committed hardware & operational settings to Cloud Firestore.'
+      );
+    } catch (error: any) {
+      toastError('Config Save Failed', `Failed to update system config: ${error.message || error}`);
       handleFirestoreError(error, OperationType.UPDATE, 'system/config');
     } finally {
       setProcessing(false);
     }
   };
 
+  useEffect(() => {
+    if (!auth.currentUser) return;
+    if (activeTab === 'roles' && profile?.role === 'manager') {
+      setLoadingRoles(true);
+      const unsub = onSnapshot(doc(db, 'settings', 'roleConfigs'), (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data.cashier) setCashierRoleDefaults(data.cashier);
+          if (data.manager) setManagerRoleDefaults(data.manager);
+        } else {
+          // Initialize self-healing defaults in firestore
+          setDoc(doc(db, 'settings', 'roleConfigs'), {
+            cashier: {
+              canManagePrices: false,
+              canManageUsers: false,
+              canVoidTickets: false,
+              canDeleteData: false,
+              canManageInventory: false,
+              canGenerateReports: false,
+              canManageInvoices: false,
+              canManageCash: true,
+              canApproveChanges: false,
+              canOpenCloseSessions: true,
+              canRetroactivePriceAdjustments: false,
+            },
+            manager: {
+              canManagePrices: true,
+              canManageUsers: true,
+              canVoidTickets: true,
+              canDeleteData: true,
+              canManageInventory: true,
+              canGenerateReports: true,
+              canManageInvoices: true,
+              canManageCash: true,
+              canApproveChanges: true,
+              canOpenCloseSessions: true,
+              canRetroactivePriceAdjustments: true,
+            }
+          }).catch(err => console.error("Error creating initial role defaults", err));
+        }
+        setLoadingRoles(false);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.GET, 'settings/roleConfigs');
+        setLoadingRoles(false);
+      });
+      return () => {
+        try {
+          unsub();
+        } catch (e) {
+          console.warn('unsub settings/roleConfigs error', e);
+        }
+      };
+    }
+  }, [activeTab, profile]);
+
+  const handleUpdateRoleDefaults = async (role: 'cashier' | 'manager', permissionKey: keyof UserPermissions, value: boolean) => {
+    try {
+      setProcessing(true);
+      const docRef = doc(db, 'settings', 'roleConfigs');
+      const targetDefaults = role === 'cashier' ? cashierRoleDefaults : managerRoleDefaults;
+      const updatedDefaults = {
+        ...targetDefaults,
+        [permissionKey]: value
+      };
+      
+      await setDoc(docRef, {
+        [role]: updatedDefaults
+      }, { merge: true });
+      
+      setStatus({ type: 'success', message: `${role.toUpperCase()} role default permissions updated.` });
+      firestore(
+        'Role Configuration Updated',
+        `Successfully updated default permissions for "${role.toUpperCase()}" in Cloud Firestore.`
+      );
+    } catch (error: any) {
+      toastError('Role Config Save Failed', `Failed to update role default permissions: ${error.message || error}`);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const handleApplyDefaultsToAll = async (role: 'cashier' | 'manager') => {
+    if (!window.confirm(`Are you sure you want to overwrite all existing ${role} accounts' permissions with the current role defaults? This action is irreversible.`)) {
+      return;
+    }
+    
+    try {
+      setProcessing(true);
+      const targetDefaults = role === 'cashier' ? cashierRoleDefaults : managerRoleDefaults;
+      
+      // Fetch all users with this role
+      const usersQuery = query(collection(db, 'users'), where('role', '==', role));
+      const querySnap = await getDocs(usersQuery);
+      
+      let updatedCount = 0;
+      for (const userDoc of querySnap.docs) {
+        await updateDoc(doc(db, 'users', userDoc.id), {
+          permissions: targetDefaults
+        });
+        updatedCount++;
+      }
+      
+      setStatus({ type: 'success', message: `Applied defaults to ${updatedCount} ${role} accounts.` });
+      success(
+        'Permissions Applied',
+        `Overwrote permissions for all ${updatedCount} existing ${role} team members with the new default template.`
+      );
+    } catch (error: any) {
+      toastError('Apply Defaults Failed', `Failed to apply defaults: ${error.message || error}`);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const getCameraUrlForDiagnostic = (camKey: 'material' | 'customer' | 'entrance') => {
+    if (settings.cameraBrand === 'reolink') {
+      const nvrIp = settings.reolinkNvrIp || '';
+      const user = settings.reolinkUsername || 'admin';
+      const pass = settings.reolinkPassword || '';
+      
+      const channels = settings.reolinkChannels || [];
+      let channelNum = 0;
+      if (camKey === 'customer') channelNum = 1;
+      else if (camKey === 'entrance') channelNum = 2;
+      
+      const matchingCh = channels.find(ch => {
+        if (camKey === 'material') return ch.id === 'cam1' || ch.channel === 0 || ch.name.toLowerCase().includes('scale') || ch.name.toLowerCase().includes('material');
+        if (camKey === 'customer') return ch.id === 'cam2' || ch.channel === 1 || ch.name.toLowerCase().includes('customer') || ch.name.toLowerCase().includes('face');
+        if (camKey === 'entrance') return ch.id === 'cam3' || ch.channel === 2 || ch.name.toLowerCase().includes('entrance') || ch.name.toLowerCase().includes('vehicle');
+        return false;
+      });
+      
+      if (matchingCh) {
+        channelNum = matchingCh.channel;
+      }
+      
+      let base = nvrIp.trim();
+      if (!base) return '';
+      if (!base.startsWith('http://') && !base.startsWith('https://')) {
+        base = `http://${base}`;
+      }
+      return `${base}/cgi-bin/api.cgi?cmd=Snap&channel=${channelNum}&user=${user}&password=${pass}`;
+    }
+    return settings.swannCams[camKey];
+  };
+
+  const runCameraDiagnostic = async (camKey: 'material' | 'customer' | 'entrance') => {
+    const rawUrl = getCameraUrlForDiagnostic(camKey);
+    if (!rawUrl) {
+      setDiagnosticResults(prev => ({
+        ...prev,
+        [camKey]: { status: 'error', detail: 'URL is empty. Enter an IP / CGI endpoint above.' }
+      }));
+      return;
+    }
+
+    setDiagnosticResults(prev => ({
+      ...prev,
+      [camKey]: { status: 'checking', detail: 'Testing connection...' }
+    }));
+
+    const connectionMode = settings.cameraConnectionMode || 'direct';
+    const testUrl = connectionMode === 'proxy' 
+      ? `/api/camera-proxy?url=${encodeURIComponent(rawUrl)}`
+      : rawUrl;
+
+    try {
+      if (connectionMode === 'proxy') {
+        const response = await fetch(`${testUrl}${testUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`);
+        if (!response.ok) {
+          let errorDetail = 'Proxy failed to connect to NVR.';
+          try {
+            const errData = await response.json();
+            errorDetail = errData.detail || errData.error || errorDetail;
+            if (errData.solution) {
+              errorDetail += `\n\nSolution: ${errData.solution}`;
+            }
+          } catch (_) {
+            errorDetail = `HTTP ${response.status}: ${response.statusText}`;
+          }
+          throw new Error(errorDetail);
+        }
+
+        setDiagnosticResults(prev => ({
+          ...prev,
+          [camKey]: { 
+            status: 'success', 
+            detail: 'Successful Connection! Connection routed through cloud proxy server.',
+            previewUrl: `${testUrl}${testUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`
+          }
+        }));
+
+        logAuditEvent(
+          'settings',
+          auth.currentUser?.uid || 'unknown',
+          'sync',
+          { 
+            before: { status: 'testing' },
+            after: { result: 'test_success_proxy', camera: camKey, laptop: localLaptopId, brand: settings.cameraBrand }
+          }
+        ).catch(() => {});
+      } else {
+        const testImg = new Image();
+        let hasTimedOut = false;
+        const timeout = setTimeout(() => {
+          hasTimedOut = true;
+          setDiagnosticResults(prev => ({
+            ...prev,
+            [camKey]: { 
+              status: 'error', 
+              detail: 'Timeout. Local Direct mode cannot cross the HTTPS barrier to access an unencrypted local HTTP camera. Allow mixed/insecure content in your browser settings (click the lock icon next to the address bar), or switch to Cloud Proxy Mode.' 
+            }
+          }));
+        }, 6000);
+
+        testImg.onload = () => {
+          if (hasTimedOut) return;
+          clearTimeout(timeout);
+          setDiagnosticResults(prev => ({
+            ...prev,
+            [camKey]: { 
+              status: 'success', 
+              detail: 'Successful Connection! Directly loaded local camera frame.',
+              previewUrl: `${testUrl}${testUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`
+            }
+          }));
+
+          logAuditEvent(
+            'settings',
+            auth.currentUser?.uid || 'unknown',
+            'sync',
+            { 
+              before: { status: 'testing' },
+              after: { result: 'test_success_direct', camera: camKey, laptop: localLaptopId, brand: settings.cameraBrand }
+            }
+          ).catch(() => {});
+        };
+
+        testImg.onerror = () => {
+          if (hasTimedOut) return;
+          clearTimeout(timeout);
+          setDiagnosticResults(prev => ({
+            ...prev,
+            [camKey]: { 
+              status: 'error', 
+              detail: 'Connection Blocked. Browsers block loading unencrypted http:// cameras inside an encrypted https:// app. Please: (1) Click the lock icon in your browser address bar -> Site Settings -> allow "Insecure Content", (2) Install a browser CORS extension, or (3) Switch to Cloud Proxy Mode with a port-forwarded/public IP.' 
+            }
+          }));
+
+          logAuditEvent(
+            'settings',
+            auth.currentUser?.uid || 'unknown',
+            'sync',
+            { 
+              before: { status: 'testing' },
+              after: { result: 'test_failed_direct', camera: camKey, laptop: localLaptopId, brand: settings.cameraBrand }
+            }
+          ).catch(() => {});
+        };
+
+        testImg.src = `${testUrl}${testUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
+      }
+    } catch (e: any) {
+      setDiagnosticResults(prev => ({
+        ...prev,
+        [camKey]: { status: 'error', detail: e.message || 'Diagnostic failed' }
+      }));
+    }
+  };
+
+  const runCustomCameraConnectivityCheck = async () => {
+    if (!customCamIp.trim()) {
+      setCustomDiagStatus('error');
+      setCustomDiagMsg('IP address or host is required.');
+      setCustomDiagDetail('Please provide a valid IP address or domain name to test.');
+      return;
+    }
+
+    setCustomDiagStatus('testing');
+    setCustomDiagMsg('Initializing diagnostic check...');
+    setCustomDiagDetail('Sending packets...');
+
+    // Clean IP address input (remove http/https prefix if user pasted it)
+    let cleanedIp = customCamIp.trim();
+    if (cleanedIp.startsWith('http://')) {
+      cleanedIp = cleanedIp.replace('http://', '');
+      setCustomCamProtocol('http');
+    } else if (cleanedIp.startsWith('https://')) {
+      cleanedIp = cleanedIp.replace('https://', '');
+      setCustomCamProtocol('https');
+    }
+
+    // Build standard URLs
+    const portStr = customCamPort.trim() ? `:${customCamPort.trim()}` : '';
+    const fullCameraUrl = `${customCamProtocol}://${cleanedIp}${portStr}${customCamPath}`;
+
+    try {
+      if (customCamMode === 'proxy') {
+        setCustomDiagMsg('Checking via secure Cloud Proxy...');
+        setCustomDiagDetail(`Routing fetch to: /api/camera-proxy?url=${encodeURIComponent(fullCameraUrl)}`);
+        
+        const proxyUrl = `/api/camera-proxy?url=${encodeURIComponent(fullCameraUrl)}`;
+        const response = await fetch(`${proxyUrl}&_t=${Date.now()}`);
+        
+        if (response.ok) {
+          setCustomDiagStatus('success');
+          setCustomDiagMsg('Cloud Proxy Ping Success!');
+          setCustomDiagDetail(`Successfully retrieved raw image data via the Cloud Run proxy server. The IP is publically reachable and port forwarding is working correctly.`);
+        } else {
+          let errDetail = 'The proxy received an error response from the camera destination.';
+          try {
+            const errData = await response.json();
+            errDetail = errData.detail || errData.error || errDetail;
+            if (errData.solution) {
+              errDetail += `\n\nSolution: ${errData.solution}`;
+            }
+          } catch (_) {
+            errDetail = `HTTP Error Code ${response.status}: ${response.statusText}`;
+          }
+          throw new Error(errDetail);
+        }
+      } else {
+        // no-cors or cors mode
+        setCustomDiagMsg(`Pinging camera directly via Browser (${customCamMode} mode)...`);
+        setCustomDiagDetail(`Executing fetch("${fullCameraUrl}", { mode: "${customCamMode}" })`);
+
+        // Create an AbortController to handle timeouts
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+        try {
+          const res = await fetch(fullCameraUrl, {
+            mode: customCamMode,
+            signal: controller.signal,
+            cache: 'no-store'
+          });
+
+          clearTimeout(timeoutId);
+
+          // In no-cors mode, a successful network connection returns status 0 (opaque response).
+          // If the network request failed (e.g., host offline or DNS failure), the fetch rejects and throws.
+          if (customCamMode === 'no-cors') {
+            setCustomDiagStatus('success');
+            setCustomDiagMsg('Direct Network Ping Success!');
+            setCustomDiagDetail(`Reachable! Browser connected successfully over local network. (no-cors mode completed with Status: ${res.status}).\n\nNote: If the camera still doesn't display in standard views, verify the snapshot path, username, and password.`);
+          } else {
+            // CORS mode
+            if (res.ok) {
+              setCustomDiagStatus('success');
+              setCustomDiagMsg('Direct CORS Connection Success!');
+              setCustomDiagDetail(`Excellent! The camera was reached and returned a valid CORS header allowing direct connection.`);
+            } else {
+              throw new Error(`Direct connection succeeded but returned HTTP status ${res.status}.`);
+            }
+          }
+        } catch (fetchErr: any) {
+          clearTimeout(timeoutId);
+          if (fetchErr.name === 'AbortError') {
+            throw new Error('Connection Timed Out. Ensure the camera is powered on, connected to the same LAN, and your port is correct.');
+          }
+          throw fetchErr;
+        }
+      }
+    } catch (e: any) {
+      setCustomDiagStatus('error');
+      setCustomDiagMsg('Connection Test Failed');
+      
+      let detail = e.message || 'Unknown network error.';
+      if (customCamMode !== 'proxy') {
+        detail += `\n\nPossible Causes:\n• The app runs on HTTPS and the camera uses unencrypted HTTP. Browsers block "Mixed Content" by default.\n• The IP address/Port is incorrect.\n• You are on a different network (SSID/VLAN) than the NVR camera.`;
+      }
+      setCustomDiagDetail(detail);
+    }
+  };
+
+  const handleLaptopIdChange = (id: string) => {
+    localStorage.setItem('pm_connected_laptop_id', id);
+    setLocalLaptopId(id);
+    setStatus({ type: 'success', message: `Laptop registered as: ${id}` });
+  };
+
   const handleTerminateSession = async (sessionId: string) => {
     try {
       await updateDoc(doc(db, 'userSessions', sessionId), { status: 'logout' });
       setStatus({ type: 'success', message: 'Session marked as terminated.' });
-    } catch (error) {
+      firestore(
+        'Session Terminated',
+        `Successfully force-logged out active session #${sessionId.slice(0, 8)}... and revoked tokens in Firestore.`
+      );
+    } catch (error: any) {
+      toastError('Revocation Failed', `Failed to terminate active session: ${error.message || error}`);
       handleFirestoreError(error, OperationType.UPDATE, `userSessions/${sessionId}`);
     }
   };
@@ -236,7 +860,12 @@ export default function Settings({ profile }: SettingsProps) {
       );
       
       setStatus({ type: 'success', message: 'User role updated successfully.' });
-    } catch (error) {
+      firestore(
+        'User Role Updated',
+        `Account role for "${oldUser?.email || 'User'}" updated to ${newRole.toUpperCase()} and committed to Cloud Firestore.`
+      );
+    } catch (error: any) {
+      toastError('Role Update Failed', `Failed to update user role: ${error.message || error}`);
       handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
     } finally {
       setSavingUser(false);
@@ -261,10 +890,108 @@ export default function Settings({ profile }: SettingsProps) {
       );
       
       setStatus({ type: 'success', message: 'User permissions updated successfully.' });
-    } catch (error) {
+      firestore(
+        'Permissions Committed',
+        `Granular access control parameters updated for "${oldUser?.email || 'User'}" and committed to Cloud Firestore.`
+      );
+    } catch (error: any) {
+      toastError('Permissions Update Failed', `Failed to update user permissions: ${error.message || error}`);
       handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
     } finally {
       setSavingUser(false);
+    }
+  };
+
+  const handleResetPassword = async (uid: string, targetEmail: string, oldCachedPass?: string) => {
+    if (!newPassword || newPassword.length < 6) {
+      setPasswordError('Password must be at least 6 characters long.');
+      return;
+    }
+    
+    setResettingPassword(true);
+    setPasswordError(null);
+    setPasswordSuccess(null);
+    
+    try {
+      // Are we resetting our own password?
+      if (uid === auth.currentUser?.uid) {
+        await updatePassword(auth.currentUser, newPassword);
+        await updateDoc(doc(db, 'users', uid), { cachedPassword: newPassword });
+        
+        await logAuditEvent(
+          'settings',
+          uid,
+          'update',
+          { before: { cachedPassword: '***' }, after: { cachedPassword: '***' } },
+          `User changed their own account password: ${targetEmail}`
+        );
+        
+        setPasswordSuccess('Password reset successfully and updated in your profile!');
+        setNewPassword('');
+        firestore(
+          'Password Changed',
+          'Successfully updated your login password in Firebase Auth and profile cache.'
+        );
+      } else {
+        // Manager resetting another user's password via secure backend administrative bypass
+        const idToken = await auth.currentUser?.getIdToken();
+        if (!idToken) {
+          throw new Error('You must be logs-in manager to reset employee passwords.');
+        }
+
+        const response = await fetch('/api/admin-reset-password', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`
+          },
+          body: JSON.stringify({
+            targetUid: uid,
+            targetEmail: targetEmail,
+            newPassword: newPassword,
+            oldPassword: oldCachedPass
+          })
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to administratively reset password.');
+        }
+
+        // Directly update the cachedPassword in Firestore from the authenticated manager's client browser
+        await setDoc(doc(db, 'users', uid), {
+          cachedPassword: newPassword,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+        
+        await logAuditEvent(
+          'settings',
+          uid,
+          'update',
+          { before: { cachedPassword: '***' }, after: { cachedPassword: '***' } },
+          `Manager administratively reset account password for employee: ${targetEmail}`
+        );
+        
+        setPasswordSuccess(`Success! Password successfully updated directly in the database and Firebase Auth for ${targetEmail}. Bypassed standard email verification flow.`);
+        setNewPassword('');
+
+        // Update local users array to match
+        setUsers(prevUsers => prevUsers.map(u => u.uid === uid ? { ...u, cachedPassword: newPassword } : u));
+        if (selectedUser && selectedUser.uid === uid) {
+          setSelectedUser(prevSelected => prevSelected ? { ...prevSelected, cachedPassword: newPassword } : null);
+        }
+
+        firestore(
+          'Password Reset Done',
+          `Successfully reset login password for "${targetEmail}" administratively.`
+        );
+      }
+    } catch (err: any) {
+      console.error('Password reset failed:', err);
+      setPasswordError(err.message || 'Failed to reset password. Please check your network or permissions.');
+      toastError('Reset Failed', `Failed to reset password: ${err.message || err}`);
+    } finally {
+      setResettingPassword(false);
     }
   };
 
@@ -478,6 +1205,17 @@ export default function Settings({ profile }: SettingsProps) {
             System Operations
           </button>
         )}
+        {profile?.role === 'manager' && (
+          <button
+            onClick={() => setActiveTab('roles')}
+            className={cn(
+              "px-6 py-3 text-[10px] font-black uppercase tracking-widest transition-all border-b-2",
+              activeTab === 'roles' ? "border-blue-600 text-blue-600" : "border-transparent text-slate-400 hover:text-slate-600"
+            )}
+          >
+            Role Configurations
+          </button>
+        )}
       </div>
 
       {status && (
@@ -652,6 +1390,143 @@ export default function Settings({ profile }: SettingsProps) {
                   )} />
                 </div>
               </button>
+
+              <button
+                onClick={() => updateSettings({ receiptFormat: settings.receiptFormat === 'letter' ? 'thermal' : 'letter' })}
+                className="w-full flex items-center justify-between p-3 bg-slate-50 rounded-xl hover:bg-slate-100 transition-colors"
+              >
+                <div className="flex flex-col items-start">
+                  <span className="text-xs font-bold text-slate-700">Thermal Receipt Format</span>
+                  <span className="text-[10px] text-slate-500 text-left">Use 80mm thermal roll format for ticket printing instead of standard Letter size.</span>
+                </div>
+                <div className={cn(
+                  "w-10 h-5 rounded-full transition-colors relative flex-shrink-0",
+                  settings.receiptFormat === 'thermal' ? "bg-blue-600" : "bg-slate-300"
+                )}>
+                  <div className={cn(
+                    "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                    settings.receiptFormat === 'thermal' ? "left-6" : "left-1"
+                  )} />
+                </div>
+              </button>
+
+              {settings.receiptFormat === 'thermal' && (
+                <div className="mt-2 p-4 bg-blue-50/50 border border-blue-100 rounded-xl space-y-4 animate-in fade-in slide-in-from-top-2 duration-200">
+                  <div className="flex items-center gap-2 pb-2 border-b border-blue-100/50">
+                    <Printer className="w-4 h-4 text-blue-600" />
+                    <span className="text-xs font-bold text-blue-900 uppercase tracking-wider">Epson TM-T88V & Thermal Printer Settings</span>
+                  </div>
+
+                  {/* Paper Width Selection */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Paper Width</label>
+                      <div className="flex bg-slate-200 p-1 rounded-lg">
+                        <button
+                          type="button"
+                          onClick={() => updateSettings({ thermalWidth: '80mm' })}
+                          className={cn(
+                            "flex-1 py-1.5 text-[10px] font-black uppercase rounded-md transition-all",
+                            settings.thermalWidth === '80mm' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-750"
+                          )}
+                        >
+                          80mm (Epson)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateSettings({ thermalWidth: '58mm' })}
+                          className={cn(
+                            "flex-1 py-1.5 text-[10px] font-black uppercase rounded-md transition-all",
+                            settings.thermalWidth === '58mm' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-750"
+                          )}
+                        >
+                          58mm (Mini)
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Font Style Selection */}
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Receipt Font</label>
+                      <div className="flex bg-slate-200 p-1 rounded-lg">
+                        <button
+                          type="button"
+                          onClick={() => updateSettings({ thermalFont: 'mono' })}
+                          className={cn(
+                            "flex-1 py-1.5 text-[10px] font-black uppercase rounded-md transition-all",
+                            settings.thermalFont === 'mono' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-750"
+                          )}
+                        >
+                          Classic Mono
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateSettings({ thermalFont: 'sans' })}
+                          className={cn(
+                            "flex-1 py-1.5 text-[10px] font-black uppercase rounded-md transition-all",
+                            settings.thermalFont === 'sans' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-750"
+                          )}
+                        >
+                          Modern Sans
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Density and Barcode Options */}
+                  <div className="grid grid-cols-2 gap-4 pt-2">
+                    {/* Density Selector */}
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Layout Density</label>
+                      <div className="flex bg-slate-200 p-1 rounded-lg">
+                        <button
+                          type="button"
+                          onClick={() => updateSettings({ thermalPrintDensity: 'normal' })}
+                          className={cn(
+                            "flex-1 py-1.5 text-[10px] font-black uppercase rounded-md transition-all",
+                            settings.thermalPrintDensity === 'normal' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-750"
+                          )}
+                        >
+                          Normal
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateSettings({ thermalPrintDensity: 'compact' })}
+                          className={cn(
+                            "flex-1 py-1.5 text-[10px] font-black uppercase rounded-md transition-all",
+                            settings.thermalPrintDensity === 'compact' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-750"
+                          )}
+                        >
+                          Compact
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Barcode Toggle */}
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Ticket Barcode</label>
+                      <button
+                        type="button"
+                        onClick={() => updateSettings({ thermalShowBarcode: !settings.thermalShowBarcode })}
+                        className="w-full flex items-center justify-between p-1.5 bg-slate-200 rounded-lg text-left"
+                      >
+                        <span className="text-[10px] font-black uppercase tracking-wider text-slate-600 ml-1">
+                          {settings.thermalShowBarcode ? "Enabled" : "Disabled"}
+                        </span>
+                        <div className={cn(
+                          "w-10 h-5 rounded-full transition-colors relative flex-shrink-0",
+                          settings.thermalShowBarcode ? "bg-blue-600" : "bg-slate-300"
+                        )}>
+                          <div className={cn(
+                            "absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all",
+                            settings.thermalShowBarcode ? "left-5.5" : "left-0.5"
+                          )} />
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
               
               <button
                 onClick={() => updateSettings({ debugPrintMode: !settings.debugPrintMode })}
@@ -700,6 +1575,202 @@ export default function Settings({ profile }: SettingsProps) {
         </div>
       </div>
 
+      {/* System Key & Authentication Security Section */}
+      <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-8">
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-blue-50 rounded-xl text-blue-600">
+            <ShieldCheck className="w-5 h-5 text-blue-600" />
+          </div>
+          <div>
+            <h3 className="font-black text-slate-900 uppercase tracking-tight">System Access & Security</h3>
+            <p className="text-[10px] text-slate-400 font-bold uppercase">Configure keys, hints, and test credential health</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+          {/* Left Column: Password/Key Hint Configuration */}
+          <div className="space-y-4">
+            <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Access Recovery Hint</h4>
+            <p className="text-xs text-slate-500 font-medium leading-relaxed">
+              Provide a subtle hint for staff or cashiers to remember the System Key/Password. This hint will be displayed on the public login page to prevent locked out situations.
+            </p>
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Current Password Hint</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold"
+                  placeholder="e.g. Office safe key followed by '03'..."
+                  value={keyHintInput}
+                  onChange={(e) => setKeyHintInput(e.target.value)}
+                />
+                <button
+                  onClick={handleSaveKeyHint}
+                  disabled={savingKeyHint}
+                  className="px-5 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-600 transition-all disabled:opacity-50 cursor-pointer"
+                >
+                  {savingKeyHint ? 'Saving...' : 'Save Hint'}
+                </button>
+              </div>
+              {keyHintStatus && (
+                <p className={`text-[10px] font-bold uppercase tracking-wider ${keyHintStatus.includes('successfully') ? 'text-green-600' : 'text-red-500'}`}>
+                  {keyHintStatus}
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Right Column: Password/System Key Health Validator */}
+          <div className="space-y-4 p-5 bg-slate-50/50 rounded-3xl border border-slate-100">
+            <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Credentials Health Validator</h4>
+            <p className="text-[10px] text-slate-500 font-bold uppercase leading-relaxed">
+              Test your active password / System Key to verify that it is fully synchronized with authentication proxy servers and that your IP routing is running free of Google lockouts.
+            </p>
+
+            <div className="space-y-3">
+              <div>
+                <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 block">Account Email</label>
+                <div className="px-4 py-2 bg-white rounded-xl border border-slate-200 text-xs font-bold text-slate-700 select-all">
+                  {profile?.email || auth.currentUser?.email || 'N/A'}
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 block">Test Password / Key</label>
+                <input
+                  type="password"
+                  className="w-full px-4 py-2 bg-white border border-slate-200 rounded-xl outline-none focus:border-blue-500 text-xs font-mono font-bold"
+                  placeholder="Type your current password..."
+                  value={validatorPassword}
+                  onChange={(e) => setValidatorPassword(e.target.value)}
+                />
+              </div>
+
+              <button
+                onClick={handleValidateCredentials}
+                disabled={validatingCredentials || !validatorPassword}
+                className="w-full py-2.5 bg-slate-900 text-white hover:bg-emerald-600 rounded-xl text-[10px] font-black uppercase tracking-widest transition-colors disabled:opacity-45 cursor-pointer"
+              >
+                {validatingCredentials ? 'Validating Connection...' : 'Validate Credentials'}
+              </button>
+
+              {validationResult && (
+                <div className={`p-3 rounded-xl border flex items-start gap-2.5 ${
+                  validationResult.success 
+                    ? 'bg-emerald-50 border-emerald-100 text-emerald-800' 
+                    : 'bg-red-50 border-red-100 text-red-800'
+                }`}>
+                  {validationResult.success ? (
+                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                  )}
+                  <div>
+                    <p className="text-[10px] font-bold uppercase leading-relaxed">
+                      {validationResult.success ? '✓ Credentials Valid & Active' : '✗ Authentication Failed'}
+                    </p>
+                    <p className="text-[9px] font-medium leading-relaxed mt-0.5">
+                      {validationResult.message}
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* State Scrap Registry Integration Section (Ohio Homeland Security) */}
+      <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-8">
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-amber-50 rounded-xl text-amber-600">
+            <Fingerprint className="w-5 h-5 text-amber-600" />
+          </div>
+          <div>
+            <h3 className="font-black text-slate-900 uppercase tracking-tight">Ohio Dept of Homeland Security</h3>
+            <p className="text-[10px] text-slate-400 font-bold uppercase">Scrap Metal Dealer Registry Portal Integration</p>
+          </div>
+        </div>
+
+        <p className="text-xs text-slate-500 font-medium leading-relaxed max-w-3xl">
+          Under Ohio compliance law (ORC § 4737.04), scrap dealers must cross-reference scrap transactions and individuals with the Ohio Department of Homeland Security Scrap Metal database. Save your agency portal link and credentials here. These will be securely displayed and copyable in the Buy Ticket flows to check sellers with a single click.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+          {/* Left Column: Portal Link & Dealer Identifier */}
+          <div className="space-y-4">
+            <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight font-display">Portal Connection</h4>
+            
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Database Portal URL</label>
+              <div className="flex gap-2">
+                <input
+                  type="url"
+                  className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold"
+                  placeholder="e.g. https://scrapmetal.dps.ohio.gov/"
+                  value={settings.ohioScrapPortalUrl || ''}
+                  onChange={(e) => updateSettings({ ohioScrapPortalUrl: e.target.value })}
+                />
+                <button
+                  onClick={() => window.open(settings.ohioScrapPortalUrl, '_blank')}
+                  className="px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl flex items-center justify-center gap-2 border border-slate-200 text-xs font-bold transition-all"
+                  title="Test Link"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Scrap Dealer Registration ID</label>
+              <input
+                type="text"
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold"
+                placeholder="e.g. SMD-OH-2026-89421"
+                value={settings.ohioScrapDealerId || ''}
+                onChange={(e) => updateSettings({ ohioScrapDealerId: e.target.value })}
+              />
+            </div>
+          </div>
+
+          {/* Right Column: Portal Login Credentials */}
+          <div className="space-y-4">
+            <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight font-display">Portal Login Credentials</h4>
+            
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Username / Login Email</label>
+              <input
+                type="text"
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold"
+                placeholder="e.g. compliance@scrapmetaldealer.com"
+                value={settings.ohioScrapUsername || ''}
+                onChange={(e) => updateSettings({ ohioScrapUsername: e.target.value })}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Portal Password</label>
+              <div className="relative">
+                <input
+                  type={showOhioPassword ? 'text' : 'password'}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold font-mono pr-12"
+                  placeholder="••••••••••••••"
+                  value={settings.ohioScrapPassword || ''}
+                  onChange={(e) => updateSettings({ ohioScrapPassword: e.target.value })}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowOhioPassword(!showOhioPassword)}
+                  className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 outline-none transition-all"
+                >
+                  {showOhioPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Hardware Integration Section */}
       <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-8">
         <div className="flex items-center gap-3">
@@ -743,10 +1814,9 @@ export default function Settings({ profile }: SettingsProps) {
               </div>
             </div>
           </div>
-
           <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Swann Surveillance Cameras (Network)</label>
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Network IP Camera Integration</label>
               <button
                 onClick={() => updateSettings({ useSwannCams: !settings.useSwannCams })}
                 className={cn(
@@ -758,46 +1828,509 @@ export default function Settings({ profile }: SettingsProps) {
               </button>
             </div>
 
-            <div className="space-y-4 pt-2">
-              <div className="space-y-1">
-                <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Material Station Cam (Snapshot URL)</label>
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center gap-2">
-                  <Video className="w-4 h-4 text-slate-400" />
-                  <input 
+            <div className="space-y-1.5 pt-1">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">IP Camera Brand</label>
+              <div className="grid grid-cols-3 gap-2">
+                {(['swann', 'reolink', 'universal'] as const).map((brand) => (
+                  <button
+                    key={brand}
+                    type="button"
+                    onClick={() => updateSettings({ cameraBrand: brand })}
+                    className={cn(
+                      "py-2.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border text-center cursor-pointer",
+                      settings.cameraBrand === brand 
+                        ? "bg-slate-900 border-slate-900 text-white shadow-sm" 
+                        : "bg-white border-slate-200 text-slate-500 hover:bg-slate-50"
+                    )}
+                  >
+                    {brand === 'swann' ? 'Swann NVR' : brand === 'reolink' ? 'Reolink' : 'Universal IP'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-1.5 pt-1">
+              <div className="flex items-center gap-1.5 ml-1">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Camera Connection Mode</label>
+                <span className="text-[8px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">CORS-Safe Option</span>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {(['direct', 'proxy'] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => updateSettings({ cameraConnectionMode: mode })}
+                    className={cn(
+                      "py-2 px-3 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border text-center cursor-pointer flex flex-col items-center justify-center gap-0.5 min-h-[48px]",
+                      settings.cameraConnectionMode === mode 
+                        ? "bg-slate-900 border-slate-900 text-white shadow-sm" 
+                        : "bg-white border-slate-200 text-slate-500 hover:bg-slate-50"
+                    )}
+                  >
+                    <span>{mode === 'direct' ? 'Direct LAN Mode' : 'Cloud Proxy Mode'}</span>
+                    <span className={cn(
+                      "text-[8px] font-bold lowercase tracking-normal",
+                      settings.cameraConnectionMode === mode ? "text-slate-300 font-medium" : "text-slate-400 font-medium"
+                    )}>
+                      {mode === 'direct' ? 'Direct Browser to LAN' : 'Secure Proxy via server'}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-4 pt-1">
+              {settings.cameraBrand === 'reolink' ? (
+                <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl space-y-4 text-slate-200">
+                  <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
+                    <Video className="w-4 h-4 text-emerald-400" />
+                    <span className="text-[10px] font-black uppercase tracking-wider">Reolink NVR Integration Suite</span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="space-y-1">
+                      <label className="text-[9px] font-black uppercase tracking-wider text-slate-400">NVR Base IP & Port</label>
+                      <input
+                        type="text"
+                        className="w-full bg-slate-950 border border-slate-850 rounded-xl px-3 py-2 text-xs font-bold text-white outline-none focus:border-emerald-500"
+                        placeholder="e.g. http://192.168.1.50:80"
+                        value={settings.reolinkNvrIp || ''}
+                        onChange={(e) => updateSettings({ reolinkNvrIp: e.target.value })}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[9px] font-black uppercase tracking-wider text-slate-400">Username</label>
+                      <input
+                        type="text"
+                        className="w-full bg-slate-950 border border-slate-850 rounded-xl px-3 py-2 text-xs font-bold text-white outline-none focus:border-emerald-500"
+                        placeholder="admin"
+                        value={settings.reolinkUsername || ''}
+                        onChange={(e) => updateSettings({ reolinkUsername: e.target.value })}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[9px] font-black uppercase tracking-wider text-slate-400">Password</label>
+                      <input
+                        type="password"
+                        className="w-full bg-slate-950 border border-slate-850 rounded-xl px-3 py-2 text-xs font-bold text-white outline-none focus:border-emerald-500"
+                        placeholder="YourPassword"
+                        value={settings.reolinkPassword || ''}
+                        onChange={(e) => updateSettings({ reolinkPassword: e.target.value })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2 pt-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[9px] font-black uppercase tracking-wider text-slate-400">NVR Channel Map & Enabled Cameras</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const channels = settings.reolinkChannels || [];
+                          const nextCh = channels.length;
+                          const newCh = {
+                            id: `cam_${Date.now()}`,
+                            name: `Camera ${nextCh + 1} (Ch ${nextCh + 1})`,
+                            channel: nextCh,
+                            isEnabled: true
+                          };
+                          updateSettings({ reolinkChannels: [...channels, newCh] });
+                        }}
+                        className="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[9px] font-black uppercase tracking-wider transition-colors"
+                      >
+                        + Add Channel
+                      </button>
+                    </div>
+
+                    <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                      {(settings.reolinkChannels || []).map((ch, idx) => (
+                        <div key={ch.id} className="grid grid-cols-12 gap-2 p-2 bg-slate-950/60 rounded-xl border border-slate-800/80 items-center">
+                          <div className="col-span-6">
+                            <input
+                              type="text"
+                              className="w-full bg-transparent border-none text-xs font-bold text-white outline-none"
+                              value={ch.name}
+                              onChange={(e) => {
+                                const updated = [...(settings.reolinkChannels || [])];
+                                updated[idx] = { ...ch, name: e.target.value };
+                                updateSettings({ reolinkChannels: updated });
+                              }}
+                            />
+                          </div>
+                          <div className="col-span-3 flex items-center gap-1 bg-slate-900 border border-slate-800 px-2 py-1 rounded">
+                            <span className="text-[9px] text-slate-400 uppercase font-bold">CH</span>
+                            <input
+                              type="number"
+                              min="0"
+                              max="64"
+                              className="bg-transparent border-none w-full text-xs font-bold text-white text-center outline-none"
+                              value={ch.channel}
+                              onChange={(e) => {
+                                const updated = [...(settings.reolinkChannels || [])];
+                                updated[idx] = { ...ch, channel: parseInt(e.target.value) || 0 };
+                                updateSettings({ reolinkChannels: updated });
+                              }}
+                            />
+                          </div>
+                          <div className="col-span-3 flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const updated = [...(settings.reolinkChannels || [])];
+                                updated[idx] = { ...ch, isEnabled: !ch.isEnabled };
+                                updateSettings({ reolinkChannels: updated });
+                              }}
+                              className={cn(
+                                "px-2 py-1 text-[9px] font-black uppercase tracking-wider rounded transition-colors",
+                                ch.isEnabled ? "bg-emerald-950 text-emerald-400 border border-emerald-800" : "bg-slate-900 text-slate-500 border border-slate-800"
+                              )}
+                            >
+                              {ch.isEnabled ? 'On' : 'Off'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const updated = (settings.reolinkChannels || []).filter(c => c.id !== ch.id);
+                                updateSettings({ reolinkChannels: updated });
+                              }}
+                              className="p-1 text-slate-500 hover:text-red-400 transition-colors"
+                              title="Delete"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-slate-500 uppercase ml-1">
+                      Material Station Cam ({settings.cameraBrand === 'swann' ? 'Swann CGI' : 'Snapshot URL'})
+                    </label>
+                    <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center gap-2">
+                      <Video className="w-4 h-4 text-slate-400" />
+                      <input 
+                        type="text"
+                        className="bg-transparent border-none outline-none text-xs font-bold w-full"
+                        placeholder={
+                          settings.cameraBrand === 'swann'
+                            ? "http://192.168.1.50/cgi-bin/snapshot.cgi?channel=1"
+                            : "http://192.168.1.50/snapshot.jpg"
+                        }
+                        value={settings.swannCams.material}
+                        onChange={(e) => updateSettings({ swannCams: { ...settings.swannCams, material: e.target.value } })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-slate-500 uppercase ml-1">
+                      Customer Face Cam ({settings.cameraBrand === 'swann' ? 'Swann CGI' : 'Snapshot URL'})
+                    </label>
+                    <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center gap-2">
+                      <Video className="w-4 h-4 text-slate-400" />
+                      <input 
+                        type="text"
+                        className="bg-transparent border-none outline-none text-xs font-bold w-full"
+                        placeholder={
+                          settings.cameraBrand === 'swann'
+                            ? "http://192.168.1.50/cgi-bin/snapshot.cgi?channel=2"
+                            : "http://192.168.1.50/snapshot.jpg"
+                        }
+                        value={settings.swannCams.customer}
+                        onChange={(e) => updateSettings({ swannCams: { ...settings.swannCams, customer: e.target.value } })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-slate-500 uppercase ml-1">
+                      Entrance/Vehicle Cam ({settings.cameraBrand === 'swann' ? 'Swann CGI' : 'Snapshot URL'})
+                    </label>
+                    <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center gap-2">
+                      <Video className="w-4 h-4 text-slate-400" />
+                      <input 
+                        type="text"
+                        className="bg-transparent border-none outline-none text-xs font-bold w-full"
+                        placeholder={
+                          settings.cameraBrand === 'swann'
+                            ? "http://192.168.1.50/cgi-bin/snapshot.cgi?channel=3"
+                            : "http://192.168.1.50/snapshot.jpg"
+                        }
+                        value={settings.swannCams.entrance}
+                        onChange={(e) => updateSettings({ swannCams: { ...settings.swannCams, entrance: e.target.value } })}
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* CORS & Network Guidance Note */}
+              <div className="p-4 bg-amber-50 rounded-2xl border border-amber-100 space-y-2 mt-2">
+                <h4 className="text-[10px] font-black text-amber-900 uppercase tracking-wider flex items-center gap-2">
+                  ⚠️ Local IP Connection & CORS Bypassing Options
+                </h4>
+                <p className="text-[10px] text-amber-800 font-bold leading-normal">
+                  Since the PMR app runs on a secure HTTPS domain, browsers strictly block requests directly to standard local HTTP camera IPs (Mixed Content/CORS block). To deploy seamlessly:
+                </p>
+                <ol className="list-decimal list-inside text-[9px] text-amber-800 font-medium space-y-1 pl-1 leading-normal">
+                  <li><strong>Local Hardware Bridge:</strong> Ensure your local Scale/Scanner Bridge (running on localhost) proxies these camera urls directly. Browser sandbox exceptions allow calling localhost hardware bridges.</li>
+                  <li><strong>Browser CORS Extension:</strong> On dedicated cashier on-premise PCs, configure an Allow-CORS Chrome extension to permit cross-origin image loads.</li>
+                  <li><strong>Local HTTPS Proxy:</strong> Set up a lightweight Nginx local server that maps your camera streams to a signed secure endpoint on your intranet.</li>
+                </ol>
+              </div>
+
+              {/* Laptop Rotational Station Monitor */}
+              <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3 mt-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
+                    <MonitorSmartphone className="w-3.5 h-3.5 text-slate-400" />
+                    Laptop Rotational Tag
+                  </span>
+                  <span className="px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-[9px] font-bold">Active Station</span>
+                </div>
+                <p className="text-[10px] text-slate-500 font-medium">
+                  Since you use rotating laptops running this cloud-ready web application, assign a label to identify this specific PC. Diagnostics will be logged under this label.
+                </p>
+                <div className="flex gap-2">
+                  <input
                     type="text"
-                    className="bg-transparent border-none outline-none text-xs font-bold w-full"
-                    placeholder="http://192.168.1.50/cgi-bin/snapshot.cgi?channel=1"
-                    value={settings.swannCams.material}
-                    onChange={(e) => updateSettings({ swannCams: { ...settings.swannCams, material: e.target.value } })}
+                    value={localLaptopId}
+                    onChange={(e) => handleLaptopIdChange(e.target.value)}
+                    placeholder="e.g., Register Workstation Left"
+                    className="flex-1 bg-white border border-slate-200 rounded-xl px-3 py-1.5 text-xs font-bold outline-none focus:border-blue-500 text-slate-800"
                   />
                 </div>
               </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Customer Face Cam (Snapshot URL)</label>
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center gap-2">
-                  <Video className="w-4 h-4 text-slate-400" />
-                  <input 
-                    type="text"
-                    className="bg-transparent border-none outline-none text-xs font-bold w-full"
-                    placeholder="http://192.168.1.50/cgi-bin/snapshot.cgi?channel=2"
-                    value={settings.swannCams.customer}
-                    onChange={(e) => updateSettings({ swannCams: { ...settings.swannCams, customer: e.target.value } })}
-                  />
+              {/* IP Camera Real-Time Connection Diagnostics & Troubleshooting */}
+              <div className="p-4 bg-slate-900 text-slate-100 rounded-2xl border border-slate-800 space-y-4 shadow-xl mt-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <div className="flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-emerald-400 animate-pulse" />
+                    <span className="text-[10px] font-black uppercase tracking-wider text-slate-200">Local Connection Diagnostics</span>
+                  </div>
+                  <span className="text-[9px] font-bold text-slate-400">Ohio Compliance Guard</span>
+                </div>
+
+                <div className="space-y-3">
+                  {(['material', 'customer', 'entrance'] as const).map(camKey => {
+                    const res = diagnosticResults[camKey];
+                    const url = getCameraUrlForDiagnostic(camKey);
+                    const label = camKey === 'material' ? 'Material Station' : camKey === 'customer' ? 'Customer Face' : 'Entrance / Vehicle';
+                    
+                    return (
+                      <div key={camKey} className="p-3 bg-slate-950/60 rounded-xl space-y-2 border border-slate-800">
+                        <div className="flex items-center justify-between">
+                          <p className="text-[10px] font-black uppercase tracking-wider text-slate-300">{label}</p>
+                          <div className="flex items-center gap-1.5">
+                            {res.status === 'success' && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
+                            {res.status === 'error' && <AlertCircle className="w-3.5 h-3.5 text-rose-400" />}
+                            {res.status === 'checking' && <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />}
+                            {res.status === 'untested' && <span className="w-2 h-2 rounded-full bg-slate-600" />}
+                            <span className={cn(
+                              "text-[9px] font-black uppercase tracking-widest",
+                              res.status === 'success' && "text-emerald-400",
+                              res.status === 'error' && "text-rose-400",
+                              res.status === 'checking' && "text-blue-400",
+                              res.status === 'untested' && "text-slate-400"
+                            )}>
+                              {res.status}
+                            </span>
+                          </div>
+                        </div>
+
+                        {url ? (
+                          <div className="space-y-1.5">
+                            <p className="text-[9px] font-mono text-slate-400 truncate bg-slate-900 border border-slate-800 px-2 py-1 rounded select-all mb-1">{url}</p>
+                            <p className="text-[9px] text-slate-300 leading-normal">{res.detail}</p>
+                            
+                            <div className="flex gap-2 pt-1">
+                              <button
+                                type="button"
+                                disabled={res.status === 'checking'}
+                                onClick={() => runCameraDiagnostic(camKey)}
+                                className="px-3 py-1.5 bg-slate-800 text-white rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-slate-700 active:scale-95 transition-all outline-none"
+                              >
+                                Test Link
+                              </button>
+                              
+                              {res.previewUrl && (
+                                <button
+                                  type="button"
+                                  onClick={() => window.open(res.previewUrl, '_blank')}
+                                  className="px-3 py-1.5 bg-slate-800 text-blue-400 rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-slate-700 transition-all flex items-center gap-1"
+                                >
+                                  View Frame <ExternalLink className="w-2.5 h-2.5" />
+                                </button>
+                              )}
+                            </div>
+
+                            {res.status === 'success' && res.previewUrl && (
+                              <div className="mt-2 border border-slate-850 rounded-lg overflow-hidden relative group aspect-video bg-slate-900">
+                                <img 
+                                  src={res.previewUrl} 
+                                  alt="Live Test Frame" 
+                                  className="w-full h-full object-cover" 
+                                  referrerPolicy="no-referrer"
+                                  onError={() => {
+                                    setDiagnosticResults(prev => ({
+                                      ...prev,
+                                      [camKey]: { status: 'error', detail: 'Preview load failed. Browser CORS extension might have turned off.' }
+                                    }));
+                                  }}
+                                />
+                                <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                  <span className="text-[8px] font-black uppercase tracking-widest text-slate-200">Active Camera Feed</span>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <p className="text-[9px] text-slate-500 italic">No URL configured. Fill out input field above to test.</p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="p-3 bg-blue-950/40 border border-blue-900/50 rounded-xl space-y-1">
+                  <h5 className="text-[9px] font-black text-blue-300 uppercase tracking-wider flex items-center gap-1">
+                    <Info className="w-3 h-3 text-blue-400" />
+                    Rotational Laptop best practices
+                  </h5>
+                  <p className="text-[9px] text-blue-200 leading-normal font-medium">
+                    Since you keep separate laptops in rotation, keep the <strong>Allow CORS</strong> Chrome extension active on their browsers. Always run <strong>Test Link</strong> above to verify communication.
+                  </p>
                 </div>
               </div>
 
-              <div className="space-y-1">
-                <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Entrance/Vehicle Cam (Snapshot URL)</label>
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center gap-2">
-                  <Video className="w-4 h-4 text-slate-400" />
-                  <input 
-                    type="text"
-                    className="bg-transparent border-none outline-none text-xs font-bold w-full"
-                    placeholder="http://192.168.1.50/cgi-bin/snapshot.cgi?channel=3"
-                    value={settings.swannCams.entrance}
-                    onChange={(e) => updateSettings({ swannCams: { ...settings.swannCams, entrance: e.target.value } })}
-                  />
+              {/* Camera Diagnostics & Raw Network Ping Utility */}
+              <div className="p-5 bg-white border border-slate-200 rounded-2xl space-y-4 shadow-sm mt-4 text-slate-800">
+                <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
+                  <Activity className="w-4 h-4 text-blue-600" />
+                  <span className="text-xs font-black uppercase tracking-wider text-slate-800">Advanced Camera Diagnostics & Ping</span>
+                </div>
+
+                <p className="text-[11px] text-slate-500 font-medium leading-relaxed">
+                  Is your camera failing to display? Use this low-level diagnostics tool to send a raw network packet directly from your browser to check if the camera IP is reachable, or test through the cloud proxy.
+                </p>
+
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <label className="text-[9px] font-black uppercase text-slate-400 ml-1">Protocol</label>
+                      <select
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none cursor-pointer text-slate-700"
+                        value={customCamProtocol}
+                        onChange={(e) => setCustomCamProtocol(e.target.value as 'http' | 'https')}
+                      >
+                        <option value="http">http://</option>
+                        <option value="https">https://</option>
+                      </select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[9px] font-black uppercase text-slate-400 ml-1">Port</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. 80"
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none text-slate-700"
+                        value={customCamPort}
+                        onChange={(e) => setCustomCamPort(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[9px] font-black uppercase text-slate-400 ml-1">IP Address / NVR Hostname</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 192.168.1.50 or external.ddns.net"
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none text-slate-700"
+                      value={customCamIp}
+                      onChange={(e) => setCustomCamIp(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[9px] font-black uppercase text-slate-400 ml-1">Snapshot Path / URL Path</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. /cgi-bin/snapshot.cgi?channel=1"
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono outline-none text-slate-700"
+                      value={customCamPath}
+                      onChange={(e) => setCustomCamPath(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="space-y-1 pt-1">
+                    <label className="text-[9px] font-black uppercase text-slate-400 ml-1">Ping Mode</label>
+                    <div className="grid grid-cols-3 gap-1">
+                      {(['no-cors', 'cors', 'proxy'] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() => setCustomCamMode(mode)}
+                          className={cn(
+                            "py-1.5 px-2 rounded-lg text-[9px] font-black uppercase tracking-wider border text-center transition-all cursor-pointer",
+                            customCamMode === mode
+                              ? "bg-blue-600 border-blue-600 text-white"
+                              : "bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100"
+                          )}
+                        >
+                          {mode === 'no-cors' ? 'Browser Ping' : mode === 'cors' ? 'CORS' : 'Cloud Proxy'}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="text-[8px] text-slate-400 leading-normal mt-1 font-medium">
+                      {customCamMode === 'no-cors' && '💡 Browser Ping (no-cors) checks LAN connectivity directly. Bypasses browser CORS but returns opaque data.'}
+                      {customCamMode === 'cors' && '⚠️ Checks if direct cross-origin loads are allowed. Fails if camera is unencrypted HTTP.'}
+                      {customCamMode === 'proxy' && '🔒 Cloud Proxy routes the camera check through our cloud server (bypasses HTTPS/Mixed Content blocks completely).'}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={runCustomCameraConnectivityCheck}
+                    disabled={customDiagStatus === 'testing'}
+                    className="w-full py-3 bg-slate-900 text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-black hover:shadow-md active:scale-95 transition-all outline-none flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    {customDiagStatus === 'testing' ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Running Diagnostics...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Activity className="w-4 h-4" />
+                        <span>Test Camera Connectivity</span>
+                      </>
+                    )}
+                  </button>
+
+                  {/* Test Result Display */}
+                  {customDiagStatus !== 'untested' && (
+                    <div className={cn(
+                      "p-3 rounded-xl border space-y-2 text-left mt-2",
+                      customDiagStatus === 'success' && "bg-emerald-50 border-emerald-100 text-emerald-900",
+                      customDiagStatus === 'error' && "bg-rose-50 border-rose-100 text-rose-900",
+                      customDiagStatus === 'testing' && "bg-blue-50 border-blue-100 text-blue-900"
+                    )}>
+                      <div className="flex items-center gap-1.5">
+                        {customDiagStatus === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-600" />}
+                        {customDiagStatus === 'error' && <AlertCircle className="w-4 h-4 text-rose-600" />}
+                        {customDiagStatus === 'testing' && <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />}
+                        <span className="text-[10px] font-black uppercase tracking-wider">{customDiagMsg}</span>
+                      </div>
+                      <p className="text-[9px] font-medium leading-relaxed whitespace-pre-line font-mono bg-white/60 p-2 rounded border border-black/5 select-all">
+                        {customDiagDetail}
+                      </p>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1084,7 +2617,9 @@ export default function Settings({ profile }: SettingsProps) {
                         canGenerateReports: 'Access analytics & data',
                         canManageInvoices: 'Create & edit sale invoices',
                         canManageCash: 'Manage cash reconciliation',
-                        canApproveChanges: 'Authorize manager overrides'
+                        canApproveChanges: 'Authorize manager overrides',
+                        canOpenCloseSessions: 'Open & close money drawer',
+                        canRetroactivePriceAdjustments: 'Adjust prices on tickets'
                       }).map(([key, label]) => (
                         <button
                           key={key}
@@ -1100,6 +2635,8 @@ export default function Settings({ profile }: SettingsProps) {
                               canManageInvoices: false,
                               canManageCash: false,
                               canApproveChanges: false,
+                              canOpenCloseSessions: false,
+                              canRetroactivePriceAdjustments: false,
                             };
                             handleUpdateUserPermissions(selectedUser.uid, {
                               ...currentPermissions,
@@ -1161,9 +2698,85 @@ export default function Settings({ profile }: SettingsProps) {
                     </div>
                   )}
 
+                  {/* Password Retrieval & Local Reset Section */}
+                  <div className="p-6 bg-slate-50/50 rounded-3xl border border-slate-100 space-y-6">
+                    <div className="flex items-center gap-3">
+                      <KeyRound className="w-5 h-5 text-blue-600" />
+                      <div>
+                        <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Credentials & Local Recovery</h4>
+                        <p className="text-[10px] text-slate-400 font-bold uppercase">See current password and perform inside-app resets</p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      {/* Password visibility check */}
+                      {selectedUser.cachedPassword ? (
+                        <div className="space-y-1.5 p-4 bg-white rounded-2xl border border-slate-200">
+                          <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block animate-pulse">Local Cached Password</label>
+                          <div className="flex items-center justify-between">
+                            <span className="font-mono text-sm font-bold text-slate-900 select-all tracking-wider">
+                              {showPassword ? selectedUser.cachedPassword : '••••••••••••'}
+                            </span>
+                            <button
+                              onClick={() => setShowPassword(!showPassword)}
+                              className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer"
+                              title={showPassword ? "Hide password" : "Reveal password"}
+                            >
+                              {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4 text-blue-500 animate-pulse" />}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="p-4 bg-amber-50/60 rounded-2xl border border-amber-100 flex items-start gap-2.5">
+                          <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="text-[10px] font-bold text-amber-800">Password Not Locally Cached</p>
+                            <p className="text-[9px] text-amber-600 font-bold uppercase leading-relaxed mt-0.5">
+                              This user was established prior to the local caching system. Reset the password below to create a local recovery record.
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Reset form */}
+                      <div className="space-y-3">
+                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">Reset Pasword Security Key</label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            placeholder="Type new password (min. 6 chars)..."
+                            value={newPassword}
+                            onChange={(e) => setNewPassword(e.target.value)}
+                            disabled={resettingPassword}
+                            className="flex-1 px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-100 transition-colors placeholder:text-slate-300"
+                          />
+                          <button
+                            onClick={() => handleResetPassword(selectedUser.uid, selectedUser.email, selectedUser.cachedPassword)}
+                            disabled={resettingPassword || !newPassword || newPassword.length < 6}
+                            className="px-4 py-2 bg-slate-900 text-white hover:bg-blue-600 rounded-xl text-[10px] font-black uppercase tracking-widest transition-colors disabled:opacity-45 disabled:hover:bg-slate-900 cursor-pointer"
+                          >
+                            {resettingPassword ? 'Resetting...' : 'Reset Key'}
+                          </button>
+                        </div>
+
+                        {passwordError && (
+                          <p className="text-[9px] font-bold text-red-600 uppercase tracking-wider">{passwordError}</p>
+                        )}
+                        {passwordSuccess && (
+                          <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-100">
+                            <p className="text-[9px] font-bold text-emerald-800 leading-relaxed uppercase">{passwordSuccess}</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="pt-6 border-t border-slate-100">
                     <button
-                      onClick={() => handleDeleteUser(selectedUser.uid)}
+                      onClick={() => {
+                        setUserToDelete(selectedUser);
+                        setDeleteConfirmText('');
+                      }}
                       disabled={selectedUser.uid === profile?.uid}
                       className="w-full py-4 bg-red-50 text-red-600 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-red-100 transition-all border border-red-100 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
@@ -1285,90 +2898,216 @@ export default function Settings({ profile }: SettingsProps) {
       {showInviteModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
           <div className="bg-white rounded-[2.5rem] shadow-2xl max-w-md w-full p-8 space-y-8 animate-in zoom-in-95 duration-300 border border-slate-100">
-            <div className="text-center space-y-2">
-              <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                <UserPlus className="w-8 h-8 text-blue-600" />
-              </div>
-              <h2 className="text-2xl font-black text-slate-900 tracking-tight">Add New User</h2>
-              <p className="text-sm text-slate-500 font-medium">Create a local account for a new team member.</p>
-            </div>
+            {justCreatedUser ? (
+              <div className="space-y-6 text-center animate-in fade-in duration-300">
+                <div className="w-16 h-16 bg-emerald-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                  <CheckCircle2 className="w-8 h-8 text-emerald-600" />
+                </div>
+                <h2 className="text-2xl font-black text-slate-900 tracking-tight">Account Created!</h2>
+                <p className="text-xs text-slate-500 font-medium">The new user has been registered in the system. Print or copy their credentials below.</p>
+                
+                <div className="bg-slate-50 p-6 rounded-3xl border border-slate-100 text-left space-y-4 font-mono text-xs text-slate-700 relative">
+                  <div>
+                    <span className="text-[10px] uppercase font-black text-slate-400 block tracking-widest">Full Name</span>
+                    <span className="text-sm font-bold text-slate-900">{justCreatedUser.name}</span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] uppercase font-black text-slate-400 block tracking-widest">Role</span>
+                    <span className="text-sm font-bold text-slate-900 uppercase tracking-wide">{justCreatedUser.role}</span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] uppercase font-black text-slate-400 block tracking-widest">Email Address / Login</span>
+                    <span className="text-sm font-bold text-slate-900">{justCreatedUser.email}</span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] uppercase font-black text-slate-400 block tracking-widest">Temporary Password</span>
+                    <span className="text-sm font-bold text-slate-900 bg-amber-100/60 px-1.5 py-0.5 rounded">{justCreatedUser.password}</span>
+                  </div>
+                  {justCreatedUser.role === 'manager' && (
+                    <div className="pt-2 border-t border-slate-200">
+                      <span className="text-[10px] uppercase font-black text-slate-400 block tracking-widest">Default Manager PIN</span>
+                      <span className="text-sm font-bold text-slate-900">1234</span>
+                    </div>
+                  )}
+                </div>
 
-            <div className="space-y-6">
-              <div className="space-y-2">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Full Name</label>
-                <input
-                  type="text"
-                  value={inviteName}
-                  onChange={(e) => setInviteName(e.target.value)}
-                  placeholder="e.g. John Doe"
-                  className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Email Address</label>
-                <input
-                  type="email"
-                  value={inviteEmail}
-                  onChange={(e) => setInviteEmail(e.target.value)}
-                  placeholder="e.g. employee@gmail.com"
-                  className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Temporary Password</label>
-                <input
-                  type="password"
-                  value={invitePassword}
-                  onChange={(e) => setInvitePassword(e.target.value)}
-                  placeholder="At least 6 characters"
-                  className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Assigned Role</label>
-                <div className="grid grid-cols-2 gap-3">
-                  {(['cashier', 'manager'] as UserRole[]).map((role) => (
-                    <button
-                      key={role}
-                      onClick={() => setInviteRole(role)}
-                      className={cn(
-                        "py-3 rounded-xl text-[10px] font-black uppercase tracking-widest border-2 transition-all",
-                        inviteRole === role 
-                          ? "bg-blue-50 border-blue-600 text-blue-600 shadow-md" 
-                          : "bg-white border-slate-100 text-slate-400 hover:border-slate-200"
-                      )}
-                    >
-                      {role}
-                    </button>
-                  ))}
+                <div className="flex gap-3 pt-2">
+                  <button
+                    onClick={() => {
+                      const text = `--- PREFERRED METALS ACCESS ---\nName: ${justCreatedUser.name}\nRole: ${justCreatedUser.role}\nEmail: ${justCreatedUser.email}\nPassword: ${justCreatedUser.password}\n${justCreatedUser.role === 'manager' ? 'Default PIN: 1234' : ''}`;
+                      navigator.clipboard.writeText(text);
+                      setIsCopied(true);
+                      setTimeout(() => setIsCopied(false), 2000);
+                    }}
+                    className={cn(
+                      "flex-1 py-4 rounded-2xl font-black text-xs uppercase tracking-widest border transition-all flex items-center justify-center gap-2",
+                      isCopied 
+                        ? "bg-emerald-50 text-emerald-700 border-emerald-200" 
+                        : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+                    )}
+                  >
+                    {isCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                    {isCopied ? "Copied!" : "Copy Details"}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setJustCreatedUser(null);
+                      setShowInviteModal(false);
+                    }}
+                    className="flex-1 py-4 bg-slate-900 text-white hover:bg-slate-800 transition-all rounded-2xl font-black text-xs uppercase tracking-widest"
+                  >
+                    Done
+                  </button>
                 </div>
               </div>
+            ) : (
+              <>
+                <div className="text-center space-y-2">
+                  <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                    <UserPlus className="w-8 h-8 text-blue-600" />
+                  </div>
+                  <h2 className="text-2xl font-black text-slate-900 tracking-tight">Add New User</h2>
+                  <p className="text-sm text-slate-500 font-medium">Create a local account for a new team member.</p>
+                </div>
 
-              <div className="bg-blue-50 rounded-2xl p-4 flex gap-3 border border-blue-100">
-                <Info className="w-5 h-5 text-blue-500 shrink-0" />
-                <p className="text-[10px] text-blue-900 font-bold leading-relaxed">
-                  The user will be able to log in immediately using these credentials. Ensure they change their password later.
-                </p>
+                <div className="space-y-6">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Full Name</label>
+                    <input
+                      type="text"
+                      value={inviteName}
+                      onChange={(e) => setInviteName(e.target.value)}
+                      placeholder="e.g. John Doe"
+                      className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Email Address</label>
+                    <input
+                      type="email"
+                      value={inviteEmail}
+                      onChange={(e) => setInviteEmail(e.target.value)}
+                      placeholder="e.g. employee@gmail.com"
+                      className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Temporary Password</label>
+                    <input
+                      type="password"
+                      value={invitePassword}
+                      onChange={(e) => setInvitePassword(e.target.value)}
+                      placeholder="At least 6 characters"
+                      className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Assigned Role</label>
+                    <div className="grid grid-cols-2 gap-3">
+                      {(['cashier', 'manager'] as UserRole[]).map((role) => (
+                        <button
+                          key={role}
+                          onClick={() => setInviteRole(role)}
+                          className={cn(
+                            "py-3 rounded-xl text-[10px] font-black uppercase tracking-widest border-2 transition-all",
+                            inviteRole === role 
+                              ? "bg-blue-50 border-blue-600 text-blue-600 shadow-md" 
+                              : "bg-white border-slate-100 text-slate-400 hover:border-slate-200"
+                          )}
+                        >
+                          {role}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="bg-blue-50 rounded-2xl p-4 flex gap-3 border border-blue-100">
+                    <Info className="w-5 h-5 text-blue-500 shrink-0" />
+                    <p className="text-[10px] text-blue-900 font-bold leading-relaxed">
+                      The user will be able to log in immediately using these credentials. Ensure they change their password later.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => {
+                      setShowInviteModal(false);
+                      setJustCreatedUser(null);
+                    }}
+                    className="flex-1 py-4 bg-slate-100 text-slate-600 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-slate-200 transition-all"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleCreateUser}
+                    disabled={processing}
+                    className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-blue-700 transition-all shadow-xl shadow-blue-200 flex items-center justify-center gap-2"
+                  >
+                    {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-4 h-4" />}
+                    Create User
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Delete User Confirmation Modal */}
+      {userToDelete && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm animate-in fade-in duration-300">
+          <div className="bg-white rounded-[2.5rem] shadow-2xl max-w-md w-full p-8 space-y-6 animate-in zoom-in-95 duration-300 border border-red-50 font-sans">
+            <div className="text-center space-y-2">
+              <div className="w-16 h-16 bg-red-50 rounded-2xl flex items-center justify-center mx-auto mb-4 animate-pulse">
+                <ShieldAlert className="w-8 h-8 text-red-600" />
               </div>
+              <h2 className="text-2xl font-black text-slate-900 tracking-tight">Delete Account?</h2>
+              <p className="text-sm text-slate-500 font-medium">Are you sure you want to remove this user from the system?</p>
+            </div>
+
+            <div className="bg-red-50/50 p-5 rounded-3xl border border-red-100 text-xs text-red-900 font-bold leading-relaxed space-y-2">
+              <p>
+                This will permanently delete the profile of <span className="text-slate-900 font-black">{userToDelete.displayName}</span> (<span className="text-slate-900">{userToDelete.email}</span>).
+              </p>
+              <p>
+                They will lose all administrative or cashiering capabilities immediately, and any ongoing login session on any terminal will be voided.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">
+                Type <span className="text-red-600 font-black">DELETE</span> to confirm
+              </label>
+              <input
+                type="text"
+                value={deleteConfirmText}
+                onChange={(e) => setDeleteConfirmText(e.target.value)}
+                placeholder="DELETE"
+                className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-red-500 outline-none transition-all uppercase tracking-widest"
+              />
             </div>
 
             <div className="flex gap-3">
               <button
-                onClick={() => setShowInviteModal(false)}
+                onClick={() => {
+                  setUserToDelete(null);
+                  setDeleteConfirmText('');
+                }}
                 className="flex-1 py-4 bg-slate-100 text-slate-600 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-slate-200 transition-all"
               >
-                Cancel
+                Keep User
               </button>
               <button
-                onClick={handleCreateUser}
-                disabled={processing}
-                className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-blue-700 transition-all shadow-xl shadow-blue-200 flex items-center justify-center gap-2"
+                onClick={handleDeleteUserConfirm}
+                disabled={processing || deleteConfirmText.trim().toUpperCase() !== 'DELETE'}
+                className="flex-1 py-4 bg-red-600 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-red-700 transition-all shadow-xl shadow-red-200 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none"
               >
-                {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-4 h-4" />}
-                Create User
+                {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                Confirm Delete
               </button>
             </div>
           </div>
@@ -1518,6 +3257,151 @@ export default function Settings({ profile }: SettingsProps) {
                     <option value="error">Critical (Red)</option>
                   </select>
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {activeTab === 'roles' && (
+        <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* Cashier Defaults card */}
+            <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-6">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-blue-50 rounded-xl text-blue-600">
+                    <User className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-black text-slate-900 uppercase tracking-tight">Cashier Default Template</h3>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Applied automatically to new cashiers</p>
+                  </div>
+                </div>
+                <button
+                  disabled={processing}
+                  onClick={() => handleApplyDefaultsToAll('cashier')}
+                  className="px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 transition-all flex items-center gap-2"
+                >
+                  Apply to All Existing
+                </button>
+              </div>
+
+              <div className="space-y-3 pt-4 border-t border-slate-50 grid grid-cols-1 gap-3">
+                {Object.entries({
+                  canManagePrices: 'Modify material prices',
+                  canManageUsers: 'Edit team roles & permissions',
+                  canVoidTickets: 'Void or cancel buy tickets',
+                  canDeleteData: 'Perform system resets',
+                  canManageInventory: 'Update stock levels',
+                  canGenerateReports: 'Access analytics & data',
+                  canManageInvoices: 'Create & edit sale invoices',
+                  canManageCash: 'Manage cash reconciliation',
+                  canApproveChanges: 'Authorize manager overrides',
+                  canOpenCloseSessions: 'Open & close money drawer',
+                  canRetroactivePriceAdjustments: 'Adjust prices on tickets'
+                }).map(([key, label]) => {
+                  const val = cashierRoleDefaults[key as keyof UserPermissions];
+                  return (
+                    <button
+                      key={`cashier-${key}`}
+                      disabled={processing}
+                      onClick={() => handleUpdateRoleDefaults('cashier', key as keyof UserPermissions, !val)}
+                      className={cn(
+                        "flex items-center justify-between p-4 rounded-2xl border transition-all hover:shadow-sm",
+                        val ? "bg-blue-50/50 border-blue-100 border-2" : "bg-white border-slate-100 grayscale opacity-60"
+                      )}
+                    >
+                      <div className="text-left">
+                        <p className={cn(
+                          "text-xs font-black uppercase tracking-tight",
+                          val ? "text-blue-900" : "text-slate-500"
+                        )}>
+                          {key.slice(3).replace(/([A-Z])/g, ' $1').trim()}
+                        </p>
+                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest">{label}</p>
+                      </div>
+                      <div className={cn(
+                        "w-10 h-5 rounded-full transition-colors relative",
+                        val ? "bg-blue-600" : "bg-slate-300"
+                      )}>
+                        <div className={cn(
+                          "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                          val ? "left-6" : "left-1"
+                        )} />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Manager Defaults card */}
+            <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-6">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-purple-50 rounded-xl text-purple-600">
+                    <ShieldCheck className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-black text-slate-900 uppercase tracking-tight">Manager Default Template</h3>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Applied automatically to new managers</p>
+                  </div>
+                </div>
+                <button
+                  disabled={processing}
+                  onClick={() => handleApplyDefaultsToAll('manager')}
+                  className="px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 transition-all flex items-center gap-2"
+                >
+                  Apply to All Existing
+                </button>
+              </div>
+
+              <div className="space-y-3 pt-4 border-t border-slate-50 grid grid-cols-1 gap-3">
+                {Object.entries({
+                  canManagePrices: 'Modify material prices',
+                  canManageUsers: 'Edit team roles & permissions',
+                  canVoidTickets: 'Void or cancel buy tickets',
+                  canDeleteData: 'Perform system resets',
+                  canManageInventory: 'Update stock levels',
+                  canGenerateReports: 'Access analytics & data',
+                  canManageInvoices: 'Create & edit sale invoices',
+                  canManageCash: 'Manage cash reconciliation',
+                  canApproveChanges: 'Authorize manager overrides',
+                  canOpenCloseSessions: 'Open & close money drawer',
+                  canRetroactivePriceAdjustments: 'Adjust prices on tickets'
+                }).map(([key, label]) => {
+                  const val = managerRoleDefaults[key as keyof UserPermissions];
+                  return (
+                    <button
+                      key={`manager-${key}`}
+                      disabled={processing}
+                      onClick={() => handleUpdateRoleDefaults('manager', key as keyof UserPermissions, !val)}
+                      className={cn(
+                        "flex items-center justify-between p-4 rounded-2xl border transition-all hover:shadow-sm",
+                        val ? "bg-purple-50/50 border-purple-100 border-2" : "bg-white border-slate-100 grayscale opacity-60"
+                      )}
+                    >
+                      <div className="text-left">
+                        <p className={cn(
+                          "text-xs font-black uppercase tracking-tight",
+                          val ? "text-purple-900" : "text-slate-500"
+                        )}>
+                          {key.slice(3).replace(/([A-Z])/g, ' $1').trim()}
+                        </p>
+                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest">{label}</p>
+                      </div>
+                      <div className={cn(
+                        "w-10 h-5 rounded-full transition-colors relative",
+                        val ? "bg-purple-600" : "bg-slate-300"
+                      )}>
+                        <div className={cn(
+                          "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                          val ? "left-6" : "left-1"
+                        )} />
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </div>

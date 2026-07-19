@@ -18,14 +18,16 @@ import {
   History,
   FileText,
   Wallet,
-  Settings
+  Settings,
+  Search
 } from 'lucide-react';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { cn } from '../lib/utils';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { useSettings } from '../context/SettingsContext';
 import { COMPANY_NAME, handleImageError } from '../constants';
 import { BrandLogo } from './BrandLogo';
+import SpotlightSearch from './SpotlightSearch';
 
 interface LayoutProps {
   user: User;
@@ -38,6 +40,27 @@ export default function Layout({ user, profile }: LayoutProps) {
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const isOnline = useNetworkStatus();
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const isInput = e.target instanceof HTMLInputElement || 
+                      e.target instanceof HTMLTextAreaElement || 
+                      (e.target as HTMLElement).isContentEditable;
+
+      // Cmd/Ctrl + K or forward slash '/' when not typing in any inputs
+      if (
+        ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') ||
+        (e.key === '/' && !isInput)
+      ) {
+        e.preventDefault();
+        setSearchOpen(prev => !prev);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   const handleLogout = async () => {
     try {
@@ -50,6 +73,8 @@ export default function Layout({ user, profile }: LayoutProps) {
     } catch (e) {
       console.warn('Logout session update failed');
     }
+    localStorage.removeItem('pm_demo_mode_active');
+    localStorage.removeItem('pm_demo_role');
     await auth.signOut();
     navigate('/login');
   };
@@ -96,7 +121,7 @@ export default function Layout({ user, profile }: LayoutProps) {
 
       {/* Sidebar */}
       <aside className={cn(
-        "fixed inset-y-0 left-0 z-50 w-64 bg-slate-900 text-slate-300 transition-transform duration-300 lg:relative lg:translate-x-0",
+        "fixed inset-y-0 left-0 z-50 w-64 bg-slate-900 text-slate-300 transition-transform duration-300 lg:relative lg:translate-x-0 print:hidden",
         sidebarOpen ? "translate-x-0" : "-translate-x-full",
         settings.compactMode && "w-20"
       )}>
@@ -175,7 +200,7 @@ export default function Layout({ user, profile }: LayoutProps) {
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         <header className={cn(
-          "h-20 bg-white border-b border-slate-200 flex items-center justify-between px-6 lg:px-10 shrink-0 transition-colors duration-300",
+          "h-20 bg-white border-b border-slate-200 flex items-center justify-between px-6 lg:px-10 shrink-0 transition-colors duration-300 print:hidden",
           settings.theme === 'dark' && "bg-slate-900 border-slate-800"
         )}>
           <button 
@@ -185,22 +210,57 @@ export default function Layout({ user, profile }: LayoutProps) {
           >
             <Menu className="w-6 h-6" />
           </button>
-          <div className="flex-1" />
+          <div className="flex-1 max-w-sm lg:max-w-md mx-4 lg:mx-6 hidden md:block">
+            <button
+              onClick={() => setSearchOpen(true)}
+              className={cn(
+                "w-full flex items-center justify-between px-4 py-2.5 bg-slate-100 hover:bg-slate-200/50 border border-slate-200/30 rounded-2xl text-slate-400 hover:text-slate-500 transition-all text-[10px] font-bold uppercase tracking-wider outline-none focus-visible:ring-2 focus-visible:ring-blue-500",
+                settings.theme === 'dark' && "bg-slate-800 hover:bg-slate-700/65 border-slate-700/80 text-slate-500 hover:text-slate-400"
+              )}
+            >
+              <div className="flex items-center gap-2.5">
+                <Search className="w-4 h-4 text-slate-400 dark:text-slate-500" />
+                <span>Search database...</span>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <kbd className="px-1.5 py-0.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded text-[9px] font-black tracking-normal">⌘K</kbd>
+              </div>
+            </button>
+          </div>
+          <div className="flex-1 md:hidden" />
           <div className="flex items-center gap-6">
+            <button
+              onClick={() => setSearchOpen(true)}
+              className={cn(
+                "p-2.5 text-slate-500 hover:bg-slate-100 rounded-2xl md:hidden transition-all outline-none",
+                settings.theme === 'dark' && "text-slate-400 hover:bg-slate-800"
+              )}
+              aria-label="Spotlight Search"
+            >
+              <Search className="w-5.25 h-5.25" />
+            </button>
             <div className={cn(
-              "flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest",
-              isOnline ? "bg-emerald-50 text-emerald-700 border border-emerald-100" : "bg-amber-50 text-amber-700 border border-amber-100",
-              settings.theme === 'dark' && (isOnline ? "bg-emerald-900/20 text-emerald-400 border-emerald-800" : "bg-amber-900/20 text-amber-400 border-amber-800")
+              "flex items-center gap-2 px-3.5 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest transition-all duration-300",
+              isOnline 
+                ? "bg-emerald-50 text-emerald-700 border border-emerald-100/80" 
+                : "bg-rose-50 text-rose-800 border border-rose-200 animate-pulse",
+              settings.theme === 'dark' && (
+                isOnline 
+                  ? "bg-emerald-950/30 text-emerald-400 border-emerald-800/50" 
+                  : "bg-rose-950/30 text-rose-400 border-rose-800"
+              )
             )}>
               {isOnline ? (
                 <>
-                  <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                  <span>System Online</span>
+                  <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full inline-block animate-pulse" />
+                  <Wifi className="w-3.5 h-3.5 text-emerald-500" />
+                  <span>Connectivity: Online</span>
                 </>
               ) : (
                 <>
-                  <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />
-                  <span>Offline Mode</span>
+                  <span className="w-1.5 h-1.5 bg-rose-500 rounded-full inline-block animate-ping" />
+                  <WifiOff className="w-3.5 h-3.5 text-rose-500" />
+                  <span className="font-extrabold text-rose-700 dark:text-rose-400">Connectivity: Disconnected (Working on Local Cache)</span>
                 </>
               )}
             </div>
@@ -214,7 +274,7 @@ export default function Layout({ user, profile }: LayoutProps) {
         </header>
 
         <main className={cn(
-          "flex-1 overflow-y-auto p-4 lg:p-8 transition-colors duration-300",
+          "flex-1 overflow-y-auto p-4 lg:p-8 transition-colors duration-300 print:p-0",
           settings.theme === 'dark' && "bg-slate-950"
         )}>
           <div className="max-w-7xl mx-auto">
@@ -222,6 +282,11 @@ export default function Layout({ user, profile }: LayoutProps) {
           </div>
         </main>
       </div>
+      <SpotlightSearch 
+        isOpen={searchOpen} 
+        onClose={() => setSearchOpen(false)} 
+        profile={profile} 
+      />
     </div>
   );
 }

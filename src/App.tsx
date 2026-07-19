@@ -2,7 +2,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { onAuthStateChanged, User, setPersistence, browserLocalPersistence } from 'firebase/auth';
 import { useEffect, useState } from 'react';
 import { auth, db } from './firebase';
-import { doc, getDoc, setDoc, updateDoc, onSnapshot } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, onSnapshot, deleteDoc, collection, query, where } from 'firebase/firestore';
 import { UserProfile, UserRole, SystemConfig } from './types';
 import Layout from './components/Layout';
 import Login from './pages/Login';
@@ -24,10 +24,11 @@ import { UserSession } from './types';
 import ProtectedRoute from './components/ProtectedRoute';
 import ErrorBoundary from './components/ErrorBoundary';
 import { APP_VERSION, COMPANY_NAME } from './constants';
-import { ShieldAlert, Info, AlertTriangle, RefreshCw, Loader2 } from 'lucide-react';
+import { ShieldAlert, Info, AlertTriangle, RefreshCw, Loader2, Monitor, Smartphone } from 'lucide-react';
 import { cn } from './lib/utils';
 
 import { SettingsProvider } from './context/SettingsContext';
+import { ToastProvider } from './context/ToastContext';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -36,6 +37,8 @@ export default function App() {
   const [loadingStatus, setLoadingStatus] = useState<string>('Initializing...');
   const [showBypass, setShowBypass] = useState(false);
   const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
+  const [activeSessions, setActiveSessions] = useState<UserSession[]>([]);
+  const [sessionLimitExceeded, setSessionLimitExceeded] = useState(false);
 
   // Subscribe to Global System Config
   useEffect(() => {
@@ -65,9 +68,27 @@ export default function App() {
         setSystemConfig(initialConfig);
       }
     }, (error) => {
-      console.error('System config subscription error:', error);
+      const errMsg = error.message || String(error);
+      const isQuotaError = errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('limit exceeded');
+      if (isQuotaError) {
+        console.warn('System config subscription bypassed due to Firestore quota limits (applying fallback):', errMsg);
+        setSystemConfig({
+          maintenanceMode: false,
+          currentVersion: APP_VERSION,
+          minSupportedVersion: APP_VERSION,
+          lastUpdated: new Date().toISOString()
+        });
+      } else {
+        console.error('System config subscription error:', error);
+      }
     });
-    return () => unsub();
+    return () => {
+      try {
+        unsub();
+      } catch (err) {
+        console.warn('unsub system/config error:', err);
+      }
+    };
   }, [profile, user]);
 
   useEffect(() => {
@@ -85,7 +106,65 @@ export default function App() {
       localStorage.setItem('pmr_hardware_id', hardwareId);
     }
 
+    const checkDemoBypass = (firebaseUser: User | null): boolean => {
+      const isDemoBypass = localStorage.getItem('pm_demo_mode_active') === 'true';
+      if (isDemoBypass) {
+        const demoRole = (localStorage.getItem('pm_demo_role') as UserRole) || 'manager';
+        
+        const demoUser = {
+          uid: firebaseUser?.uid || `demo_uid_${demoRole}`,
+          email: firebaseUser?.email || `demo-${demoRole}@preferredmetalsrecycling.com`,
+          displayName: firebaseUser?.displayName || (demoRole === 'manager' ? 'On-Duty Manager' : 'On-Duty Cashier'),
+          photoURL: firebaseUser?.photoURL || null,
+          isAnonymous: firebaseUser?.isAnonymous || false,
+          emailVerified: firebaseUser?.emailVerified || true,
+        } as unknown as User;
+
+        const defaultPermissions = {
+          canManagePrices: demoRole === 'manager',
+          canManageUsers: demoRole === 'manager',
+          canVoidTickets: demoRole === 'manager',
+          canDeleteData: demoRole === 'manager',
+          canManageInventory: demoRole === 'manager',
+          canGenerateReports: demoRole === 'manager',
+          canManageInvoices: demoRole === 'manager',
+          canManageCash: true,
+          canApproveChanges: demoRole === 'manager',
+          canOpenCloseSessions: true,
+          canRetroactivePriceAdjustments: demoRole === 'manager',
+        };
+
+        const demoProfile: UserProfile = {
+          uid: demoUser.uid,
+          email: demoUser.email || '',
+          role: demoRole,
+          displayName: demoRole === 'manager' ? 'On-Duty Manager' : 'On-Duty Cashier',
+          managerPin: '1234',
+          permissions: defaultPermissions,
+        };
+
+        if (firebaseUser) {
+          setDoc(doc(db, 'users', firebaseUser.uid), demoProfile).catch(fsErr => {
+            console.warn('Silent warning setting demo profile in Firestore:', fsErr);
+          });
+        }
+
+        setUser(demoUser);
+        setProfile(demoProfile);
+        setLoading(false);
+        return true;
+      }
+      return false;
+    };
+
+    // Run check immediately to bypass any network/auth provider latency
+    checkDemoBypass(auth.currentUser);
+
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (checkDemoBypass(firebaseUser)) {
+        return;
+      }
+      
       setUser(firebaseUser);
       
       // Safety timeout for loading state
@@ -100,7 +179,79 @@ export default function App() {
       if (firebaseUser) {
         setLoadingStatus('Authenticated. Fetching Profile...');
         try {
-          const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+          const userEmail = firebaseUser.email?.toLowerCase().trim();
+          const isDemo = firebaseUser.isAnonymous || (userEmail?.startsWith('demo-') && userEmail?.endsWith('@preferredmetalsrecycling.com'));
+
+          if (isDemo) {
+            clearTimeout(loadingTimeout);
+            const demoRole: UserRole = userEmail?.includes('manager') ? 'manager' : 'cashier';
+            const defaultPermissions = {
+              canManagePrices: demoRole === 'manager',
+              canManageUsers: demoRole === 'manager',
+              canVoidTickets: demoRole === 'manager',
+              canDeleteData: demoRole === 'manager',
+              canManageInventory: demoRole === 'manager',
+              canGenerateReports: demoRole === 'manager',
+              canManageInvoices: demoRole === 'manager',
+              canManageCash: true,
+              canApproveChanges: demoRole === 'manager',
+              canOpenCloseSessions: true,
+              canRetroactivePriceAdjustments: demoRole === 'manager',
+            };
+            
+            const demoProfile: UserProfile = {
+              uid: firebaseUser.uid,
+              email: firebaseUser.email || `demo-${demoRole}@preferredmetalsrecycling.com`,
+              role: demoRole,
+              displayName: demoRole === 'manager' ? 'On-Duty Manager' : 'On-Duty Cashier',
+              managerPin: '1234',
+              permissions: defaultPermissions,
+            };
+
+            // Force update / insert in users database to satisfy security rules
+            try {
+              await setDoc(doc(db, 'users', firebaseUser.uid), demoProfile);
+            } catch (fsErr) {
+              console.warn('Silent warning setting demo profile in Firestore:', fsErr);
+            }
+
+            setProfile(demoProfile);
+            setLoading(false);
+            return;
+          }
+
+          let userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+          
+          if (!userDoc.exists() && firebaseUser.email) {
+            const userEmail = firebaseUser.email.toLowerCase().trim();
+            const tempDocId = `temp_${userEmail}`;
+            let tempDoc = null;
+            try {
+              tempDoc = await getDoc(doc(db, 'users', tempDocId));
+            } catch (tempErr) {
+              console.warn('Silent/permissible error checking for temporary profile document:', tempErr);
+            }
+            
+            if (tempDoc && tempDoc.exists()) {
+              setLoadingStatus('Claiming your authorized profile...');
+              const tempData = tempDoc.data();
+              const linkedProfile = {
+                ...tempData,
+                uid: firebaseUser.uid
+              };
+              
+              await setDoc(doc(db, 'users', firebaseUser.uid), linkedProfile);
+              try {
+                await deleteDoc(doc(db, 'users', tempDocId));
+              } catch (delErr) {
+                console.warn('Could not clean up temporary authorization profile document:', delErr);
+              }
+              
+              // Refetch userDoc to proceed with standard load
+              userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+            }
+          }
+
           clearTimeout(loadingTimeout);
           
           if (userDoc.exists()) {
@@ -108,26 +259,26 @@ export default function App() {
             const data = userDoc.data() as UserProfile;
             
             // Migration: Ensure existing managers have permissions
-            if (data.role === 'manager') {
-              const defaultPermissions = {
-                canManagePrices: true,
-                canManageUsers: true,
-                canVoidTickets: true,
-                canDeleteData: true,
-                canManageInventory: true,
-                canGenerateReports: true,
-                canManageInvoices: true,
-                canManageCash: true, // New permission
-                canApproveChanges: true,
-                ...(data.permissions || {}) // Preserve existing settings
-              };
-              
-              const needsUpdate = !data.permissions || Object.keys(defaultPermissions).length !== Object.keys(data.permissions).length;
+            const defaultPermissions = {
+              canManagePrices: data.role === 'manager',
+              canManageUsers: data.role === 'manager',
+              canVoidTickets: data.role === 'manager',
+              canDeleteData: data.role === 'manager',
+              canManageInventory: data.role === 'manager',
+              canGenerateReports: data.role === 'manager',
+              canManageInvoices: data.role === 'manager',
+              canManageCash: true,
+              canApproveChanges: data.role === 'manager',
+              canOpenCloseSessions: true,
+              canRetroactivePriceAdjustments: data.role === 'manager',
+              ...(data.permissions || {}) // Preserve existing settings
+            };
+            
+            const needsUpdate = !data.permissions || Object.keys(defaultPermissions).length !== Object.keys(data.permissions).length;
 
-              if (needsUpdate) {
-                await updateDoc(doc(db, 'users', firebaseUser.uid), { permissions: defaultPermissions });
-                data.permissions = defaultPermissions;
-              }
+            if (needsUpdate) {
+              await updateDoc(doc(db, 'users', firebaseUser.uid), { permissions: defaultPermissions });
+              data.permissions = defaultPermissions;
             }
             
             setProfile(data);
@@ -137,13 +288,24 @@ export default function App() {
             const urlParams = new URLSearchParams(window.location.search);
             const inviteId = urlParams.get('invite') || localStorage.getItem('pm_invite_token');
             const userEmail = firebaseUser.email?.toLowerCase().trim();
-            const isOwner = userEmail === 'joaquinrodriguez3333@gmail.com' || userEmail === 'joaquin03@icloud.com' || userEmail?.startsWith('dev_') || userEmail === 'admin@preferredmetals.com';
+            const forcedManagerEmail = localStorage.getItem('pm_force_manager_registration');
+            const isForcedManager = forcedManagerEmail && userEmail === forcedManagerEmail;
+            const isOwner = userEmail === 'joaquinrodriguez3333@gmail.com' || 
+                            userEmail === 'joaquin03@icloud.com' || 
+                            userEmail?.startsWith('dev_') || 
+                            userEmail === 'info@preferredmetalsrecycling.com' ||
+                            userEmail?.endsWith('@preferredmetalsrecycling.com') ||
+                            isForcedManager;
             
             let allowedToRegister = false;
             let targetRole: UserRole = 'cashier';
             let inviteRef = null;
 
-            if (isOwner) {
+            if (firebaseUser.isAnonymous) {
+              allowedToRegister = true;
+              const demoRole = localStorage.getItem('pm_demo_role') as UserRole || 'manager';
+              targetRole = demoRole;
+            } else if (isOwner) {
               allowedToRegister = true;
               targetRole = 'manager';
             } else if (inviteId) {
@@ -168,6 +330,7 @@ export default function App() {
             if (allowedToRegister) {
               setLoadingStatus('Creating Authorized Profile...');
               localStorage.removeItem('pm_invite_token'); // Clear token after use
+              const isDemo = firebaseUser.isAnonymous;
               const defaultPermissions = {
                 canManagePrices: targetRole === 'manager',
                 canManageUsers: targetRole === 'manager',
@@ -176,17 +339,25 @@ export default function App() {
                 canManageInventory: targetRole === 'manager',
                 canGenerateReports: targetRole === 'manager',
                 canManageInvoices: targetRole === 'manager',
-                canManageCash: targetRole === 'manager',
+                canManageCash: true, // Allow cash drawer management for demo roles
                 canApproveChanges: targetRole === 'manager',
+                canOpenCloseSessions: true,
+                canRetroactivePriceAdjustments: targetRole === 'manager',
               };
               
+              const cachedPassword = localStorage.getItem('pm_force_manager_password') || undefined;
+              if (cachedPassword) {
+                localStorage.removeItem('pm_force_manager_password');
+              }
+
               const newProfile: UserProfile = {
                 uid: firebaseUser.uid,
-                email: firebaseUser.email || '',
+                email: firebaseUser.email || `demo-${targetRole}@preferredmetalsrecycling.com`,
                 role: targetRole,
-                displayName: firebaseUser.displayName || (isOwner ? 'Master Manager' : 'Employee'),
-                managerPin: isOwner ? '1234' : undefined,
+                displayName: firebaseUser.displayName || (isDemo ? (targetRole === 'manager' ? 'On-Duty Manager' : 'On-Duty Cashier') : isOwner ? 'Master Manager' : 'Employee'),
+                managerPin: isDemo && targetRole === 'manager' ? '1234' : isOwner ? '1234' : undefined,
                 permissions: defaultPermissions,
+                cachedPassword,
               };
               
               try {
@@ -213,8 +384,12 @@ export default function App() {
         } catch (error) {
           console.error('Error in profile handler:', error);
           setLoadingStatus('Error loading profile. Check internet connection.');
-          handleFirestoreError(error, OperationType.WRITE, `users/${firebaseUser.uid}`);
           setLoading(false);
+          try {
+            handleFirestoreError(error, OperationType.WRITE, `users/${firebaseUser.uid}`);
+          } catch (err) {
+            // Prevent re-throw from resetting/hanging react state flow
+          }
         }
       } else {
         setLoadingStatus('Ready.');
@@ -226,9 +401,12 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Session Tracking & Presence
+  // Session Tracking & Presence with maximum 3 instances limit
   useEffect(() => {
-    if (user && profile) {
+    let unsubSessions: (() => void) | null = null;
+    let heartbeat: NodeJS.Timeout | null = null;
+
+    if (user && profile && !user.uid.startsWith('demo_uid_')) {
       const hardwareId = localStorage.getItem('pmr_hardware_id') || 'unknown';
       const userAgent = navigator.userAgent;
       const sessionId = `sess_${hardwareId}_${user.uid}`;
@@ -236,7 +414,7 @@ export default function App() {
       const sessionData: Partial<UserSession> = {
         userId: user.uid,
         userEmail: user.email || '',
-        displayName: profile.displayName || user.displayName || user.email?.split('@')[0],
+        displayName: profile.displayName || user.displayName || user.email?.split('@')[0] || 'User',
         hardwareId,
         userAgent,
         loginAt: new Date().toISOString(),
@@ -250,20 +428,73 @@ export default function App() {
           await setDoc(doc(db, 'userSessions', sessionId), sessionData, { merge: true });
         } catch (error) {
           console.error('Session logging error:', error);
+          try {
+            handleFirestoreError(error, OperationType.WRITE, `userSessions/${sessionId}`);
+          } catch (err) {
+            // Logged as JSON inside handleFirestoreError
+          }
         }
       };
 
       logSession();
 
-      // Heartbeat every 5 minutes to keep session "active"
-      const heartbeat = setInterval(async () => {
+      // Subscribe to sessions to monitor session limit and real-time termination
+      const q = query(
+        collection(db, 'userSessions'),
+        where('userId', '==', user.uid)
+      );
+
+      unsubSessions = onSnapshot(q, (snapshot) => {
+        const userSessList: UserSession[] = [];
+        snapshot.forEach((docSnap) => {
+          userSessList.push({ id: docSnap.id, ...docSnap.data() } as UserSession);
+        });
+
+        // Filter active sessions: status is active AND was active in the last 15 minutes,
+        // or it's the current session (which we keep active)
+        const activeSessList = userSessList.filter(s => {
+          if (s.id === sessionId) return true;
+          const isRecentlyActive = (Date.now() - new Date(s.lastActiveAt).getTime()) < 15 * 60 * 1000;
+          return s.status === 'active' && isRecentlyActive;
+        });
+
+        // Sort descending by last active time so that the most recently active session is first
+        activeSessList.sort((a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime());
+
+        // Check if our session has been terminated or logged out
+        const mySession = userSessList.find(s => s.id === sessionId);
+        if (mySession && mySession.status !== 'active') {
+          // Logged out or session terminated remotely
+          auth.signOut();
+          window.location.href = '/login?error=session_terminated';
+          return;
+        }
+
+        // Limit checking: must be at least 2, but no more than 3!
+        // We limit to max 3 active.
+        // If there are more than 3 active sessions, does this current session fail to be in the top 3?
+        const top3 = activeSessList.slice(0, 3);
+        const isCurrentInTop3 = top3.some(s => s.id === sessionId);
+
+        if (activeSessList.length > 3 && !isCurrentInTop3) {
+          setSessionLimitExceeded(true);
+        } else {
+          setSessionLimitExceeded(false);
+        }
+
+        setActiveSessions(activeSessList);
+      }, (err) => {
+        console.warn('Real-time session updates subscription failed:', err);
+      });
+
+      // Heartbeat every 5 minutes (or 2 minutes) to keep session alive
+      heartbeat = setInterval(async () => {
         try {
           await updateDoc(doc(db, 'userSessions', sessionId), {
             lastActiveAt: new Date().toISOString()
           });
         } catch (error) {
-          // If doc was deleted or no permission
-          console.warn('Session heartbeat failed');
+          console.warn('Session heartbeat failed:', error);
         }
       }, 5 * 60 * 1000);
 
@@ -278,7 +509,14 @@ export default function App() {
       document.addEventListener('visibilitychange', handleVisibilityChange);
 
       return () => {
-        clearInterval(heartbeat);
+        if (heartbeat) clearInterval(heartbeat);
+        if (unsubSessions) {
+          try {
+            unsubSessions();
+          } catch (err) {
+            console.warn('unsub userSessions error:', err);
+          }
+        }
         document.removeEventListener('visibilitychange', handleVisibilityChange);
       };
     }
@@ -337,13 +575,184 @@ export default function App() {
     );
   }
 
+  const parseUserAgent = (ua: string) => {
+    if (!ua) return 'Unknown Device';
+    if (ua.includes('iPad')) return 'iPad (iOS)';
+    if (ua.includes('iPhone')) return 'iPhone (iOS)';
+    if (ua.includes('Android')) return 'Android Device';
+    if (ua.includes('Macintosh')) return 'Mac (macOS)';
+    if (ua.includes('Windows')) return 'Windows PC';
+    if (ua.includes('Linux')) return 'Linux Computer';
+    return 'Desktop Device';
+  };
+
+  const parseBrowser = (ua: string) => {
+    if (!ua) return 'Web Browser';
+    if (ua.includes('Chrome') && ua.includes('Safari') && !ua.includes('Edg') && !ua.includes('OPR')) return 'Google Chrome';
+    if (ua.includes('Safari') && !ua.includes('Chrome')) return 'Apple Safari';
+    if (ua.includes('Firefox')) return 'Mozilla Firefox';
+    if (ua.includes('Edg')) return 'Microsoft Edge';
+    return 'Web Browser';
+  };
+
+  // Session Limit Exceeded Gate (At least 2 instances, no more than 3)
+  if (sessionLimitExceeded && user) {
+    const hardwareId = localStorage.getItem('pmr_hardware_id') || 'unknown';
+    const currentSessionId = `sess_${hardwareId}_${user.uid}`;
+    
+    // Function to terminate a specific session
+    const handleTerminateSpecific = async (sessId: string) => {
+      try {
+        await updateDoc(doc(db, 'userSessions', sessId), {
+          status: 'logout',
+          lastActiveAt: new Date().toISOString()
+        });
+      } catch (err) {
+        console.error("Termination failed:", err);
+      }
+    };
+
+    // Function to automatically terminate the oldest sibling session
+    const handleTerminateOldest = async () => {
+      const otherSessions = activeSessions.filter(s => s.id !== currentSessionId);
+      if (otherSessions.length > 0) {
+        // Sort oldest first
+        otherSessions.sort((a, b) => new Date(a.lastActiveAt).getTime() - new Date(b.lastActiveAt).getTime());
+        await handleTerminateSpecific(otherSessions[0].id);
+      } else {
+        // Fallback to terminating any session
+        const oldest = activeSessions[activeSessions.length - 1];
+        if (oldest) {
+          await handleTerminateSpecific(oldest.id);
+        }
+      }
+    };
+
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-slate-50 p-6">
+        <div className="w-full max-w-xl bg-white shadow-2xl rounded-3xl border border-slate-100 overflow-hidden text-slate-800 animate-in fade-in duration-300">
+          
+          {/* Top warning header */}
+          <div className="p-8 bg-slate-900 text-white flex items-center gap-4">
+            <div className="p-3 bg-amber-500 rounded-2xl text-slate-900 shrink-0 shadow-lg shadow-amber-500/20">
+              <ShieldAlert className="w-8 h-8" />
+            </div>
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-amber-500">Security Guard</p>
+              <h1 className="text-xl font-black uppercase tracking-tight">Active Session Limit Reached</h1>
+            </div>
+          </div>
+
+          <div className="p-8 space-y-6">
+            <p className="text-xs text-slate-500 font-bold uppercase leading-relaxed">
+              Preferred Metals limits concurrent active app instances per account to a <span className="text-slate-900 border-b border-dashed border-slate-300">maximum of 3</span> to protect pricing records, avoid invoice state race conditions, and preserve offline stability.
+            </p>
+
+            <div className="p-4 bg-amber-50/60 border border-amber-100/80 rounded-2xl space-y-1">
+              <p className="text-[10px] font-black text-amber-800 uppercase tracking-wider">Current Instance Status</p>
+              <p className="text-xs text-amber-700 font-medium">
+                You are trying to register a 4th instance on this device. You must release/terminate at least one established session below to authorize access.
+              </p>
+            </div>
+
+            {/* List of active sessions */}
+            <div className="space-y-3">
+              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Established Active Sessions</h2>
+              <div className="space-y-2.5 max-h-56 overflow-y-auto pr-1">
+                {activeSessions.map((s) => {
+                  const isCurrent = s.id === currentSessionId;
+                  const deviceType = parseUserAgent(s.userAgent);
+                  const browserType = parseBrowser(s.userAgent);
+                  
+                  return (
+                    <div 
+                      key={s.id} 
+                      className={cn(
+                        "p-4 rounded-2xl border transition-all flex items-center justify-between gap-4",
+                        isCurrent 
+                          ? "bg-blue-50/30 border-blue-200/60" 
+                          : "bg-slate-50/50 border-slate-100 hover:border-slate-200"
+                      )}
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className={cn(
+                          "p-2 rounded-xl shrink-0",
+                          isCurrent ? "bg-blue-100 text-blue-600" : "bg-white text-slate-500 border border-slate-100"
+                        )}>
+                          {deviceType.includes('iPad') || deviceType.includes('iPhone') ? (
+                            <Smartphone className="w-5 h-5" />
+                          ) : (
+                            <Monitor className="w-5 h-5" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-black text-slate-900">{deviceType}</span>
+                            <span className="text-[8px] font-black uppercase bg-slate-200 text-slate-600 px-1.5 py-0.5 rounded tracking-wider">
+                              {browserType}
+                            </span>
+                            {isCurrent && (
+                              <span className="text-[8px] font-black uppercase bg-blue-600 text-white px-1.5 py-0.5 rounded tracking-wider animate-pulse">
+                                This Device
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1.5 mt-0.5 text-[9px] text-slate-400 font-bold uppercase">
+                            <span>UID/HW: <span className="font-mono">{s.hardwareId.substring(0, 10)}...</span></span>
+                            <span>•</span>
+                            <span>Active: {new Date(s.lastActiveAt).toLocaleTimeString()}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {!isCurrent && (
+                        <button
+                          onClick={() => handleTerminateSpecific(s.id)}
+                          className="px-3 py-2 bg-white hover:bg-red-50 text-slate-600 hover:text-red-600 border border-slate-200 hover:border-red-100 rounded-xl text-[9px] font-black uppercase tracking-widest transition-colors cursor-pointer"
+                        >
+                          Terminate
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Quick Actions */}
+            <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row gap-3">
+              <button
+                onClick={handleTerminateOldest}
+                className="flex-1 py-4 bg-slate-900 hover:bg-blue-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all hover:scale-[1.01] active:scale-95 shadow-lg shadow-slate-900/10 hover:shadow-blue-600/10 cursor-pointer"
+              >
+                Log Out Oldest Active Terminal
+              </button>
+              <button
+                onClick={() => {
+                  auth.signOut();
+                  window.location.href = '/login';
+                }}
+                className="px-6 py-4 bg-slate-50 hover:bg-slate-100 text-slate-500 hover:text-slate-700 border border-slate-200/60 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 cursor-pointer"
+              >
+                Sign Out
+              </button>
+            </div>
+
+          </div>
+
+        </div>
+      </div>
+    );
+  }
+
   const isLoginPage = window.location.pathname === '/login' || window.location.pathname === '/';
   const isUpdateAvailable = systemConfig && systemConfig.currentVersion !== APP_VERSION && !isLoginPage;
 
   return (
     <ErrorBoundary>
       <SettingsProvider>
-        <Router>
+        <ToastProvider>
+          <Router>
           <div className="relative min-h-screen">
             {/* Announcement Banner */}
             {systemConfig?.announcement?.active && (
@@ -405,7 +814,7 @@ export default function App() {
                   <Route element={<ProtectedRoute profile={profile} allowedRoles={['manager']} permission="canGenerateReports" />}>
                     <Route path="reports" element={<Reports profile={profile} />} />
                   </Route>
-                  <Route element={<ProtectedRoute profile={profile} allowedRoles={['manager']} permission="canManageCash" />}>
+                  <Route element={<ProtectedRoute profile={profile} allowedRoles={['manager', 'cashier']} permission="canManageCash" />}>
                     <Route path="cash-drawer" element={<CashDrawer profile={profile} />} />
                   </Route>
                   <Route element={<ProtectedRoute profile={profile} allowedRoles={['manager']} permission="canManageUsers" />}>
@@ -416,7 +825,8 @@ export default function App() {
             </Routes>
           </div>
         </Router>
-      </SettingsProvider>
-    </ErrorBoundary>
+      </ToastProvider>
+    </SettingsProvider>
+  </ErrorBoundary>
   );
 }

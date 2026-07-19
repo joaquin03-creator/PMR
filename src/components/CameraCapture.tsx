@@ -1,38 +1,116 @@
 import React, { useState, useRef } from 'react';
 import { Camera, RefreshCw, X, Video, Loader2 } from 'lucide-react';
 import { PHOTO_PLACEHOLDER_URL } from '../constants';
+import { useSettings } from '../context/SettingsContext';
 
 interface CameraCaptureProps {
   onCapture: (photoUrl: string) => void;
   label?: string;
   className?: string;
   networkUrl?: string; // Swann Snapshot URL
+  photoUrl?: string; // Existing photo URL
 }
 
 export const CameraCapture: React.FC<CameraCaptureProps> = ({ 
   onCapture, 
   label = "Take Photo", 
   className = "",
-  networkUrl 
+  networkUrl,
+  photoUrl
 }) => {
+  const { settings } = useSettings();
   const [isStreaming, setIsStreaming] = useState(false);
   const [isPulling, setIsPulling] = useState(false);
-  const [capturedPhoto, setCapturedPhoto] = useState<string | null>(null);
+  const [capturedPhoto, setCapturedPhoto] = useState<string | null>(photoUrl || null);
+
+  React.useEffect(() => {
+    setCapturedPhoto(photoUrl || null);
+  }, [photoUrl]);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  const pullFromNetwork = async () => {
-    if (!networkUrl) return;
+  // Get list of available cameras based on brand
+  const getAvailableNetworkCams = () => {
+    if (settings.cameraBrand === 'reolink') {
+      const channels = settings.reolinkChannels || [];
+      const user = settings.reolinkUsername || 'admin';
+      const pass = settings.reolinkPassword || '';
+      let base = (settings.reolinkNvrIp || '').trim();
+      if (base && !base.startsWith('http://') && !base.startsWith('https://')) {
+        base = `http://${base}`;
+      }
+
+      return channels
+        .filter(ch => ch.isEnabled)
+        .map(ch => {
+          const url = base ? `${base}/cgi-bin/api.cgi?cmd=Snap&channel=${ch.channel}&user=${user}&password=${pass}` : '';
+          return {
+            id: ch.id,
+            name: ch.name,
+            url: url
+          };
+        });
+    } else {
+      const list = [];
+      if (settings.swannCams.material) list.push({ id: 'material', name: 'Material Station Cam', url: settings.swannCams.material });
+      if (settings.swannCams.customer) list.push({ id: 'customer', name: 'Customer Face Cam', url: settings.swannCams.customer });
+      if (settings.swannCams.entrance) list.push({ id: 'entrance', name: 'Entrance/Vehicle Cam', url: settings.swannCams.entrance });
+      return list;
+    }
+  };
+
+  const availableCams = getAvailableNetworkCams();
+
+  const getInitialCamIndex = () => {
+    const lbl = label.toLowerCase();
+    if (lbl.includes('entrance') || lbl.includes('vehicle')) {
+      const idx = availableCams.findIndex(c => c.id === 'entrance' || c.name.toLowerCase().includes('entrance') || c.name.toLowerCase().includes('vehicle'));
+      if (idx !== -1) return idx;
+    }
+    if (lbl.includes('customer') || lbl.includes('face') || lbl.includes('id ') || lbl.includes('document')) {
+      const idx = availableCams.findIndex(c => c.id === 'customer' || c.name.toLowerCase().includes('customer') || c.name.toLowerCase().includes('face') || c.name.toLowerCase().includes('id'));
+      if (idx !== -1) return idx;
+    }
+    if (lbl.includes('material') || lbl.includes('scale')) {
+      const idx = availableCams.findIndex(c => c.id === 'material' || c.name.toLowerCase().includes('scale') || c.name.toLowerCase().includes('material'));
+      if (idx !== -1) return idx;
+    }
+    if (networkUrl) {
+      const idx = availableCams.findIndex(c => c.url === networkUrl);
+      if (idx !== -1) return idx;
+    }
+    return 0;
+  };
+
+  const [selectedCamIdx, setSelectedCamIdx] = useState(() => getInitialCamIndex());
+
+  const pullFromNetworkUrl = async (url: string) => {
+    if (!url) return;
     setIsPulling(true);
     try {
-      // Use a timestamp to bust cache
-      const cacheBustUrl = `${networkUrl}${networkUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
-      
-      // We try to fetch the image. If the camera doesn't have CORS, this will fail.
-      // But we can also try to use a proxy if needed.
-      // For now, let's try direct fetch or a proxy if configured.
+      const connectionMode = settings.cameraConnectionMode || 'direct';
+      const actualFetchUrl = connectionMode === 'proxy' 
+        ? `/api/camera-proxy?url=${encodeURIComponent(url)}`
+        : url;
+
+      const cacheBustUrl = `${actualFetchUrl}${actualFetchUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
       const response = await fetch(cacheBustUrl);
-      if (!response.ok) throw new Error("Failed to pull from camera");
+      
+      if (!response.ok) {
+        if (connectionMode === 'proxy') {
+          let errorDetail = 'Proxy failed to connect to camera.';
+          try {
+            const errData = await response.json();
+            errorDetail = errData.detail || errData.error || errorDetail;
+            if (errData.solution) {
+              errorDetail += `\n\nSolution: ${errData.solution}`;
+            }
+          } catch (_) {}
+          throw new Error(errorDetail);
+        } else {
+          throw new Error("HTTP connection failed. NVR might be offline or blocked.");
+        }
+      }
       
       const blob = await response.blob();
       const reader = new FileReader();
@@ -42,10 +120,14 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         onCapture(base64data);
       };
       reader.readAsDataURL(blob);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Network Camera Error:", err);
-      // Fallback: If fetch fails (likely CORS), we inform the user
-      alert("Browser blocked direct capture from network camera (CORS). Ensure your camera permits cross-origin requests or use the standard camera capture.");
+      const isProxy = settings.cameraConnectionMode === 'proxy';
+      if (isProxy) {
+        alert(`Cloud Camera Proxy failed:\n${err.message || 'Unknown network error'}\n\nCheck your router settings or credentials.`);
+      } else {
+        alert("Camera connection blocked. Your browser blocks direct unencrypted HTTP connections inside an HTTPS website.\n\nTo resolve this:\n1. Open your camera settings and switch 'Camera Connection Mode' to 'Cloud Proxy Mode' (highly recommended for remote/cloud access).\n2. Alternatively, configure your browser's site settings to allow 'Insecure Content' for this application (click the lock icon in Chrome/Edge/Brave's address bar).");
+      }
     } finally {
       setIsPulling(false);
     }
@@ -137,21 +219,59 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
           <button
             type="button"
             onClick={startStream}
-            className="flex items-center justify-center gap-2 w-full py-4 border-2 border-dashed border-slate-200 rounded-2xl text-slate-500 font-bold hover:bg-slate-50 hover:border-blue-300 hover:text-blue-600 transition-all"
+            className="flex items-center justify-center gap-2 w-full py-4 border-2 border-dashed border-slate-200 rounded-2xl text-slate-500 font-bold hover:bg-slate-50 hover:border-blue-300 hover:text-blue-600 transition-all cursor-pointer"
           >
             <Camera className="w-5 h-5" />
             {label} (Local)
           </button>
           
-          {networkUrl && (
+          {settings.useSwannCams && availableCams.length > 0 && (
+            <div className="p-3 bg-slate-900 text-white rounded-2xl space-y-2.5 shadow-lg border border-slate-800">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Network Camera Selection</span>
+                {availableCams.length > 1 && (
+                  <select
+                    className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[10px] font-bold text-white outline-none cursor-pointer max-w-[160px] truncate"
+                    value={selectedCamIdx}
+                    onChange={(e) => setSelectedCamIdx(parseInt(e.target.value) || 0)}
+                  >
+                    {availableCams.map((cam, idx) => (
+                      <option key={cam.id} value={idx}>
+                        {cam.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const activeCam = availableCams[selectedCamIdx];
+                  if (activeCam && activeCam.url) {
+                    pullFromNetworkUrl(activeCam.url);
+                  }
+                }}
+                disabled={isPulling || !availableCams[selectedCamIdx]?.url}
+                className="flex items-center justify-center gap-2 w-full py-3 bg-slate-950 hover:bg-black text-white rounded-xl font-bold transition-all border border-slate-800 active:scale-95 disabled:opacity-50 cursor-pointer"
+              >
+                {isPulling ? <Loader2 className="w-5 h-5 animate-spin" /> : <Video className="w-5 h-5 text-emerald-400" />}
+                <span>
+                  Pull from {availableCams[selectedCamIdx]?.name || 'Camera'}
+                </span>
+              </button>
+            </div>
+          )}
+
+          {!settings.useSwannCams && networkUrl && (
             <button
               type="button"
-              onClick={pullFromNetwork}
+              onClick={() => pullFromNetworkUrl(networkUrl)}
               disabled={isPulling}
-              className="flex items-center justify-center gap-2 w-full py-4 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all shadow-lg active:scale-95 disabled:opacity-50"
+              className="flex items-center justify-center gap-2 w-full py-4 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all shadow-lg active:scale-95 disabled:opacity-50 cursor-pointer"
             >
               {isPulling ? <Loader2 className="w-5 h-5 animate-spin" /> : <Video className="w-5 h-5 text-emerald-400" />}
-              Pull from Swann Camera (Network)
+              Pull from Camera
             </button>
           )}
         </div>

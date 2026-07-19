@@ -1,29 +1,7 @@
-import { clsx, type ClassValue } from 'clsx';
-import { twMerge } from 'tailwind-merge';
+const fs = require('fs');
+const content = fs.readFileSync('src/lib/utils.ts', 'utf8');
 
-export function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
-
-/**
- * Generates a ticket ID following a date/time scheme down to the second
- * e.g., BUY-20260605-033717
- */
-export function generateTicketId(prefix: 'BUY' | 'TRIP'): string {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day = String(now.getDate()).padStart(2, '0');
-  const hours = String(now.getHours()).padStart(2, '0');
-  const minutes = String(now.getMinutes()).padStart(2, '0');
-  const seconds = String(now.getSeconds()).padStart(2, '0');
-  
-  // Keep length under 20 characters to comply with state XML constraints (Error 105)
-  return `${prefix}-${year}${month}${day}-${hours}${minutes}${seconds}`;
-}
-
-
-export async function compressImageToBase64(dataUrl: string, maxBytes: number): Promise<string> {
+const replacement = `export async function compressImageToBase64(dataUrl: string, maxBytes: number): Promise<string> {
   const isDataUrl = dataUrl.startsWith('data:');
   const base64Data = isDataUrl ? dataUrl.split(',')[1] : dataUrl;
   
@@ -75,4 +53,10 @@ export async function compressImageToBase64(dataUrl: string, maxBytes: number): 
     };
     img.src = dataUrl;
   });
-}
+}`;
+
+const startIndex = content.indexOf('export async function compressImageToBase64');
+const newContent = content.slice(0, startIndex) + replacement;
+
+fs.writeFileSync('src/lib/utils.ts', newContent);
+console.log("Updated utils.ts");
