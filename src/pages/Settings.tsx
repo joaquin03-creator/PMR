@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { auth, db } from '../firebase';
 import { collection, getDocs, deleteDoc, doc, writeBatch, addDoc, onSnapshot, updateDoc, setDoc, query, where } from 'firebase/firestore';
-import { UserProfile, Material, Customer, UserRole, UserPermissions, UserSession, UserInvite, SystemConfig } from '../types';
+import { UserProfile, Material, Customer, UserRole, UserPermissions, UserSession, UserInvite, SystemConfig, BuyTicket } from '../types';
 import { 
   Settings as SettingsIcon, 
   Trash2, 
@@ -158,6 +158,34 @@ export default function Settings({ profile }: SettingsProps) {
   const [customCamProtocol, setCustomCamProtocol] = useState<'http' | 'https'>('http');
   const [customCamMode, setCustomCamMode] = useState<'no-cors' | 'cors' | 'proxy'>('no-cors');
   const [customDiagStatus, setCustomDiagStatus] = useState<'untested' | 'testing' | 'success' | 'error'>('untested');
+
+  // Compliance Data Repair State
+  const [scanningRepair, setScanningRepair] = useState(false);
+  const [repairingData, setRepairingData] = useState(false);
+  const [repairProgress, setRepairProgress] = useState<{ current: number; total: number } | null>(null);
+  const [scanResults, setScanResults] = useState<{
+    totalScanned: number;
+    completeCount: number;
+    repairableTickets: Array<{
+      ticketId: string;
+      ticketNumber: string;
+      customerId: string;
+      customerName: string;
+      fixIdPhoto: boolean;
+      fixCustomerPhoto: boolean;
+      idImageUrlToSet?: string;
+      customerPhotoUrlToSet?: string;
+    }>;
+    needsAttentionTickets: Array<{
+      ticketId: string;
+      ticketNumber: string;
+      customerId: string;
+      customerName: string;
+      missingFields: string[];
+    }>;
+  } | null>(null);
+  const [repairCompleted, setRepairCompleted] = useState(false);
+  const [repairSummary, setRepairSummary] = useState<{ repairedCount: number; failedCount: number } | null>(null);
   const [customDiagMsg, setCustomDiagMsg] = useState('');
   const [customDiagDetail, setCustomDiagDetail] = useState('');
 
@@ -444,6 +472,205 @@ export default function Settings({ profile }: SettingsProps) {
       handleFirestoreError(error, OperationType.UPDATE, 'system/config');
     } finally {
       setProcessing(false);
+    }
+  };
+
+  const handleScanComplianceData = async () => {
+    if (profile?.role !== 'manager') return;
+    setScanningRepair(true);
+    setRepairCompleted(false);
+    setRepairSummary(null);
+
+    try {
+      const q = query(collection(db, 'buyTickets'), where('status', '==', 'completed'));
+      const ticketsSnap = await getDocs(q);
+
+      const customersSnap = await getDocs(collection(db, 'customers'));
+      const customerMap = new Map<string, Customer>();
+      customersSnap.docs.forEach(docSnap => {
+        customerMap.set(docSnap.id, { id: docSnap.id, ...docSnap.data() } as Customer);
+      });
+
+      let completeCount = 0;
+      const repairableTickets: Array<{
+        ticketId: string;
+        ticketNumber: string;
+        customerId: string;
+        customerName: string;
+        fixIdPhoto: boolean;
+        fixCustomerPhoto: boolean;
+        idImageUrlToSet?: string;
+        customerPhotoUrlToSet?: string;
+      }> = [];
+
+      const needsAttentionTickets: Array<{
+        ticketId: string;
+        ticketNumber: string;
+        customerId: string;
+        customerName: string;
+        missingFields: string[];
+      }> = [];
+
+      ticketsSnap.docs.forEach(docSnap => {
+        const ticket = docSnap.data() as BuyTicket;
+        const ticketId = docSnap.id;
+        const ticketNumber = ticket.id ? ticket.id.substring(0, 8).toUpperCase() : ticketId.substring(0, 8).toUpperCase();
+        const custId = ticket.customerId || '';
+        const customer = custId ? customerMap.get(custId) : null;
+        const customerName = customer?.name || ticket.createdBy || 'Unknown Seller';
+
+        const hasTicketIdImg = Boolean(ticket.idImageUrl && ticket.idImageUrl.trim() !== '');
+        const hasTicketCustImg = Boolean(ticket.customerPhotoUrl && ticket.customerPhotoUrl.trim() !== '');
+
+        const hasCustIdImg = Boolean(customer?.idImageUrl && customer.idImageUrl.trim() !== '');
+        const hasCustPhotoImg = Boolean(customer?.photoUrl && customer.photoUrl.trim() !== '');
+
+        if (hasTicketIdImg && hasTicketCustImg) {
+          completeCount++;
+          return;
+        }
+
+        let fixIdPhoto = false;
+        let fixCustomerPhoto = false;
+        const missingUnfixable: string[] = [];
+
+        if (!hasTicketIdImg) {
+          if (hasCustIdImg) {
+            fixIdPhoto = true;
+          } else {
+            missingUnfixable.push('ID Photo');
+          }
+        }
+
+        if (!hasTicketCustImg) {
+          if (hasCustPhotoImg) {
+            fixCustomerPhoto = true;
+          } else {
+            missingUnfixable.push('Seller Photo');
+          }
+        }
+
+        if (fixIdPhoto || fixCustomerPhoto) {
+          repairableTickets.push({
+            ticketId,
+            ticketNumber,
+            customerId: custId,
+            customerName,
+            fixIdPhoto,
+            fixCustomerPhoto,
+            idImageUrlToSet: fixIdPhoto ? customer?.idImageUrl : undefined,
+            customerPhotoUrlToSet: fixCustomerPhoto ? customer?.photoUrl : undefined,
+          });
+        }
+
+        if (missingUnfixable.length > 0) {
+          needsAttentionTickets.push({
+            ticketId,
+            ticketNumber,
+            customerId: custId,
+            customerName,
+            missingFields: missingUnfixable,
+          });
+        }
+      });
+
+      setScanResults({
+        totalScanned: ticketsSnap.docs.length,
+        completeCount,
+        repairableTickets,
+        needsAttentionTickets,
+      });
+
+      setStatus({
+        type: 'success',
+        message: `Scan complete: ${ticketsSnap.docs.length} tickets scanned, ${repairableTickets.length} repairable, ${needsAttentionTickets.length} need attention.`,
+      });
+    } catch (err: any) {
+      console.error('Failed compliance scan:', err);
+      setStatus({
+        type: 'error',
+        message: `Scan failed: ${err.message || err}`,
+      });
+    } finally {
+      setScanningRepair(false);
+    }
+  };
+
+  const handleRepairComplianceData = async () => {
+    if (profile?.role !== 'manager' || !scanResults || scanResults.repairableTickets.length === 0) return;
+    setRepairingData(true);
+
+    const toRepair = scanResults.repairableTickets;
+    const BATCH_SIZE = 25;
+    let repairedCount = 0;
+    let failedCount = 0;
+
+    try {
+      for (let i = 0; i < toRepair.length; i += BATCH_SIZE) {
+        const chunk = toRepair.slice(i, i + BATCH_SIZE);
+        setRepairProgress({ current: Math.min(i + BATCH_SIZE, toRepair.length), total: toRepair.length });
+
+        const batch = writeBatch(db);
+        chunk.forEach(item => {
+          const ref = doc(db, 'buyTickets', item.ticketId);
+          const updates: any = {
+            backfilledAt: new Date().toISOString(),
+          };
+          const backfilledFields: string[] = [];
+
+          if (item.fixIdPhoto && item.idImageUrlToSet) {
+            updates.idImageUrl = item.idImageUrlToSet;
+            backfilledFields.push('idImageUrl');
+          }
+          if (item.fixCustomerPhoto && item.customerPhotoUrlToSet) {
+            updates.customerPhotoUrl = item.customerPhotoUrlToSet;
+            backfilledFields.push('customerPhotoUrl');
+          }
+          updates.backfilledFields = backfilledFields;
+          batch.update(ref, updates);
+        });
+
+        try {
+          await batch.commit();
+          repairedCount += chunk.length;
+        } catch (batchErr) {
+          console.error('Batch repair failed:', batchErr);
+          failedCount += chunk.length;
+        }
+      }
+
+      await logAuditEvent(
+        'settings',
+        'COMPLIANCE_DATA_REPAIR',
+        'sync',
+        {
+          before: { repairableCount: toRepair.length },
+          after: { repairedCount, failedCount },
+        },
+        `Repaired ${repairedCount} completed tickets for Ohio compliance (executed by ${profile?.displayName || profile?.email})`
+      );
+
+      setRepairCompleted(true);
+      setRepairSummary({ repairedCount, failedCount });
+
+      setScanResults(prev => prev ? {
+        ...prev,
+        repairableTickets: [],
+      } : null);
+
+      setStatus({
+        type: 'success',
+        message: `Repair completed! Repaired ${repairedCount} tickets. ${scanResults.needsAttentionTickets.length} still need attention.`,
+      });
+    } catch (err: any) {
+      console.error('Failed repair execution:', err);
+      setStatus({
+        type: 'error',
+        message: `Repair failed: ${err.message || err}`,
+      });
+    } finally {
+      setRepairingData(false);
+      setRepairProgress(null);
     }
   };
 
@@ -3258,6 +3485,148 @@ export default function Settings({ profile }: SettingsProps) {
                   </select>
                 </div>
               </div>
+            </div>
+
+            {/* Compliance Data Repair Card */}
+            <div className={cn(
+              "bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-6 lg:col-span-2 relative overflow-hidden transition-all",
+              profile?.role !== 'manager' && "opacity-75 bg-slate-50/50"
+            )}>
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-emerald-50 rounded-xl text-emerald-600">
+                    <ShieldCheck className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-black text-slate-900 uppercase tracking-tight">Compliance Data Repair</h3>
+                      {profile?.role !== 'manager' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
+                          <Lock className="w-3 h-3" />
+                          Manager only
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-500 font-medium mt-0.5">
+                      Checks older tickets for missing ID photos and seller photos, and fills them in from customer profiles where possible.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    disabled={scanningRepair || repairingData || profile?.role !== 'manager'}
+                    onClick={handleScanComplianceData}
+                    className="px-5 py-2.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-bold rounded-xl transition-all shadow-md inline-flex items-center gap-2"
+                  >
+                    {scanningRepair ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Scanning...
+                      </>
+                    ) : (
+                      <>
+                        <Scan className="w-4 h-4" />
+                        Scan Tickets
+                      </>
+                    )}
+                  </button>
+
+                  {scanResults && scanResults.repairableTickets.length > 0 && (
+                    <button
+                      disabled={repairingData || profile?.role !== 'manager'}
+                      onClick={handleRepairComplianceData}
+                      className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold rounded-xl transition-all shadow-md shadow-emerald-600/20 inline-flex items-center gap-2"
+                    >
+                      {repairingData ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          {repairProgress ? `Repairing ${repairProgress.current} of ${repairProgress.total}...` : 'Repairing...'}
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="w-4 h-4" />
+                          Repair {scanResults.repairableTickets.length} Tickets
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Scan Results Display */}
+              {scanResults && (
+                <div className="pt-4 border-t border-slate-100 space-y-4">
+                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-2">
+                    <p className="text-sm font-bold text-slate-900">
+                      Scanned <span className="font-extrabold text-blue-600">{scanResults.totalScanned}</span> tickets.
+                    </p>
+                    <ul className="text-xs text-slate-600 space-y-1 font-medium pl-2">
+                      <li className="flex items-center gap-2 text-emerald-700 font-semibold">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span><strong className="font-black">{scanResults.completeCount}</strong> are fully complete — no action needed.</span>
+                      </li>
+                      <li className="flex items-center gap-2 text-blue-700 font-semibold">
+                        <RefreshCw className="w-4 h-4 text-blue-600 shrink-0" />
+                        <span><strong className="font-black">{scanResults.repairableTickets.length}</strong> can be repaired automatically.</span>
+                      </li>
+                      <li className="flex items-center gap-2 text-amber-700 font-semibold">
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span><strong className="font-black">{scanResults.needsAttentionTickets.length}</strong> need attention (no image available on ticket or customer profile).</span>
+                      </li>
+                    </ul>
+                  </div>
+
+                  {repairCompleted && repairSummary && (
+                    <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center justify-between text-emerald-900">
+                      <div className="flex items-center gap-3">
+                        <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                        <p className="text-xs font-bold">
+                          Repaired <span className="font-black">{repairSummary.repairedCount}</span> tickets. {scanResults.needsAttentionTickets.length} still need attention.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Needs Attention List */}
+                  {scanResults.needsAttentionTickets.length > 0 && (
+                    <div className="space-y-3 pt-2">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-xs font-black uppercase tracking-wider text-slate-700 flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 text-amber-500" />
+                          Tickets Needing Manual Attention ({scanResults.needsAttentionTickets.length})
+                        </h4>
+                        <span className="text-[10px] text-slate-400 font-semibold">
+                          These tickets cannot be made compliant retroactively
+                        </span>
+                      </div>
+
+                      <div className="max-h-60 overflow-y-auto border border-slate-200 rounded-2xl divide-y divide-slate-100 bg-white shadow-inner">
+                        {scanResults.needsAttentionTickets.map((item) => (
+                          <div key={item.ticketId} className="p-3.5 flex items-center justify-between text-xs hover:bg-slate-50 transition-colors">
+                            <div>
+                              <span className="font-bold text-slate-900 mr-2">
+                                Ticket #{item.ticketNumber}
+                              </span>
+                              <span className="text-slate-600 font-medium">
+                                ({item.customerName})
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mr-1">Missing:</span>
+                              {item.missingFields.map((field) => (
+                                <span key={field} className="px-2 py-0.5 bg-rose-50 text-rose-700 border border-rose-200 font-bold text-[10px] rounded-lg">
+                                  {field}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>

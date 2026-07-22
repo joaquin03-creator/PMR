@@ -117,6 +117,8 @@ export interface BuyTicket {
   createdBy?: string;
   createdByName?: string;
   ohioDatabaseStatus?: 'not_checked' | 'cleared' | 'flagged';
+  backfilledAt?: string;
+  backfilledFields?: string[];
 }
 
 export interface TripTicketMaterial {
@@ -266,10 +268,14 @@ export interface ComplianceSubmission {
   date: string; // YYYY-MM-DD
   timestamp: string;
   submittedBy: string;
-  status: 'pending' | 'success' | 'failed';
+  status: 'pending' | 'submitted' | 'verified' | 'rejected' | 'success' | 'failed';
   ticketCount: number;
   responseMessage?: string;
-  payloadText: string; // CSV or JSON sent
+  payloadText: string; // CSV or JSON or XML sent
+  verifiedAt?: string | null;
+  verifiedBy?: string | null;
+  transactionCount?: number;
+  ticketIds?: string[];
 }
 
 export interface UserSession {
@@ -305,6 +311,8 @@ export interface SystemConfig {
   currentVersion: string;
   minSupportedVersion: string;
   lastUpdated: string;
+  dnbLastImportedAt?: string;
+  cameraSetupComplete?: boolean;
 }
 
 export interface CashSession {

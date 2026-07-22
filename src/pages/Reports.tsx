@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { useSettings } from '../context/SettingsContext';
-import { collection, onSnapshot, query, where, addDoc, getDocs, serverTimestamp, orderBy, limit } from 'firebase/firestore';
+import { collection, onSnapshot, query, where, addDoc, getDocs, serverTimestamp, orderBy, limit, doc, updateDoc } from 'firebase/firestore';
 import { BuyTicket, TripTicket, Material, Customer, Invoice, InventoryItem, DailySnapshot, AuditLog, ComplianceSubmission, CashSession, CashTransaction, PricingSnapshot } from '../types';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
@@ -42,7 +43,8 @@ import {
   ArrowRight,
   ArrowUpDown,
   ArrowUp,
-  ArrowDown
+  ArrowDown,
+  ExternalLink
 } from 'lucide-react';
 import { cn, compressImageToBase64 } from '../lib/utils';
 import { 
@@ -80,13 +82,26 @@ export default function Reports({ profile }: { profile: any }) {
   const [pricingSnapshots, setPricingSnapshots] = useState<PricingSnapshot[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [complianceSubmissions, setComplianceSubmissions] = useState<ComplianceSubmission[]>([]);
+  const [verifyingSub, setVerifyingSub] = useState<ComplianceSubmission | null>(null);
   const [cashSessions, setCashSessions] = useState<CashSession[]>([]);
   const [cashTransactions, setCashTransactions] = useState<CashTransaction[]>([]);
   const [loading, setLoading] = useState(true);
   const [creatingSnapshot, setCreatingSnapshot] = useState(false);
   const [submittingReporting, setSubmittingReporting] = useState(false);
   const [timeRange, setTimeRange] = useState<'daily' | 'weekly' | 'monthly' | 'custom'>('weekly');
+  const [searchParams] = useSearchParams();
   const [activeTab, setActiveTab] = useState<'overview' | 'materials' | 'sales' | 'compliance' | 'backups' | 'history' | 'cash_flow'>('overview');
+
+  useEffect(() => {
+    const tab = searchParams.get('tab');
+    if (tab === 'compliance' || tab === 'xml_portal') {
+      setActiveTab('compliance');
+      if (tab === 'xml_portal') {
+        setComplianceSubTab('xml_portal');
+      }
+    }
+  }, [searchParams]);
+
   const [salesSubTab, setSalesSubTab] = useState<'overview' | 'tickets' | 'categories' | 'coppers'>('overview');
   const [salesSearch, setSalesSearch] = useState('');
   const [salesSortField, setSalesSortField] = useState<string>('profit');
@@ -233,8 +248,21 @@ export default function Reports({ profile }: { profile: any }) {
       xml += `    </bulkContainerPhoptos>\n`;
       xml += `    <licensePlateNumner>${escapeXml((ticket.vehiclePlate || 'NONE').substring(0, 20))}</licensePlateNumner>\n`; // Note: Required Ohio spelling typo
       xml += `    <licensePlateIssueState>${escapeXml(getOhioStateCode(ticket.vehicleType || 'OH'))}</licensePlateIssueState>\n`;
-      xml += `    <metalArticlesNotRecyclableDesc></metalArticlesNotRecyclableDesc>\n`;
-      xml += `    <weightOfMetalArticlesNotRecyclable>0</weightOfMetalArticlesNotRecyclable>\n`;
+      // Error 124 compliance: full material description paired with valid weight.
+      // Ohio requires a full and accurate description of each material purchased,
+      // including identifying letters or marks, max 255 chars, paired with a valid weight.
+      const materialDescParts = ticket.materials.map(tm => {
+        const mat = materials.find(m => m.id === tm.materialId);
+        const name = mat?.name || 'Scrap Metal';
+        const code = mat?.code ? `[${mat.code}] ` : '';
+        return `${code}${name} ${tm.netWeight}lb`;
+      });
+      const fullMaterialDesc = materialDescParts.join('; ').substring(0, 255);
+      const totalNetWeight = Math.max(1, Math.round(ticket.materials.reduce((sum, tm) => sum + (tm.netWeight || 0), 0)));
+      const weightStr = String(Math.min(totalNetWeight, 99999)); // max 5 digits
+
+      xml += `    <metalArticlesNotRecyclableDesc>${escapeXml(fullMaterialDesc)}</metalArticlesNotRecyclableDesc>\n`;
+      xml += `    <weightOfMetalArticlesNotRecyclable>${weightStr}</weightOfMetalArticlesNotRecyclable>\n`;
       xml += `    <recycMaterilasNotSpecialPurchaseArticles>${escapeXml(nonSpecialCodes)}</recycMaterilasNotSpecialPurchaseArticles>\n`; // Note: Required Ohio spelling typo
       xml += `    <recycMaterialsSpecialPurchaseArticles>${escapeXml(specialCodes)}</recycMaterialsSpecialPurchaseArticles>\n`;
       xml += `    <recycMaterialsSpecialPurchaseArticlePhotos>\n`;
@@ -282,7 +310,7 @@ export default function Reports({ profile }: { profile: any }) {
       '121': { desc: 'Missing or too long (>5 chars) bulk container weight', critical: true },
       '122': { desc: 'License Plate too long (>20 chars)', critical: false },
       '123': { desc: 'Invalid License Plate State', critical: false },
-      '124': { desc: 'Metal articles not recyclable description >255 characters',                          critical: false },
+      '124': { desc: 'Material description/weight pairing invalid — description and valid weight must both be present (Error 124)', critical: true },
       '125': { desc: 'Invalid Non-Special Material Code(s)', critical: true },
       '126': { desc: 'Invalid Special Material Code(s)', critical: true },
       '127': { desc: 'Missing Special Material Photo(s)', critical: true },
@@ -654,14 +682,23 @@ export default function Reports({ profile }: { profile: any }) {
             });
           }
 
-          // 124 — metalArticlesNotRecyclableDesc: max 255 chars
+          // 124 — Material description + weight pairing (official Ohio definition)
           const bulkDesc = bulkContainerDesc;
           const numContainers = numberOfBulkContainers;
           const weightContainers = weightOfBulkContainers;
           const nonSpecialRaw = recycMaterilasNotSpecialPurchaseArticles;
 
           const metalDesc = txt(tx, 'metalArticlesNotRecyclableDesc');
-          if (metalDesc.length > 255) inc('124');
+          const metalWeightRaw = txt(tx, 'weightOfMetalArticlesNotRecyclable');
+          const metalWeight = parseInt(metalWeightRaw, 10);
+          const hasDesc = metalDesc.length > 0;
+          const hasWeight = metalWeightRaw.length > 0 && !isNaN(metalWeight) && metalWeight > 0;
+
+          if (metalDesc.length > 255) inc('124');                    // description too long
+          else if (hasDesc && !hasWeight) inc('124');                // description without valid weight
+          else if (hasWeight && !hasDesc) inc('124');                // weight without description
+          else if (metalWeightRaw.length > 0 && (isNaN(metalWeight) || metalWeight < 0)) inc('124'); // invalid weight value
+          else if (metalWeightRaw.length > 5) inc('124');            // weight too long
 
           // 128 — at least one article info field must be present per transaction
           const hasBulkInfo = !!(bulkDesc || numContainers || weightContainers);
@@ -805,9 +842,13 @@ export default function Reports({ profile }: { profile: any }) {
         date: new Date().toISOString().split('T')[0],
         timestamp: new Date().toISOString(),
         submittedBy: profile.displayName || profile.email,
-        status: 'success',
+        status: 'submitted',
+        verifiedAt: null,
+        verifiedBy: null,
+        transactionCount: transactions.length,
+        ticketIds,
         ticketCount: transactions.length,
-        responseMessage: `XML Upload Portal Submission Success. Confirmation Receipt ID: ${receiptId}`,
+        responseMessage: `XML Upload Portal Submission Pending Verification. Confirmation Receipt ID: ${receiptId}`,
         payloadText: JSON.stringify({
           source: 'Ohio XML Compliance Upload Portal',
           receiptId,
@@ -835,6 +876,46 @@ export default function Reports({ profile }: { profile: any }) {
       console.error(err);
       setProcessingLogs(l => [...l, `[ERROR] Processing failed: ${err.message}`]);
       setIsProcessingXml(false);
+    }
+  };
+
+  const handleConfirmVerified = async (sub: ComplianceSubmission) => {
+    try {
+      await updateDoc(doc(db, 'complianceSubmissions', sub.id), {
+        status: 'verified',
+        verifiedAt: new Date().toISOString(),
+        verifiedBy: profile.displayName || profile.email
+      });
+      setVerifyingSub(null);
+      setNotification({
+        type: 'success',
+        message: 'Submission marked as verified! Ohio portal status confirmed.'
+      });
+    } catch (err: any) {
+      setNotification({
+        type: 'error',
+        message: `Failed to update submission status: ${err.message || err}`
+      });
+    }
+  };
+
+  const handleConfirmRejected = async (sub: ComplianceSubmission) => {
+    try {
+      await updateDoc(doc(db, 'complianceSubmissions', sub.id), {
+        status: 'rejected',
+        verifiedAt: new Date().toISOString(),
+        verifiedBy: profile.displayName || profile.email
+      });
+      setVerifyingSub(null);
+      setNotification({
+        type: 'error',
+        message: 'Re-generate the XML after fixing errors and submit again. The validation report will identify the issue.'
+      });
+    } catch (err: any) {
+      setNotification({
+        type: 'error',
+        message: `Failed to update submission status: ${err.message || err}`
+      });
     }
   };
 
@@ -3781,10 +3862,20 @@ export default function Reports({ profile }: { profile: any }) {
                         <tr key={sub.id} className="hover:bg-slate-50/50 transition-colors">
                           <td className="px-6 py-4">
                             <div className="flex items-center gap-2">
-                              {sub.status === 'success' ? (
+                              {sub.status === 'verified' || sub.status === 'success' ? (
                                 <div className="flex items-center gap-1.5 text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
                                   <CheckCircle2 className="w-3 h-3" />
-                                  <span className="text-[10px] font-black uppercase tracking-widest">Transmitted</span>
+                                  <span className="text-[10px] font-black uppercase tracking-widest">Verified</span>
+                                </div>
+                              ) : sub.status === 'submitted' ? (
+                                <div className="flex items-center gap-1.5 text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">
+                                  <Clock className="w-3 h-3" />
+                                  <span className="text-[10px] font-black uppercase tracking-widest">Pending Verification</span>
+                                </div>
+                              ) : sub.status === 'rejected' ? (
+                                <div className="flex items-center gap-1.5 text-rose-600 bg-rose-50 px-2 py-0.5 rounded-full">
+                                  <XCircle className="w-3 h-3" />
+                                  <span className="text-[10px] font-black uppercase tracking-widest">Rejected</span>
                                 </div>
                               ) : (
                                 <div className="flex items-center gap-1.5 text-red-600 bg-red-50 px-2 py-0.5 rounded-full">
@@ -3822,6 +3913,49 @@ export default function Reports({ profile }: { profile: any }) {
                     </tbody>
                   </table>
                 </div>
+
+                {/* Pending Verification Card */}
+                {complianceSubmissions.filter(s => s.status === 'submitted').length > 0 && (
+                  <div className="p-6 bg-amber-50/60 border-t border-amber-200/60 space-y-4">
+                    {complianceSubmissions.filter(s => s.status === 'submitted').map(sub => {
+                      const txCount = sub.transactionCount || sub.ticketCount;
+                      return (
+                        <div key={sub.id} className="p-5 bg-white border border-amber-200 rounded-2xl shadow-sm space-y-4">
+                          <div className="flex items-start gap-3">
+                            <div className="p-2 rounded-xl bg-amber-100 text-amber-700">
+                              <AlertTriangle className="w-5 h-5" />
+                            </div>
+                            <div>
+                              <h5 className="font-bold text-amber-950 text-sm">
+                                Waiting for portal confirmation — log into the Ohio portal and confirm all {txCount} transactions appear, then confirm here.
+                              </h5>
+                              <p className="text-xs text-amber-800/80 mt-1">
+                                Submitted on {new Date(sub.timestamp).toLocaleString()} by {sub.submittedBy} ({txCount} tickets included).
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-amber-100">
+                            <a 
+                              href="https://services.dps.ohio.gov/ScrapDealer/" 
+                              target="_blank" 
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-xl transition-all"
+                            >
+                              Open Ohio Portal
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                            <button
+                              onClick={() => setVerifyingSub(sub)}
+                              className="inline-flex items-center gap-1.5 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl transition-all shadow-sm"
+                            >
+                              Confirm Verified
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </section>
 
               <section className="bg-white rounded-[2.5rem] border border-slate-200 shadow-xl shadow-slate-200/50 overflow-hidden">
@@ -4470,6 +4604,53 @@ export default function Reports({ profile }: { profile: any }) {
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {verifyingSub && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 space-y-6 shadow-2xl border border-slate-100 animate-in zoom-in-95 duration-200">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-amber-100 text-amber-700 rounded-2xl">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">Confirm Ohio Portal Verification</h3>
+                  <p className="text-xs text-slate-500">Ohio DPS Scrap Dealer Portal Check</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setVerifyingSub(null)}
+                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+              <p className="text-sm text-slate-800 font-medium leading-relaxed">
+                Did you see all <span className="font-extrabold text-slate-900">{verifyingSub.transactionCount || verifyingSub.ticketCount}</span> transactions listed in the Ohio portal with no errors?
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <button
+                onClick={() => handleConfirmVerified(verifyingSub)}
+                className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-2xl text-xs transition-all shadow-md shadow-emerald-600/20 flex items-center justify-center gap-2"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                Yes, all transactions appear
+              </button>
+              <button
+                onClick={() => handleConfirmRejected(verifyingSub)}
+                className="w-full py-3 px-4 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-bold rounded-2xl text-xs transition-all flex items-center justify-center gap-2"
+              >
+                <XCircle className="w-4 h-4" />
+                No, some are missing or show errors
+              </button>
             </div>
           </div>
         </div>

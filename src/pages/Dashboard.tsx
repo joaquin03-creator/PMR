@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, query, where, limit, setDoc, orderBy, deleteDoc, getDocs } from 'firebase/firestore';
-import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, InventoryItem, UserProfile, DailySnapshot, PricingSnapshot } from '../types';
+import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, InventoryItem, UserProfile, DailySnapshot, PricingSnapshot, SystemConfig, ComplianceSubmission } from '../types';
 import { 
   Plus, 
   Search, 
@@ -31,7 +31,8 @@ import {
   Fingerprint,
   Check,
   ExternalLink,
-  Copy
+  Copy,
+  Camera
 } from 'lucide-react';
 import { cn, generateTicketId } from '../lib/utils';
 import { Link } from 'react-router-dom';
@@ -127,8 +128,107 @@ export default function Dashboard({ profile }: DashboardProps) {
   const [doNotBuyList, setDoNotBuyList] = useState<DoNotBuyEntry[]>([]);
   const [dailySnapshots, setDailySnapshots] = useState<DailySnapshot[]>([]);
   const [pricingSnapshots, setPricingSnapshots] = useState<PricingSnapshot[]>([]);
+  const [complianceSubmissions, setComplianceSubmissions] = useState<ComplianceSubmission[]>([]);
+  const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
   const [chartMode, setChartMode] = useState<'financial' | 'volume'>('financial');
   const [loading, setLoading] = useState(true);
+
+  const [currentTime, setCurrentTime] = useState(new Date());
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 30000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const formatShortDate = (dateVal: string | Date | undefined) => {
+    if (!dateVal) return '';
+    const d = typeof dateVal === 'string' ? new Date(dateVal) : dateVal;
+    if (isNaN(d.getTime())) return '';
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return `${months[d.getMonth()]} ${d.getDate()}`;
+  };
+
+  const yesterdayInfo = useMemo(() => {
+    const now = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(now.getDate() - 1);
+    
+    const startOfYesterday = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate(), 0, 0, 0, 0);
+    const endOfYesterday = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate(), 23, 59, 59, 999);
+    
+    const yesterdayYMD = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+    
+    return {
+      start: startOfYesterday,
+      end: endOfYesterday,
+      ymd: yesterdayYMD,
+    };
+  }, [currentTime]);
+
+  const yesterdayCompletedTickets = useMemo(() => {
+    const { start, end } = yesterdayInfo;
+    return buyTickets.filter(ticket => {
+      if (ticket.status !== 'completed') return false;
+      const tDate = new Date(ticket.timestamp);
+      return tDate >= start && tDate <= end;
+    });
+  }, [buyTickets, yesterdayInfo]);
+
+  const yesterdaySubmissionState = useMemo<'verified' | 'submitted' | 'rejected' | 'none'>(() => {
+    const { ymd, end } = yesterdayInfo;
+    const yesterdaySubs = complianceSubmissions.filter(sub => {
+      const subDate = sub.date;
+      const subTime = new Date(sub.timestamp);
+      return subDate === ymd || subTime > end;
+    });
+
+    if (yesterdaySubs.length === 0) return 'none';
+
+    const hasVerified = yesterdaySubs.some(sub => sub.status === 'verified' || sub.status === 'success');
+    if (hasVerified) return 'verified';
+
+    const hasSubmitted = yesterdaySubs.some(sub => sub.status === 'submitted');
+    if (hasSubmitted) return 'submitted';
+
+    const hasRejected = yesterdaySubs.some(sub => sub.status === 'rejected' || sub.status === 'failed');
+    if (hasRejected) return 'rejected';
+
+    return 'none';
+  }, [complianceSubmissions, yesterdayInfo]);
+
+  const handleMarkDnbUpdated = async () => {
+    if (profile?.role !== 'manager') return;
+    try {
+      await updateDoc(doc(db, 'system', 'config'), {
+        dnbLastImportedAt: new Date().toISOString(),
+        lastUpdated: new Date().toISOString()
+      });
+      firestore(
+        'Police List Marked as Updated',
+        'Successfully logged physical verification and update of the police Do-Not-Buy list.'
+      );
+    } catch (err: any) {
+      toastError('Update Failed', `Could not update police list status: ${err.message || err}`);
+    }
+  };
+
+  const handleCameraSetupDone = async () => {
+    if (profile?.role !== 'manager') return;
+    try {
+      await updateDoc(doc(db, 'system', 'config'), {
+        cameraSetupComplete: true,
+        lastUpdated: new Date().toISOString()
+      });
+      firestore(
+        'Camera Calibration Confirmed',
+        'Successfully marked camera date/time stamp setup as complete and compliant.'
+      );
+    } catch (err: any) {
+      toastError('Update Failed', `Could not save camera setup status: ${err.message || err}`);
+    }
+  };
   
   // Quick Ticket State
   const [showQuickTicket, setShowQuickTicket] = useState(false);
@@ -502,6 +602,24 @@ export default function Dashboard({ profile }: DashboardProps) {
       setDrafts(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'ticketDrafts'));
 
+    const unsubCompliance = onSnapshot(
+      query(collection(db, 'complianceSubmissions'), orderBy('timestamp', 'desc'), limit(50)),
+      (snapshot) => {
+        setComplianceSubmissions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as ComplianceSubmission[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'complianceSubmissions')
+    );
+
+    const unsubSystemConfig = onSnapshot(
+      doc(db, 'system', 'config'),
+      (snap) => {
+        if (snap.exists()) {
+          setSystemConfig(snap.data() as SystemConfig);
+        }
+      },
+      (error) => handleFirestoreError(error, OperationType.GET, 'system/config')
+    );
+
     return () => {
       try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
       try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
@@ -511,6 +629,8 @@ export default function Dashboard({ profile }: DashboardProps) {
       try { unsubDailySnapshots(); } catch (e) { console.warn('unsubDailySnapshots error', e); }
       try { unsubPricingSnapshots(); } catch (e) { console.warn('unsubPricingSnapshots error', e); }
       try { unsubDrafts(); } catch (e) { console.warn('unsubDrafts error', e); }
+      try { unsubCompliance(); } catch (e) { console.warn('unsubCompliance error', e); }
+      try { unsubSystemConfig(); } catch (e) { console.warn('unsubSystemConfig error', e); }
     };
   }, [profile]);
 
@@ -1210,6 +1330,25 @@ export default function Dashboard({ profile }: DashboardProps) {
     );
   }
 
+  const noonToday = new Date();
+  noonToday.setHours(12, 0, 0, 0);
+  const isBeforeNoon = currentTime < noonToday;
+
+  let countdownString = '';
+  if (isBeforeNoon) {
+    const diffMs = noonToday.getTime() - currentTime.getTime();
+    const hours = Math.floor(diffMs / (1000 * 60 * 60));
+    const mins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+    countdownString = `${hours}:${String(mins).padStart(2, '0')}`;
+  }
+
+  const dnbLastImportDate = systemConfig?.dnbLastImportedAt ? new Date(systemConfig.dnbLastImportedAt) : null;
+  const dnbDaysElapsed = dnbLastImportDate 
+    ? Math.floor((currentTime.getTime() - dnbLastImportDate.getTime()) / (1000 * 60 * 60 * 24)) 
+    : 999;
+
+  const showCard1 = yesterdayCompletedTickets.length > 0;
+
   return (
     <main className={cn("space-y-8", settings.compactMode && "space-y-4")}>
       {/* Brand Header */}
@@ -1252,6 +1391,222 @@ export default function Dashboard({ profile }: DashboardProps) {
           </button>
         </div>
       </header>
+
+      {/* Compliance Status Strip */}
+      {(showCard1 || systemConfig?.cameraSetupComplete !== true || dnbDaysElapsed > 0 || !dnbLastImportDate) && (
+        <section id="compliance-status-strip" className="space-y-4" aria-label="Compliance Status Dashboard">
+          <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest">Compliance Status</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* Card 1 - Daily State Report */}
+            {showCard1 && (
+              <div 
+                id="compliance-card-daily-state-report"
+                className={cn(
+                  "p-5 rounded-xl border flex flex-col justify-between transition-all",
+                  yesterdaySubmissionState === 'verified'
+                    ? "bg-emerald-50/40 border-emerald-200 text-emerald-950 dark:bg-emerald-950/10 dark:border-emerald-900"
+                    : yesterdaySubmissionState === 'submitted'
+                      ? "bg-amber-50/40 border-amber-200 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900"
+                      : yesterdaySubmissionState === 'rejected'
+                        ? "bg-rose-50/40 border-rose-200 text-rose-950 dark:bg-rose-950/10 dark:border-rose-900"
+                        : isBeforeNoon
+                          ? "bg-amber-50/40 border-amber-200 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900"
+                          : "bg-rose-50/40 border-rose-200 text-rose-950 dark:bg-rose-950/10 dark:border-rose-900"
+                )}
+              >
+                <div>
+                  <div className="flex items-center gap-3">
+                    <div className={cn(
+                      "p-2 rounded-lg",
+                      yesterdaySubmissionState === 'verified'
+                        ? "bg-emerald-100/80 text-emerald-700 dark:bg-emerald-900/30"
+                        : yesterdaySubmissionState === 'submitted'
+                          ? "bg-amber-100/80 text-amber-700 dark:bg-amber-900/30"
+                          : yesterdaySubmissionState === 'rejected'
+                            ? "bg-rose-100/80 text-rose-700 dark:bg-rose-900/30"
+                            : isBeforeNoon
+                              ? "bg-amber-100/80 text-amber-700 dark:bg-amber-900/30"
+                              : "bg-rose-100/80 text-rose-700 dark:bg-rose-900/30"
+                    )}>
+                      {yesterdaySubmissionState === 'verified' ? (
+                        <ShieldCheck className="w-5 h-5" />
+                      ) : (
+                        <AlertCircle className="w-5 h-5" />
+                      )}
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-sm tracking-tight">
+                        {yesterdaySubmissionState === 'verified'
+                          ? "Yesterday's state report is done ✓"
+                          : yesterdaySubmissionState === 'submitted'
+                            ? "Report sent — needs a quick check"
+                            : yesterdaySubmissionState === 'rejected'
+                              ? "Ohio rejected the last report"
+                              : isBeforeNoon 
+                                ? "Yesterday's state report is due by noon" 
+                                : "Yesterday's state report is OVERDUE"}
+                      </h3>
+                      <p className="text-xs opacity-80 mt-1">
+                        {yesterdaySubmissionState === 'verified'
+                          ? "Submitted and verified with Ohio portal. Nothing to do."
+                          : yesterdaySubmissionState === 'submitted'
+                            ? "Log into the Ohio portal to confirm the transactions went through."
+                            : yesterdaySubmissionState === 'rejected'
+                              ? "Fix the errors and send it again."
+                              : isBeforeNoon 
+                                ? `${yesterdayCompletedTickets.length} tickets need to be sent. Time remaining: ${countdownString}` 
+                                : `${yesterdayCompletedTickets.length} tickets must be reported immediately.`}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {yesterdaySubmissionState !== 'verified' && (
+                  <div className="mt-4 pt-3 border-t border-current/10">
+                    <Link 
+                      to="/reports?tab=xml_portal"
+                      className={cn(
+                        "inline-flex items-center justify-center gap-1.5 px-4 py-2 font-bold rounded-lg text-xs transition-all text-white",
+                        yesterdaySubmissionState === 'submitted'
+                          ? "bg-amber-600 hover:bg-amber-700"
+                          : yesterdaySubmissionState === 'rejected'
+                            ? "bg-rose-600 hover:bg-rose-700"
+                            : isBeforeNoon
+                              ? "bg-amber-600 hover:bg-amber-700"
+                              : "bg-rose-600 hover:bg-rose-700"
+                      )}
+                    >
+                      {yesterdaySubmissionState === 'submitted'
+                        ? "Verify Now"
+                        : yesterdaySubmissionState === 'rejected'
+                          ? "Fix and Resend"
+                          : "Send Report Now"}
+                    </Link>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Card 2 - Do-Not-Buy List Refresh */}
+            <div 
+              id="compliance-card-dnb-list"
+              className={cn(
+                "p-5 rounded-xl border flex flex-col justify-between transition-all",
+                dnbDaysElapsed <= 80
+                  ? "bg-emerald-50/40 border-emerald-200 text-emerald-950 dark:bg-emerald-950/10 dark:border-emerald-900"
+                  : dnbDaysElapsed <= 90
+                    ? "bg-amber-50/40 border-amber-200 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900"
+                    : "bg-rose-50/40 border-rose-200 text-rose-950 dark:bg-rose-950/10 dark:border-rose-900"
+              )}
+            >
+              <div>
+                <div className="flex items-center gap-3">
+                  <div className={cn(
+                    "p-2 rounded-lg",
+                    dnbDaysElapsed <= 80
+                      ? "bg-emerald-100/80 text-emerald-700 dark:bg-emerald-900/30"
+                      : dnbDaysElapsed <= 90
+                        ? "bg-amber-100/80 text-amber-700 dark:bg-amber-900/30"
+                        : "bg-rose-100/80 text-rose-700 dark:bg-rose-900/30"
+                  )}>
+                    <Database className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-sm tracking-tight">
+                      {dnbDaysElapsed <= 80 
+                        ? "Police list is fresh" 
+                        : dnbDaysElapsed <= 90 
+                          ? "Police list update needed soon" 
+                          : "POLICE LIST UPDATE OVERDUE"}
+                    </h3>
+                    <p className="text-xs opacity-80 mt-1">
+                      {dnbDaysElapsed <= 80 
+                        ? `Last updated ${formatShortDate(dnbLastImportDate)}. Next update in ${90 - dnbDaysElapsed} days.` 
+                        : dnbDaysElapsed <= 90 
+                          ? `Last updated ${formatShortDate(dnbLastImportDate)}. ${90 - dnbDaysElapsed} days until required update.` 
+                          : `Required update was due on ${dnbLastImportDate ? formatShortDate(new Date(dnbLastImportDate.getTime() + 90 * 24 * 60 * 60 * 1000)) : 'due date'}. Please refresh now!`}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-current/10 flex flex-col gap-2">
+                <div className="flex flex-wrap gap-2">
+                  <a 
+                    href="https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList" 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 border border-current/20 hover:bg-current/5 font-bold rounded-lg text-xs transition-all"
+                  >
+                    Open State List
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                  <button
+                    onClick={handleMarkDnbUpdated}
+                    disabled={profile?.role !== 'manager'}
+                    title={profile?.role !== 'manager' ? "Manager only" : "Mark database updated"}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 bg-slate-900 dark:bg-slate-800 hover:bg-slate-850 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-lg text-xs transition-all"
+                  >
+                    Mark as Updated
+                  </button>
+                </div>
+                <div>
+                  <a 
+                    href="https://www.cincinnati-oh.gov/police/community-involvement/scrap-metal-dealers-no-buy-list/" 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className="text-[11px] font-medium underline opacity-70 hover:opacity-100 transition-all inline-flex items-center gap-1"
+                  >
+                    Cincinnati PD list
+                    <ExternalLink className="w-2.5 h-2.5" />
+                  </a>
+                </div>
+              </div>
+            </div>
+
+            {/* Card 3 - One-time Camera Setup */}
+            {systemConfig?.cameraSetupComplete !== true && (
+              <div 
+                id="compliance-card-camera-setup"
+                className="p-5 rounded-xl border border-amber-200 bg-amber-50/40 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900 flex flex-col justify-between transition-all"
+              >
+                <div>
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 rounded-lg bg-amber-100/80 text-amber-700 dark:bg-amber-900/30">
+                      <Camera className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-sm tracking-tight">
+                        One-time camera calibration needed
+                      </h3>
+                      <p className="text-xs opacity-80 mt-1">
+                        Ensure date/time overlay stamp is visible and legible on all camera views.
+                      </p>
+                    </div>
+                  </div>
+
+                  <ul className="text-xs opacity-90 space-y-1.5 mt-3 pl-3 list-disc">
+                    <li>Date & Time stamp legible</li>
+                    <li>Valid mm/dd/yyyy and standard AM/PM format</li>
+                    <li>Positioned in high-contrast box</li>
+                  </ul>
+                </div>
+
+                <div className="mt-4 pt-3 border-t border-amber-200/40">
+                  <button
+                    onClick={handleCameraSetupDone}
+                    disabled={profile?.role !== 'manager'}
+                    title={profile?.role !== 'manager' ? "Manager only" : "Mark camera calibration done"}
+                    className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-lg text-xs transition-all"
+                  >
+                    All Done
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* Pending Ticket Area */}
       {drafts.length > 0 && (

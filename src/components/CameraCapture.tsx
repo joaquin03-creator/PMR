@@ -3,6 +3,55 @@ import { Camera, RefreshCw, X, Video, Loader2 } from 'lucide-react';
 import { PHOTO_PLACEHOLDER_URL } from '../constants';
 import { useSettings } from '../context/SettingsContext';
 
+const stampImage = (base64OrDataUrl: string): Promise<string> => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { resolve(base64OrDataUrl); return; }
+      ctx.drawImage(img, 0, 0);
+
+      // Format: mm/dd/yyyy hh:mm AM/PM
+      const now = new Date();
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const dd = String(now.getDate()).padStart(2, '0');
+      const yyyy = now.getFullYear();
+      let hours = now.getHours();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12;
+      const mins = String(now.getMinutes()).padStart(2, '0');
+      const stamp = `${mm}/${dd}/${yyyy} ${hours}:${mins} ${ampm}`;
+
+      // Scale font to image size, minimum 16px
+      const fontSize = Math.max(16, Math.floor(img.width / 40));
+      ctx.font = `bold ${fontSize}px Arial`;
+
+      // Draw semi-opaque black background box in bottom-right corner
+      const textWidth = ctx.measureText(stamp).width;
+      const pad = fontSize * 0.4;
+      const boxX = img.width - textWidth - pad * 3;
+      const boxY = img.height - fontSize - pad * 3;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+      ctx.fillRect(boxX, boxY, textWidth + pad * 2, fontSize + pad * 2);
+
+      // Draw white timestamp text
+      ctx.fillStyle = '#FFFFFF';
+      ctx.textBaseline = 'top';
+      ctx.fillText(stamp, boxX + pad, boxY + pad);
+
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => {
+      resolve(base64OrDataUrl);
+    };
+    img.src = base64OrDataUrl;
+  });
+};
+
 interface CameraCaptureProps {
   onCapture: (photoUrl: string) => void;
   label?: string;
@@ -114,10 +163,11 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
       
       const blob = await response.blob();
       const reader = new FileReader();
-      reader.onloadend = () => {
+      reader.onloadend = async () => {
         const base64data = reader.result as string;
-        setCapturedPhoto(base64data);
-        onCapture(base64data);
+        const stamped = await stampImage(base64data);
+        setCapturedPhoto(stamped);
+        onCapture(stamped);
       };
       reader.readAsDataURL(blob);
     } catch (err: any) {
@@ -186,7 +236,7 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
     }
   };
 
-  const capture = () => {
+  const capture = async () => {
     if (videoRef.current && canvasRef.current) {
       const context = canvasRef.current.getContext('2d');
       if (context) {
@@ -195,8 +245,9 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         context.drawImage(videoRef.current, 0, 0);
         
         const dataUrl = canvasRef.current.toDataURL('image/jpeg', 0.6);
-        setCapturedPhoto(dataUrl);
-        onCapture(dataUrl);
+        const stamped = await stampImage(dataUrl);
+        setCapturedPhoto(stamped);
+        onCapture(stamped);
         
         stopStream();
       }
