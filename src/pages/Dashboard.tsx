@@ -945,6 +945,7 @@ export default function Dashboard({ profile }: DashboardProps) {
         vehiclePhotoUrl: qtVehiclePhotoUrl || '',
         idImageUrl: qtIdImageUrl || '',
         signatureUrl: qtSignatureUrl || '',
+        sellerAffirmed: !!(qtSignatureUrl),
         ohioDatabaseStatus: qtOhioDatabaseStatus || 'not_checked',
         createdBy: profile?.uid || '',
         createdByName: profile?.displayName || profile?.email || 'System'

@@ -696,7 +696,9 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
         notes: ticketDetails.notes || '',
         customerPhotoUrl: ticketDetails.customerPhotoUrl || '',
         vehiclePhotoUrl: ticketDetails.vehiclePhotoUrl || '',
+        idImageUrl: ticketDetails.idImageUrl || '',
         signatureUrl: ticketDetails.signatureUrl || '',
+        sellerAffirmed: !!(ticketDetails.signatureUrl),
         ohioDatabaseStatus: ticketDetails.ohioDatabaseStatus || 'not_checked',
         createdBy: profile?.uid || '',
         createdByName: profile?.displayName || profile?.email || 'System'
