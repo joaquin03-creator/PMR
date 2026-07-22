@@ -69,6 +69,7 @@ export interface Customer {
   idType?: string;
   idNumber?: string;
   idExpiration?: string;
+  idImageUpdatedAt?: string;
   verifiedStatus?: 'unverified' | 'verified' | 'restricted';
   customerType?: 'individual' | 'commercial' | 'industrial';
   // Vehicle Fields for persistent profile preloading

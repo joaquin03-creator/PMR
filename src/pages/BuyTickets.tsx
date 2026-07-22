@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams, useNavigate } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, setDoc, query, where, orderBy, limit, getDocs, deleteDoc } from 'firebase/firestore';
 import { Material, Customer, BuyTicket, BuyTicketMaterial, InventoryItem, UserProfile, DoNotBuyEntry } from '../types';
@@ -55,6 +55,11 @@ interface BuyTicketsProps {
 }
 
 export default function BuyTickets({ profile }: BuyTicketsProps) {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const editTicketId = searchParams.get("edit");
+  const isEditing = !!editTicketId;
+  const [originalTicket, setOriginalTicket] = useState<BuyTicket | null>(null);
   const { firestore, local, error: toastError, info } = useToast();
   const [step, setStep] = useState(1);
   const [materials, setMaterials] = useState<Material[]>([]);

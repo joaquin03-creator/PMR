@@ -643,12 +643,16 @@ async function startServer() {
 
         if (isEligibleForAutoRegister && (message === "EMAIL_NOT_FOUND" || message === "USER_NOT_FOUND")) {
           console.log(`Auto-creating credentials for eligible master user on backend: ${cleanedEmail}`);
-          const newUserRecord = await admin.auth().createUser({
-            email: cleanedEmail,
-            password: password,
-            displayName: cleanedEmail.split("@")[0]
-          });
-          localId = newUserRecord.uid;
+          try {
+             const signUpResponse = await axios.post(
+               `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${firebaseConfig.apiKey}`,
+               { email: cleanedEmail, password: password, returnSecureToken: true }
+             );
+             localId = signUpResponse.data.localId;
+          } catch (signUpErr: any) {
+             console.error("Auto-registration failed:", signUpErr.response?.data || signUpErr.message);
+             throw signUpErr;
+          }
         } else {
           // If password was wrong or some other error, throw it so we return 401
           throw authError;

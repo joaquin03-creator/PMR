@@ -536,26 +536,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     }
   };
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-[60vh]">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
-      </div>
-    );
-  }
-
-  if (profile?.role !== 'manager' || !profile?.permissions?.canManageInventory) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-[60vh] text-center p-8">
-        <div className="p-6 bg-red-50 rounded-full text-red-600 mb-6">
-          <Lock className="w-12 h-12" />
-        </div>
-        <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Access Restricted</h2>
-        <p className="text-slate-500 mt-2 max-w-md">You do not have the required permissions to manage inventory. Please contact your system administrator.</p>
-      </div>
-    );
-  }
-
   const categoryCasingMap = useMemo(() => {
     const map: Record<string, string> = {};
     materials.forEach(m => {
@@ -638,6 +618,27 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     const search = salesSearch.toLowerCase();
     return name.includes(search) || code.includes(search) || (s.notes || '').toLowerCase().includes(search);
   });
+
+  // Ensure early returns are only evaluated AFTER all hooks have been declared to avoid hook order violations
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
+      </div>
+    );
+  }
+
+  if (profile && !profile.permissions?.canManageInventory && profile.role !== 'manager') {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] text-center p-8">
+        <div className="p-6 bg-red-50 rounded-full text-red-600 mb-6">
+          <Lock className="w-12 h-12" />
+        </div>
+        <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Access Restricted</h2>
+        <p className="text-slate-500 mt-2 max-w-md">You do not have the required permissions to manage inventory. Please contact your system administrator.</p>
+      </div>
+    );
+  }
 
   return (
     <main className="max-w-7xl mx-auto space-y-8">

@@ -44,6 +44,63 @@ import { BuyTicketPrint } from './BuyTicketPrint';
 import { logAuditEvent } from '../lib/audit';
 import { roundNetWeight } from '../lib/weightUtils';
 
+const normalizeName = (name: string) =>
+  name.toLowerCase().replace(/[^a-z\s]/g, '').replace(/\s+/g, ' ').trim();
+
+const namesMatch = (a: string, b: string) => {
+  const na = normalizeName(a);
+  const nb = normalizeName(b);
+  if (na === nb) return true;
+  // Check reversed first/last name
+  const partsA = na.split(' ');
+  const partsB = nb.split(' ');
+  if (partsA.length >= 2 && partsB.length >= 2) {
+    const reversedA = [...partsA].reverse().join(' ');
+    if (reversedA === nb) return true;
+  }
+  return false;
+};
+
+interface IdImageThumbnailProps {
+  imageUrl: string;
+  onViewFull: (url: string) => void;
+}
+
+function IdImageThumbnail({ imageUrl, onViewFull }: IdImageThumbnailProps) {
+  const [hasError, setHasError] = useState(false);
+
+  if (hasError) {
+    return (
+      <div className="w-[120px] h-[80px] bg-rose-50 border border-rose-200 rounded-lg flex items-center justify-center p-2 text-center text-[10px] text-rose-600 font-bold">
+        ID image unavailable — re-scan required
+      </div>
+    );
+  }
+
+  return (
+    <div 
+      onClick={(e) => {
+        e.stopPropagation();
+        onViewFull(imageUrl);
+      }}
+      className="relative w-[120px] h-[80px] border border-slate-200 rounded-lg overflow-hidden cursor-pointer group shadow-sm hover:ring-2 hover:ring-blue-500 hover:ring-offset-1 transition-all bg-white"
+    >
+      <img
+        src={imageUrl}
+        alt="Customer ID Copy"
+        referrerPolicy="no-referrer"
+        onError={() => setHasError(true)}
+        className="w-full h-full object-cover transition-transform duration-350 group-hover:scale-105"
+      />
+      <div className="absolute inset-0 bg-black/0 hover:bg-black/10 transition-colors flex items-center justify-center">
+        <span className="opacity-0 group-hover:opacity-100 bg-black/60 text-white text-[9px] font-black uppercase px-1.5 py-0.5 rounded tracking-wider transition-opacity">
+          View Full
+        </span>
+      </div>
+    </div>
+  );
+}
+
 interface BuyTicketModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -68,6 +125,8 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
   const [isCustomerLookupOpen, setIsCustomerLookupOpen] = useState(false);
   const [newCustomer, setNewCustomer] = useState({ name: '', phone: '', address: '', businessName: '', idNumber: '', idType: '', idExpiration: '' });
   const [isNewCustomer, setIsNewCustomer] = useState(false);
+  const [idImageSource, setIdImageSource] = useState<'new' | 'on_file' | 'updated'>('new');
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   
   const [items, setItems] = useState<(BuyTicketMaterial & { id: string, material: Material | null, materialSearch?: string, isDropdownOpen?: boolean })[]>([
     { id: Math.random().toString(36).substr(2, 9), materialId: '', material: null, grossWeight: 0, tareWeight: 0, netWeight: 0, pricePerUnit: 0, totalAmount: 0, materialSearch: '', isDropdownOpen: false, photoUrl: '' }
@@ -202,6 +261,26 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       return () => clearTimeout(timer);
     }
   }, [selectedCustomer?.id, newCustomer.name, ticketDetails.ohioDatabaseStatus]);
+
+  // Automatically reset check status when customer changes
+  useEffect(() => {
+    setTicketDetails(prev => ({ ...prev, ohioDatabaseStatus: 'not_checked' }));
+    setOhioCheckMessage(null);
+  }, [selectedCustomer?.id, newCustomer.name]);
+
+  // Automatically load existing customer's ID photo on file
+  useEffect(() => {
+    if (selectedCustomer) {
+      if (selectedCustomer.idImageUrl) {
+        setTicketDetails(prev => ({ ...prev, idImageUrl: selectedCustomer.idImageUrl || '' }));
+        setIdImageSource('on_file');
+      } else {
+        setIdImageSource('new');
+      }
+    } else {
+      setIdImageSource('new');
+    }
+  }, [selectedCustomer?.id]);
 
   const [success, setQtSuccess] = useState(false);
   const [qtVerificationStatus, setQtVerificationStatus] = useState<'idle' | 'verifying' | 'verified' | 'failed' | 'offline-saved'>('idle');
@@ -496,18 +575,41 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       if (!selectedCustomer && (!isNewCustomer || !newCustomer.name)) return;
       // Check DNB
       const nameToCheck = selectedCustomer?.name || newCustomer.name;
-      const match = doNotBuyList.find(entry => entry.name.toLowerCase() === nameToCheck.toLowerCase());
+      const match = doNotBuyList.find(entry => namesMatch(entry.name, nameToCheck));
       if (match) {
         setIdCheckResult({ prohibited: true, reason: match.reason });
         return; // Block progression if prohibited
       }
       
-      // Compliance check: government ID photo copy captured
-      if (!ticketDetails.idImageUrl && !showIdConfirm) {
+      // ── COMPLIANCE HARD BLOCK: Ohio ORC 4737.04 ──────────────────────────
+      // ID card image is REQUIRED. No bypass permitted.
+      // A missing ID image produces error code 116 and rejects the Ohio upload.
+      if (!ticketDetails.idImageUrl) {
         setShowIdConfirm(true);
+        return; // hard stop — cannot proceed without ID image
+      }
+
+      // Seller photo is REQUIRED. No bypass permitted.
+      // A missing seller photo produces error code 117 and rejects the Ohio upload.
+      const hasSellerPhoto = !!(ticketDetails.customerPhotoUrl);
+      if (!hasSellerPhoto) {
+        setShowIdConfirm(false);
+        alert('Ohio ORC 4737.04 Compliance: A photograph of the seller is required before this ticket can be completed. Please capture a customer photo before continuing.');
+        return; // hard stop
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
+      // Ohio DPS check must be run and must not be flagged
+      if (ticketDetails.ohioDatabaseStatus === 'not_checked') {
+        alert('Ohio DPS check has not been run for this seller. The database check is required before completing a transaction. Please wait for the check to complete or run it manually.');
         return;
       }
-      
+
+      if (ticketDetails.ohioDatabaseStatus === 'flagged') {
+        // Do not allow ticket to proceed — seller is on the Do-Not-Buy list
+        return; // UI already shows flagged state — hard stop, no alert needed
+      }
+
       setShowIdConfirm(false);
       setIdCheckResult({ prohibited: false });
       setStep(2);
@@ -784,6 +886,8 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
     setIsNewCustomer(false);
     setItems([{ id: Math.random().toString(36).substr(2, 9), materialId: '', material: null, grossWeight: 0, tareWeight: 0, netWeight: 0, pricePerUnit: 0, totalAmount: 0, materialSearch: '', isDropdownOpen: false }]);
     setTicketDetails({ vehiclePlate: '', vehicleType: '', paymentMethod: 'cash', notes: '', customerPhotoUrl: '', signatureUrl: '', idImageUrl: '', vehiclePhotoUrl: '', ohioDatabaseStatus: 'not_checked' });
+    setIdImageSource('new');
+    setLightboxUrl(null);
     setQtSuccess(false);
     setQtVerificationStatus('idle');
     setLastCreatedTicket(null);
@@ -908,6 +1012,40 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
               {/* Step 1: Customer */}
               {step === 1 && (
                 <div className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-300">
+                  {/* Ohio DB Banner */}
+                  {(selectedCustomer || (isNewCustomer && newCustomer.name)) && (
+                    <div className="space-y-3">
+                      {ticketDetails.ohioDatabaseStatus === 'flagged' && (
+                        <div className="p-4 bg-red-100 border-2 border-red-500 rounded-xl text-red-800 animate-in fade-in duration-200">
+                          <p className="font-black text-xs flex items-center gap-2">
+                            <span>⛔ TRANSACTION BLOCKED — This seller is on the Ohio Do-Not-Buy list. You are prohibited from purchasing from this individual under Ohio ORC 4737.04. Do not proceed.</span>
+                          </p>
+                          {(() => {
+                            const dnbMatch = doNotBuyList.find(entry => namesMatch(entry.name, selectedCustomer?.name || newCustomer.name || ''));
+                            const dnbReason = dnbMatch?.reason || ohioCheckMessage || '';
+                            return dnbReason ? (
+                              <p className="text-[10px] font-bold text-red-700 mt-2 bg-red-50 p-2 rounded-lg border border-red-200">
+                                DNB Reason: {dnbReason}
+                              </p>
+                            ) : null;
+                          })()}
+                        </div>
+                      )}
+                      {ticketDetails.ohioDatabaseStatus === 'not_checked' && (
+                        <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl text-amber-800 font-bold text-xs flex items-center gap-2 animate-pulse">
+                          <span className="w-2 h-2 bg-amber-500 rounded-full animate-ping" />
+                          <span>Ohio DPS check in progress — please wait before continuing.</span>
+                        </div>
+                      )}
+                      {ticketDetails.ohioDatabaseStatus === 'cleared' && (
+                        <div className="p-4 bg-emerald-50 border border-emerald-300 rounded-xl text-emerald-800 font-bold text-xs flex items-center gap-2">
+                          <span className="w-2 h-2 bg-emerald-500 rounded-full" />
+                          <span>Ohio DPS check cleared — seller is not on the Do-Not-Buy list.</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="flex items-center justify-between">
                     <h4 className="font-bold text-slate-900 flex items-center gap-2">
                       <User className="w-4 h-4 text-blue-600" />
@@ -972,13 +1110,38 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                           )}
                         </h5>
                         <p className="text-[10px] text-slate-500">Ohio ORC 4737.04 photo copy compliance of identity.</p>
+                        
+                        {!ticketDetails.idImageUrl && (
+                          <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl flex items-center gap-2.5 text-xs text-rose-800 font-bold animate-in fade-in duration-200">
+                            <span className="w-2.5 h-2.5 bg-rose-500 rounded-full animate-pulse shrink-0" />
+                            <span>ID required — scan or photograph seller's state-issued ID.</span>
+                          </div>
+                        )}
+                        {idImageSource === 'updated' && ticketDetails.idImageUrl && (
+                          <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex flex-col gap-3 text-xs text-emerald-800 font-bold animate-in fade-in duration-200">
+                            <div className="flex items-center gap-2.5">
+                              <span className="w-2.5 h-2.5 bg-emerald-500 rounded-full shrink-0" />
+                              <span>New ID scanned and saved to customer profile.</span>
+                            </div>
+                            <div className="pt-1 pl-5">
+                              <IdImageThumbnail 
+                                imageUrl={ticketDetails.idImageUrl} 
+                                onViewFull={(url) => setLightboxUrl(url)} 
+                              />
+                            </div>
+                          </div>
+                        )}
+
                         <CameraCapture 
                           label="Capture ID Document Copy"
                           onCapture={(url) => {
                             setTicketDetails({ ...ticketDetails, idImageUrl: url });
                             setShowIdConfirm(false);
                             if (url) {
+                              setIdImageSource('updated');
                               handleReadIDFromPhoto(url);
+                            } else {
+                              setIdImageSource('new');
                             }
                           }}
                           networkUrl={settings.useSwannCams ? settings.swannCams.customer : undefined}
@@ -1065,13 +1228,69 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                               )}
                             </h5>
                             <p className="text-[10px] text-slate-500">Scan or snapshot of state-issued ID for official records record-keeping.</p>
+                            
+                            {!ticketDetails.idImageUrl && (
+                              <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl flex items-center gap-2.5 text-xs text-rose-800 font-bold animate-in fade-in duration-200">
+                                <span className="w-2.5 h-2.5 bg-rose-500 rounded-full animate-pulse shrink-0" />
+                                <span>ID required — scan or photograph seller's state-issued ID.</span>
+                              </div>
+                            )}
+                            {idImageSource === 'on_file' && ticketDetails.idImageUrl && (
+                              <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl flex flex-col gap-3 text-xs text-amber-800 font-bold animate-in fade-in duration-200">
+                                <div className="flex items-center gap-2.5">
+                                  <span className="w-2.5 h-2.5 bg-amber-500 rounded-full animate-pulse shrink-0" />
+                                  <span>ID on file — verify this matches today's ID. Re-scan if expired or changed.</span>
+                                </div>
+                                
+                                <div className="flex flex-col gap-1.5 pt-1 pl-5">
+                                  <span className="text-[10px] text-amber-900 font-extrabold uppercase tracking-wider">
+                                    Seller Profile: {selectedCustomer?.name}
+                                  </span>
+                                  <IdImageThumbnail 
+                                    imageUrl={ticketDetails.idImageUrl} 
+                                    onViewFull={(url) => setLightboxUrl(url)} 
+                                  />
+                                </div>
+
+                                <div className="pl-5 pt-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setTicketDetails(prev => ({ ...prev, idImageUrl: '' }));
+                                      setIdImageSource('new');
+                                    }}
+                                    className="px-2.5 py-1 text-[11px] font-bold bg-amber-100 hover:bg-amber-200 text-amber-900 rounded-lg border border-amber-300 transition-colors cursor-pointer whitespace-nowrap w-fit"
+                                  >
+                                    Re-scan ID
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                            {idImageSource === 'updated' && ticketDetails.idImageUrl && (
+                              <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex flex-col gap-3 text-xs text-emerald-800 font-bold animate-in fade-in duration-200">
+                                <div className="flex items-center gap-2.5">
+                                  <span className="w-2.5 h-2.5 bg-emerald-500 rounded-full shrink-0" />
+                                  <span>New ID scanned and saved to customer profile.</span>
+                                </div>
+                                <div className="pt-1 pl-5">
+                                  <IdImageThumbnail 
+                                    imageUrl={ticketDetails.idImageUrl} 
+                                    onViewFull={(url) => setLightboxUrl(url)} 
+                                  />
+                                </div>
+                              </div>
+                            )}
+
                             <CameraCapture 
                               label="Capture ID Document Copy"
                               onCapture={(url) => {
                                 setTicketDetails({ ...ticketDetails, idImageUrl: url });
                                 setShowIdConfirm(false);
                                 if (url) {
+                                  setIdImageSource('updated');
                                   handleReadIDFromPhoto(url);
+                                } else {
+                                  setIdImageSource('new');
                                 }
                               }}
                               networkUrl={settings.useSwannCams ? settings.swannCams.customer : undefined}
@@ -1811,7 +2030,11 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                 <button
                   onClick={handleNext}
                   disabled={
-                    (step === 1 && !selectedCustomer && (!isNewCustomer || !newCustomer.name)) ||
+                    (step === 1 && (
+                      !selectedCustomer && (!isNewCustomer || !newCustomer.name) ||
+                      ticketDetails.ohioDatabaseStatus === 'not_checked' ||
+                      ticketDetails.ohioDatabaseStatus === 'flagged'
+                    )) ||
                     (step === 2 && items.some(i => !i.material || i.netWeight <= 0)) ||
                     showIdConfirm ||
                     showVehicleConfirm
@@ -2187,6 +2410,35 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                   </div>
                 ));
               })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {lightboxUrl && (
+        <div 
+          className="fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center p-4 animate-in fade-in duration-200"
+          onClick={() => setLightboxUrl(null)}
+        >
+          <div className="relative max-w-4xl max-h-[90vh] bg-slate-900 rounded-2xl overflow-hidden shadow-2xl flex flex-col items-center">
+            <button
+              type="button"
+              className="absolute top-4 right-4 p-2 bg-black/60 hover:bg-black/80 text-white rounded-full transition-colors z-10 cursor-pointer"
+              onClick={() => setLightboxUrl(null)}
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <div className="p-4 max-h-[80vh] overflow-auto flex items-center justify-center">
+              <img
+                src={lightboxUrl}
+                alt="Full size ID"
+                referrerPolicy="no-referrer"
+                className="max-w-full max-h-[70vh] object-contain rounded-lg"
+                onClick={(e) => e.stopPropagation()}
+              />
+            </div>
+            <div className="pb-4 px-6 text-white text-xs font-bold text-center">
+              Full Size ID Document Preview (Inspect closely for compliance checks)
             </div>
           </div>
         </div>

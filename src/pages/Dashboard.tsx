@@ -54,6 +54,63 @@ import USBBarcodeScannerModal from '../components/USBBarcodeScannerModal';
 import { useToast } from '../context/ToastContext';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 
+const normalizeName = (name: string) =>
+  name.toLowerCase().replace(/[^a-z\s]/g, '').replace(/\s+/g, ' ').trim();
+
+const namesMatch = (a: string, b: string) => {
+  const na = normalizeName(a);
+  const nb = normalizeName(b);
+  if (na === nb) return true;
+  // Check reversed first/last name
+  const partsA = na.split(' ');
+  const partsB = nb.split(' ');
+  if (partsA.length >= 2 && partsB.length >= 2) {
+    const reversedA = [...partsA].reverse().join(' ');
+    if (reversedA === nb) return true;
+  }
+  return false;
+};
+
+interface IdImageThumbnailProps {
+  imageUrl: string;
+  onViewFull: (url: string) => void;
+}
+
+function IdImageThumbnail({ imageUrl, onViewFull }: IdImageThumbnailProps) {
+  const [hasError, setHasError] = useState(false);
+
+  if (hasError) {
+    return (
+      <div className="w-[120px] h-[80px] bg-rose-50 border border-rose-200 rounded-lg flex items-center justify-center p-2 text-center text-[10px] text-rose-600 font-bold">
+        ID image unavailable — re-scan required
+      </div>
+    );
+  }
+
+  return (
+    <div 
+      onClick={(e) => {
+        e.stopPropagation();
+        onViewFull(imageUrl);
+      }}
+      className="relative w-[120px] h-[80px] border border-slate-200 rounded-lg overflow-hidden cursor-pointer group shadow-sm hover:ring-2 hover:ring-blue-500 hover:ring-offset-1 transition-all bg-white"
+    >
+      <img
+        src={imageUrl}
+        alt="Customer ID Copy"
+        referrerPolicy="no-referrer"
+        onError={() => setHasError(true)}
+        className="w-full h-full object-cover transition-transform duration-350 group-hover:scale-105"
+      />
+      <div className="absolute inset-0 bg-black/0 hover:bg-black/10 transition-colors flex items-center justify-center">
+        <span className="opacity-0 group-hover:opacity-100 bg-black/60 text-white text-[9px] font-black uppercase px-1.5 py-0.5 rounded tracking-wider transition-opacity">
+          View Full
+        </span>
+      </div>
+    </div>
+  );
+}
+
 interface DashboardProps {
   profile: UserProfile | null;
 }
@@ -104,6 +161,8 @@ export default function Dashboard({ profile }: DashboardProps) {
   const [qtCustomerPhotoUrl, setQtCustomerPhotoUrl] = useState('');
   const [qtVehiclePhotoUrl, setQtVehiclePhotoUrl] = useState('');
   const [qtIdImageUrl, setQtIdImageUrl] = useState('');
+  const [qtIdImageSource, setQtIdImageSource] = useState<'new' | 'on_file' | 'updated'>('new');
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [qtVehiclePlate, setQtVehiclePlate] = useState('');
   const [qtVehicleType, setQtVehicleType] = useState('');
   const [showQtIdConfirm, setShowQtIdConfirm] = useState(false);
@@ -252,7 +311,14 @@ export default function Dashboard({ profile }: DashboardProps) {
       }
     } catch (err) {
       console.error("Error executing auto Ohio check in Dashboard:", err);
-      setOhioCheckMessage("Unable to connect to state portal or offline fallback. Please check manually.");
+      const localMatch = doNotBuyList.find(entry => namesMatch(entry.name, nameToCheck));
+      if (localMatch) {
+        setQtOhioDatabaseStatus('flagged');
+        setOhioCheckMessage(`Connection failed. Local offline fallback match found: ${localMatch.reason}`);
+      } else {
+        setQtOhioDatabaseStatus('cleared');
+        setOhioCheckMessage("Connection failed. Cleared against local offline Do-Not-Buy database.");
+      }
     } finally {
       setIsCheckingOhioPortal(false);
     }
@@ -273,6 +339,12 @@ export default function Dashboard({ profile }: DashboardProps) {
     }
   }, [qtCustomer?.id, qtNewCustomer.name, qtOhioDatabaseStatus]);
 
+  // Automatically reset check status when customer changes
+  useEffect(() => {
+    setQtOhioDatabaseStatus('not_checked');
+    setOhioCheckMessage(null);
+  }, [qtCustomer?.id, qtNewCustomer.name]);
+
   // Recall last vehicle and other profile data for Quick Ticket when customer is selected
   useEffect(() => {
     if (qtCustomer) {
@@ -281,7 +353,13 @@ export default function Dashboard({ profile }: DashboardProps) {
       if (qtCustomer.vehicleType) setQtVehicleType(qtCustomer.vehicleType);
       if (qtCustomer.vehiclePhotoUrl) setQtVehiclePhotoUrl(qtCustomer.vehiclePhotoUrl);
       if (qtCustomer.photoUrl) setQtCustomerPhotoUrl(qtCustomer.photoUrl);
-      if (qtCustomer.idImageUrl) setQtIdImageUrl(qtCustomer.idImageUrl);
+      if (qtCustomer.idImageUrl) {
+        setQtIdImageUrl(qtCustomer.idImageUrl);
+        setQtIdImageSource('on_file');
+      } else {
+        setQtIdImageUrl('');
+        setQtIdImageSource('new');
+      }
 
       // Now query historical tickets to backfill or get the most recent vehicle used
       const fetchLastVehicle = async () => {
@@ -318,7 +396,10 @@ export default function Dashboard({ profile }: DashboardProps) {
           if (vehicleType) setQtVehicleType(vehicleType);
           if (vehiclePhotoUrl) setQtVehiclePhotoUrl(vehiclePhotoUrl);
           if (customerPhotoUrl) setQtCustomerPhotoUrl(customerPhotoUrl);
-          if (idImageUrl) setQtIdImageUrl(idImageUrl);
+          if (idImageUrl) {
+            setQtIdImageUrl(idImageUrl);
+            setQtIdImageSource('on_file');
+          }
 
         } catch (error) {
           console.error("Error fetching last vehicle for Quick Ticket:", error);
@@ -332,6 +413,7 @@ export default function Dashboard({ profile }: DashboardProps) {
       setQtVehiclePhotoUrl('');
       setQtCustomerPhotoUrl('');
       setQtIdImageUrl('');
+      setQtIdImageSource('new');
     }
   }, [qtCustomer?.id]);
 
@@ -741,11 +823,34 @@ export default function Dashboard({ profile }: DashboardProps) {
   const handleQuickTicketSubmit = async () => {
     if (qtItems.some(item => !item.material || (item.gross - item.tare) <= 0) || (!qtCustomer && !qtNewCustomer.name)) return;
 
-    // Ohio compliance: Warning checks for ID copy and Vehicle plate/photo
-    if (!qtIdImageUrl && !qtIdBypassed) {
-      setShowQtIdConfirm(true);
+    // ── COMPLIANCE HARD BLOCK: Ohio ORC 4737.04 ──────────────────────────
+    // ID card image is REQUIRED. No bypass permitted.
+    // A missing ID image produces error code 116 and rejects the Ohio upload.
+    if (!qtIdImageUrl) {
+      toastError('Ohio Compliance Error 116', "Ohio ORC 4737.04 Compliance: Government ID photo copy is REQUIRED. Transaction blocked until ID photo is captured.");
+      alert("Ohio Compliance Error 116: Government ID photo copy is REQUIRED by Ohio law (ORC 4737.04). Transaction blocked until ID photo is captured.");
+      return; // hard stop — cannot proceed without ID image
+    }
+
+    // Seller photo is REQUIRED. No bypass permitted.
+    // A missing seller photo produces error code 117 and rejects the Ohio upload.
+    if (!qtCustomerPhotoUrl) {
+      toastError('Ohio Compliance Error 117', "Ohio ORC 4737.04 Compliance: Customer face photo is REQUIRED. Transaction blocked until customer photo is captured.");
+      alert("Ohio Compliance Error 117: Customer face photo is REQUIRED by Ohio law (ORC 4737.04). Transaction blocked until seller photo is captured.");
+      return; // hard stop — cannot proceed without customer photo
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Ohio DPS database check compliance block
+    if (qtOhioDatabaseStatus === 'not_checked') {
+      alert('Ohio DPS check has not been run for this seller. The database check is required before completing a transaction. Please wait for the check to complete or run it manually.');
       return;
     }
+
+    if (qtOhioDatabaseStatus === 'flagged') {
+      return; // hard stop — UI shows flagged state
+    }
+
     if ((!qtVehiclePlate || !qtVehiclePhotoUrl || !qtVehicleType) && !qtVehicleBypassed) {
       setShowQtVehicleConfirm(true);
       return;
@@ -798,6 +903,7 @@ export default function Dashboard({ profile }: DashboardProps) {
             idExpiration: qtNewCustomer.idExpiration || '',
             photoUrl: qtCustomerPhotoUrl || '',
             idImageUrl: qtIdImageUrl || '',
+            idImageUpdatedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
           });
@@ -878,7 +984,12 @@ export default function Dashboard({ profile }: DashboardProps) {
       // Update customer profile with any and all annotated data from this ticket (photos, vehicle info, and profile info)
       const customerUpdate: any = {};
       if (qtCustomerPhotoUrl) customerUpdate.photoUrl = qtCustomerPhotoUrl;
-      if (qtIdImageUrl) customerUpdate.idImageUrl = qtIdImageUrl;
+      if (qtIdImageUrl) {
+        customerUpdate.idImageUrl = qtIdImageUrl;
+        if (qtIdImageSource === 'updated') {
+          customerUpdate.idImageUpdatedAt = ticketData.timestamp;
+        }
+      }
       if (qtVehiclePlate) customerUpdate.vehiclePlate = qtVehiclePlate;
       if (qtVehicleType) customerUpdate.vehicleType = qtVehicleType;
       if (qtVehiclePhotoUrl) customerUpdate.vehiclePhotoUrl = qtVehiclePhotoUrl;
@@ -892,6 +1003,9 @@ export default function Dashboard({ profile }: DashboardProps) {
         customerUpdate.idType = qtCustomer.idType || '';
         customerUpdate.idNumber = qtCustomer.idNumber || '';
         customerUpdate.idExpiration = qtCustomer.idExpiration || '';
+        if (qtCustomer.idImageUpdatedAt && !customerUpdate.idImageUpdatedAt) {
+          customerUpdate.idImageUpdatedAt = qtCustomer.idImageUpdatedAt;
+        }
       }
 
       if (Object.keys(customerUpdate).length > 0) {
@@ -1060,6 +1174,7 @@ export default function Dashboard({ profile }: DashboardProps) {
     setQtCustomerPhotoUrl('');
     setQtVehiclePhotoUrl('');
     setQtIdImageUrl('');
+    setQtIdImageSource('new');
     setQtVehiclePlate('');
     setQtVehicleType('');
     setShowQtIdConfirm(false);
@@ -1076,9 +1191,7 @@ export default function Dashboard({ profile }: DashboardProps) {
 
   const checkDoNotBuy = () => {
     const nameToCheck = qtCustomer?.name || qtNewCustomer.name;
-    const match = doNotBuyList.find(entry => 
-      entry.name.toLowerCase() === nameToCheck.toLowerCase()
-    );
+    const match = doNotBuyList.find(entry => namesMatch(entry.name, nameToCheck));
     
     if (match) {
       setIdCheckResult({ prohibited: true, reason: match.reason });
@@ -1627,6 +1740,40 @@ export default function Dashboard({ profile }: DashboardProps) {
                 </div>
               ) : (
                 <div className="min-h-[400px] flex flex-col">
+                  {/* Ohio DB Banner */}
+                  {step >= 2 && (qtCustomer || qtNewCustomer.name) && (
+                    <div className="mb-6 space-y-3">
+                      {qtOhioDatabaseStatus === 'flagged' && (
+                        <div className="p-4 bg-red-100 border-2 border-red-500 rounded-xl text-red-800 animate-in fade-in duration-200">
+                          <p className="font-black text-xs flex items-center gap-2">
+                            <span>⛔ TRANSACTION BLOCKED — This seller is on the Ohio Do-Not-Buy list. You are prohibited from purchasing from this individual under Ohio ORC 4737.04. Do not proceed.</span>
+                          </p>
+                          {(() => {
+                            const dnbMatch = doNotBuyList.find(entry => namesMatch(entry.name, qtCustomer?.name || qtNewCustomer.name || ''));
+                            const dnbReason = dnbMatch?.reason || ohioCheckMessage || '';
+                            return dnbReason ? (
+                              <p className="text-[10px] font-bold text-red-700 mt-2 bg-red-50 p-2 rounded-lg border border-red-200">
+                                DNB Reason: {dnbReason}
+                              </p>
+                            ) : null;
+                          })()}
+                        </div>
+                      )}
+                      {qtOhioDatabaseStatus === 'not_checked' && (
+                        <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl text-amber-800 font-bold text-xs flex items-center gap-2 animate-pulse">
+                          <span className="w-2 h-2 bg-amber-500 rounded-full animate-ping" />
+                          <span>Ohio DPS check in progress — please wait before continuing.</span>
+                        </div>
+                      )}
+                      {qtOhioDatabaseStatus === 'cleared' && (
+                        <div className="p-4 bg-emerald-50 border border-emerald-300 rounded-xl text-emerald-800 font-bold text-xs flex items-center gap-2">
+                          <span className="w-2 h-2 bg-emerald-500 rounded-full" />
+                          <span>Ohio DPS check cleared — seller is not on the Do-Not-Buy list.</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {/* Step 1: Material & Weight */}
                   {step === 1 && (
                     <div className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-300">
@@ -2205,6 +2352,40 @@ export default function Dashboard({ profile }: DashboardProps) {
                                   />
                                 </div>
 
+                                {qtCustomer?.idImageUpdatedAt && (() => {
+                                  const scanDate = new Date(qtCustomer.idImageUpdatedAt);
+                                  const today = new Date();
+                                  const diffTime = Math.abs(today.getTime() - scanDate.getTime());
+                                  const daysSinceScan = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                                  const isExpiredOrStale = daysSinceScan > 365;
+
+                                  if (isExpiredOrStale) {
+                                    return (
+                                      <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl flex flex-col gap-1 text-xs text-amber-800 font-bold animate-in fade-in duration-200">
+                                        <div className="flex items-center gap-2">
+                                          <span className="w-2 h-2 bg-amber-500 rounded-full animate-pulse shrink-0" />
+                                          <span>Compliance Warning: ID scanned more than 1 year ago.</span>
+                                        </div>
+                                        <p className="text-[10px] text-amber-700 font-medium pl-4">
+                                          Last scanned: {scanDate.toLocaleDateString()} ({daysSinceScan} days ago). Please re-scan modern ID copy.
+                                        </p>
+                                      </div>
+                                    );
+                                  }
+
+                                  return (
+                                    <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-2xl flex flex-col gap-1 text-xs text-slate-700 font-semibold animate-in fade-in duration-200">
+                                      <div className="flex items-center gap-2">
+                                        <span className="w-2 h-2 bg-emerald-500 rounded-full shrink-0" />
+                                        <span>ID copy on file: Active & Compliant.</span>
+                                      </div>
+                                      <p className="text-[10px] text-slate-500 font-medium pl-4">
+                                        Last scanned: {scanDate.toLocaleDateString()} ({daysSinceScan} days ago).
+                                      </p>
+                                    </div>
+                                  );
+                                })()}
+
                                 <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-2xl text-[11px] text-emerald-800 font-medium leading-relaxed space-y-1">
                                   <p className="font-bold uppercase tracking-wider text-[9px] text-emerald-700">Database Sync Active (Quick Ticket)</p>
                                   <p>Compliance fields verified here will automatically synchronize with Google Cloud Firestore upon completing this ticket.</p>
@@ -2230,7 +2411,8 @@ export default function Dashboard({ profile }: DashboardProps) {
                       <div className="pt-8 w-full max-w-xs">
                         <button 
                           onClick={checkDoNotBuy}
-                          className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-2"
+                          disabled={qtOhioDatabaseStatus === 'not_checked' || qtOhioDatabaseStatus === 'flagged'}
+                          className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 disabled:opacity-50 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-2"
                         >
                           Verify Identity
                           <ChevronRight className="w-5 h-5" />
@@ -2437,26 +2619,6 @@ export default function Dashboard({ profile }: DashboardProps) {
                             </div>
                           )}
 
-                          {showQtIdConfirm && (
-                            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex gap-3 items-center text-amber-800 text-xs animate-in slide-in-from-top duration-200" role="alert">
-                              <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
-                              <div className="flex-1">
-                                <p className="font-extrabold text-amber-900">Missing Government ID Photo</p>
-                                <p className="font-medium text-amber-700">Ohio ORC § 4737.04 requires government ID copy photographic records. Please capture/upload their state ID document below, or click Bypass.</p>
-                              </div>
-                              <button 
-                                type="button"
-                                onClick={() => {
-                                  setQtIdBypassed(true);
-                                  setShowQtIdConfirm(false); 
-                                }}
-                                className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-bold transition-all shadow-md shadow-amber-200"
-                              >
-                                Bypass ID Rule
-                              </button>
-                            </div>
-                          )}
-
                           {showQtVehicleConfirm && (
                             <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex gap-3 items-center text-amber-800 text-xs animate-in slide-in-from-top duration-200" role="alert">
                               <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
@@ -2491,16 +2653,68 @@ export default function Dashboard({ profile }: DashboardProps) {
                                 </div>
                               </div>
 
-                              <div className="p-6 bg-slate-50 rounded-3xl border border-slate-200 shadow-sm flex flex-col">
-                                <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                              <div className="p-6 bg-slate-50 rounded-3xl border border-slate-200 shadow-sm flex flex-col gap-4">
+                                <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
                                   <span>Government ID Photo</span>
-                                  {qtIdImageUrl ? (
-                                    <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-black uppercase">Captured</span>
-                                  ) : (
-                                    <span className="text-[8px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-black uppercase">Warning Action</span>
-                                  )}
                                 </h5>
-                                <p className="text-[10px] text-slate-500 font-medium mb-3">Copy of seller's valid state driver's license (Ohio Compliance ORC 4737.04).</p>
+                                <p className="text-[10px] text-slate-500 font-medium -mt-2">Copy of seller's valid state driver's license (Ohio Compliance ORC 4737.04).</p>
+                                
+                                <div className="space-y-3">
+                                  {(!qtIdImageUrl || qtIdImageSource === 'new') && !qtIdImageUrl && (
+                                    <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl flex items-center gap-2.5 text-xs text-rose-800 font-bold animate-in fade-in duration-200">
+                                      <span className="w-2.5 h-2.5 bg-rose-500 rounded-full shrink-0" />
+                                      <span>ID required — scan or photograph seller's state-issued ID.</span>
+                                    </div>
+                                  )}
+
+                                  {qtIdImageSource === 'on_file' && qtIdImageUrl && (
+                                    <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl flex flex-col gap-3 text-xs text-amber-800 font-bold animate-in fade-in duration-200">
+                                      <div className="flex items-center gap-2.5">
+                                        <span className="w-2.5 h-2.5 bg-amber-500 rounded-full animate-pulse shrink-0" />
+                                        <span>ID on file — verify this matches today's ID. Re-scan if expired or changed.</span>
+                                      </div>
+                                      
+                                      <div className="flex flex-col gap-1.5 pt-1 pl-5">
+                                        <span className="text-[10px] text-amber-900 font-extrabold uppercase tracking-wider">
+                                          Seller Profile: {qtCustomer?.name || 'Repeat Customer'}
+                                        </span>
+                                        <IdImageThumbnail 
+                                          imageUrl={qtIdImageUrl} 
+                                          onViewFull={(url) => setLightboxUrl(url)} 
+                                        />
+                                      </div>
+
+                                      <div className="pl-5 pt-1">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setQtIdImageUrl('');
+                                            setQtIdImageSource('new');
+                                          }}
+                                          className="px-2.5 py-1 text-[11px] font-bold bg-amber-100 hover:bg-amber-200 text-amber-900 rounded-lg border border-amber-300 transition-colors cursor-pointer whitespace-nowrap w-fit"
+                                        >
+                                          Re-scan ID
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {qtIdImageSource === 'updated' && qtIdImageUrl && (
+                                    <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex flex-col gap-3 text-xs text-emerald-800 font-bold animate-in fade-in duration-200">
+                                      <div className="flex items-center gap-2.5">
+                                        <span className="w-2.5 h-2.5 bg-emerald-500 rounded-full shrink-0" />
+                                        <span>New ID scanned and saved to customer profile.</span>
+                                      </div>
+                                      <div className="pt-1 pl-5">
+                                        <IdImageThumbnail 
+                                          imageUrl={qtIdImageUrl} 
+                                          onViewFull={(url) => setLightboxUrl(url)} 
+                                        />
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+
                                 <div className="flex-1">
                                   <CameraCapture 
                                     label="Capture ID Document"
@@ -2509,6 +2723,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                                       setShowQtIdConfirm(false); 
                                       setQtIdBypassed(false);
                                       if (url) {
+                                        setQtIdImageSource('updated');
                                         handleReadIDFromPhoto(url);
                                       }
                                     }}
@@ -2692,7 +2907,14 @@ export default function Dashboard({ profile }: DashboardProps) {
                       {step === 3 ? null : step < 4 ? (
                         <button 
                           onClick={() => setStep(prev => prev + 1)}
-                          disabled={step === 1 && (qtItems.length === 0 || qtItems.some(item => !item.material || (item.gross - item.tare) <= 0))}
+                          disabled={
+                            (step === 1 && (qtItems.length === 0 || qtItems.some(item => !item.material || (item.gross - item.tare) <= 0))) ||
+                            (step === 2 && (
+                              (!qtCustomer && !qtNewCustomer.name) ||
+                              qtOhioDatabaseStatus === 'not_checked' ||
+                              qtOhioDatabaseStatus === 'flagged'
+                            ))
+                          }
                           className="px-8 py-4 bg-slate-900 text-white rounded-xl font-bold flex items-center gap-2 hover:bg-slate-800 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400 disabled:opacity-50"
                         >
                           Continue
@@ -2713,7 +2935,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                             </button>
                             <button 
                               onClick={handleQuickTicketSubmit}
-                              disabled={qtProcessing || qtItems.some(item => !item.material || (item.gross - item.tare) <= 0) || (!qtCustomer && !qtNewCustomer.name) || netWeight <= 0 || showQtIdConfirm || showQtVehicleConfirm}
+                              disabled={qtProcessing || qtItems.some(item => !item.material || (item.gross - item.tare) <= 0) || (!qtCustomer && !qtNewCustomer.name) || netWeight <= 0 || showQtIdConfirm || showQtVehicleConfirm || qtOhioDatabaseStatus === 'not_checked' || qtOhioDatabaseStatus === 'flagged'}
                               className="px-8 py-4 bg-blue-600 text-white rounded-xl font-bold flex items-center gap-2 hover:bg-blue-700 shadow-lg shadow-blue-200 disabled:opacity-50 transition-all outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
                             >
                               {qtProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <CheckCircle2 className="w-5 h-5" />}
@@ -3197,6 +3419,30 @@ export default function Dashboard({ profile }: DashboardProps) {
                   </div>
                 ));
               })()}
+            </div>
+          </div>
+        </div>
+      )}
+      {lightboxUrl && (
+        <div 
+          className="fixed inset-0 z-[9999] bg-black/80 flex items-center justify-center p-4 animate-in fade-in duration-200"
+          onClick={() => setLightboxUrl(null)}
+        >
+          <div className="relative max-w-4xl max-h-[90vh] bg-slate-900 rounded-2xl overflow-hidden shadow-2xl flex flex-col items-center">
+            <button
+              onClick={() => setLightboxUrl(null)}
+              className="absolute top-4 right-4 p-2 bg-black/40 hover:bg-black/60 text-white rounded-full transition-colors cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <div className="p-4 max-h-[80vh] overflow-auto flex items-center justify-center bg-slate-950">
+              <img
+                src={lightboxUrl}
+                alt="Full size ID"
+                referrerPolicy="no-referrer"
+                className="max-w-full max-h-[70vh] object-contain rounded-lg"
+                onClick={(e) => e.stopPropagation()}
+              />
             </div>
           </div>
         </div>

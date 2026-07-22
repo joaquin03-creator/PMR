@@ -1,12 +1,21 @@
-import { useState, useEffect, useMemo } from 'react';
-import { useSearchParams } from 'react-router-dom';
-import { auth, db } from '../firebase';
-import { useSettings } from '../context/SettingsContext';
-import { collection, onSnapshot, query, orderBy, doc, deleteDoc, updateDoc, increment, writeBatch } from 'firebase/firestore';
-import { BuyTicket, Customer, Material, UserProfile } from '../types';
-import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE, handleImageError } from '../constants';
-import { BrandLogo } from '../components/BrandLogo';
-import { 
+import {
+useState, useEffect, useMemo } from 'react';
+import {
+useSearchParams } from 'react-router-dom';
+import {
+auth, db } from '../firebase';
+import {
+useSettings } from '../context/SettingsContext';
+import {
+collection, onSnapshot, query, orderBy, doc, deleteDoc, updateDoc, increment, writeBatch } from 'firebase/firestore';
+import {
+BuyTicket, Customer, Material, UserProfile } from '../types';
+import {
+COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE, handleImageError } from '../constants';
+import {
+BrandLogo } from '../components/BrandLogo';
+import {
+
   Search, 
   Printer, 
   X, 
@@ -24,14 +33,20 @@ import {
   Trash2,
   Ban,
   AlertTriangle,
-  AlertCircle
+  AlertCircle,
+  Edit2,
 } from 'lucide-react';
-import { cn } from '../lib/utils';
-import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
+import {
+cn } from '../lib/utils';
+import {
+handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import ManagerPinModal from '../components/ManagerPinModal';
-import { printTicket } from '../lib/printTicket';
-import { BuyTicketPrint } from '../components/BuyTicketPrint';
-import { logAuditEvent } from '../lib/audit';
+import {
+printTicket } from '../lib/printTicket';
+import {
+BuyTicketPrint } from '../components/BuyTicketPrint';
+import {
+logAuditEvent } from '../lib/audit';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
@@ -790,7 +805,21 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
               
               {profile?.role === 'manager' && (
                 <div className="flex gap-2">
+                  
+                  {profile.permissions?.canRetroactivePriceAdjustments && (
+                    <button 
+                      onClick={() => {
+                        window.location.href = `/buy-tickets?edit=${selectedTicket.id}`;
+                      }}
+                      disabled={processing || selectedTicket?.status === 'voided' || selectedTicket?.status === 'cancelled'}
+                      className="flex items-center gap-2 px-6 py-4 bg-blue-50 text-blue-600 border border-blue-200 rounded-2xl font-bold hover:bg-blue-100 transition-all active:scale-95 disabled:opacity-50"
+                    >
+                      <Edit2 className="w-5 h-5" />
+                      Edit
+                    </button>
+                  )}
                   {profile.permissions?.canVoidTickets && (
+
                     <button 
                       onClick={() => {
                         setPendingAction({ type: 'void', ticket: selectedTicket });

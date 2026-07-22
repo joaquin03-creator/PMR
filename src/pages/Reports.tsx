@@ -64,7 +64,7 @@ import {
 
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { OHIO_XML_ERROR_CODES } from '../data/ohioErrorCodes';
-import { getOhioStateCode, mapMaterialToOhioCode, mapSpecialMaterialToOhioCode } from '../lib/ohioMapping';
+import { getOhioStateCode, mapMaterialToOhioCode, mapSpecialMaterialToOhioCode, VALID_OHIO_MATERIAL_CODES, VALID_OHIO_SPECIAL_CODES } from '../lib/ohioMapping';
 
 export default function Reports({ profile }: { profile: any }) {
   const { settings } = useSettings();
@@ -186,10 +186,13 @@ export default function Reports({ profile }: { profile: any }) {
       const materialNamesList = ticket.materials.map(tm => materials.find(m => m.id === tm.materialId)?.name || 'Scrap Metal');
       const mNames = materialNamesList.join(', ');
       
-      const nonSpecialCodesArray = Array.from(new Set(materialNamesList.map(n => mapMaterialToOhioCode(n))));
+      const materialsList = ticket.materials.map(tm => ({
+        code: materials.find(m => m.id === tm.materialId)?.code || '',
+        name: materials.find(m => m.id === tm.materialId)?.name || 'Scrap Metal',
+      }));
+      const nonSpecialCodesArray = Array.from(new Set(materialsList.map(m => mapMaterialToOhioCode(m.code, m.name))));
       const nonSpecialCodes = nonSpecialCodesArray.join(',');
-      
-      const specialCodesArray = Array.from(new Set(materialNamesList.map(n => mapSpecialMaterialToOhioCode(n)).filter(Boolean)));
+      const specialCodesArray = Array.from(new Set(materialsList.map(m => mapSpecialMaterialToOhioCode(m.code, m.name)).filter(Boolean)));
       const specialCodes = specialCodesArray.join(',');
 
       // Compress images
@@ -249,17 +252,49 @@ export default function Reports({ profile }: { profile: any }) {
     return xml;
   };
 
-  // Run full validation on XML
+  // ── OHIO DPS XML VALIDATION ENGINE ──────────────────────────────────────────
+  // Validates every transaction against Ohio error codes 104–129.
+  // Zero errors required before upload. Run before every submission.
   const validateXmlContent = (xmlContent: string) => {
     setXmlValidationStatus('validating');
     const results: XmlValidationResult[] = [];
-    
+
+    const txt = (node: Element, tag: string) => node.getElementsByTagName(tag)[0]?.textContent || '';
+
+    const ohioErrors: Record<string, { desc: string; critical: boolean }> = {
+      '104': { desc: 'Missing or invalid Facility Registration Number', critical: true },
+      '105': { desc: 'Missing or too long (>20 chars) Transaction Number', critical: true },
+      '106': { desc: 'Missing or too long (>33 chars) Seller First Name', critical: true },
+      '107': { desc: 'Seller Middle Name too long (>31 chars)', critical: false },
+      '108': { desc: 'Missing or too long (>33 chars) Seller Last Name', critical: true },
+      '109': { desc: 'Seller Suffix too long (>5 chars)', critical: false },
+      '110': { desc: 'Missing or too long (>40 chars) Seller Address Line 1', critical: true },
+      '111': { desc: 'Seller Address Line 2 too long (>40 chars)', critical: false },
+      '112': { desc: 'Missing or too long (>40 chars) Seller City', critical: true },
+      '113': { desc: 'Missing or invalid Seller State', critical: true },
+      '114': { desc: 'Missing or too long (>9 chars) Seller ZIP Code', critical: true },
+      '115': { desc: 'Missing or invalid Transaction Timestamp', critical: true },
+      '116': { desc: 'Missing or invalid ID Card Image', critical: true },
+      '117': { desc: 'Missing or invalid Seller Photograph', critical: true },
+      '118': { desc: 'Container description too long (>255 chars)', critical: false },
+      '119': { desc: 'Number of containers exceeds 5 digits', critical: true },
+      '120': { desc: 'Missing Container Photographs', critical: true },
+      '121': { desc: 'Missing or too long (>5 chars) bulk container weight', critical: true },
+      '122': { desc: 'License Plate too long (>20 chars)', critical: false },
+      '123': { desc: 'Invalid License Plate State', critical: false },
+      '124': { desc: 'Metal articles not recyclable description >255 characters',                          critical: false },
+      '125': { desc: 'Invalid Non-Special Material Code(s)', critical: true },
+      '126': { desc: 'Invalid Special Material Code(s)', critical: true },
+      '127': { desc: 'Missing Special Material Photo(s)', critical: true },
+      '128': { desc: 'No article info present — at least one of bulk, metal, or recyclable info required', critical: true  },
+      '129': { desc: 'Duplicate Transaction Number', critical: true }
+    };
+
+    let errorCount = 0;
+    let warningCount = 0;
+
     if (!xmlContent || !xmlContent.trim()) {
-      results.push({
-        status: 'error',
-        title: 'Empty File content',
-        description: 'The uploaded file is empty or could not be read.'
-      });
+      results.push({ status: 'error', title: 'Empty File', description: 'The file is empty or could not be read.' });
       setXmlValidationResults(results);
       setXmlValidationStatus('failed');
       return;
@@ -267,14 +302,14 @@ export default function Reports({ profile }: { profile: any }) {
 
     try {
       const parser = new DOMParser();
-      const xmlDoc = parser.parseFromString(xmlContent, "text/xml");
-      
-      const parserError = xmlDoc.getElementsByTagName("parsererror");
-      if (parserError.length > 0) {
+      const xmlDoc = parser.parseFromString(xmlContent, 'text/xml');
+
+      const parseErr = xmlDoc.getElementsByTagName("parsererror");
+      if (parseErr.length > 0) {
         results.push({
           status: 'error',
           title: 'XML Syntax Error',
-          description: `The file is not formatted as valid XML: ${parserError[0].textContent}`
+          description: `The file is not formatted as valid XML: ${parseErr[0].textContent}`
         });
         setXmlValidationResults(results);
         setXmlValidationStatus('failed');
@@ -286,13 +321,13 @@ export default function Reports({ profile }: { profile: any }) {
         results.push({
           status: 'error',
           title: 'Invalid Root Element',
-          description: `Expected root tag <ScrapDealerTransactions> but found <${root.nodeName}>.`,
+          description: 'Expected root tag <ScrapDealerTransactions> but found <' + root.nodeName + '>.',
           tag: 'ScrapDealerTransactions'
         });
       } else {
         results.push({
           status: 'success',
-          title: 'Root Tag structure valid',
+          title: 'Root Tag Structure Valid',
           description: 'Verified root element <ScrapDealerTransactions> matches schema.'
         });
       }
@@ -311,168 +346,401 @@ export default function Reports({ profile }: { profile: any }) {
           description: `Found ${transactions.length} transaction record(s) inside file.`
         });
 
-        const firstTx = transactions[0];
-        
-        // Typo Check 1: bulkContainerPhoptos
-        const correctBulkPhotos = firstTx.getElementsByTagName("bulkContainerPhoptos");
-        const regularBulkPhotos = firstTx.getElementsByTagName("bulkContainerPhotos");
-        if (correctBulkPhotos.length > 0) {
-          results.push({
-            status: 'success',
-            title: 'Validated Schema Typo (Container Photos)',
-            description: 'Verified correct spelling of required tag: <bulkContainerPhoptos>.',
-            tag: 'bulkContainerPhoptos'
-          });
-        } else if (regularBulkPhotos.length > 0) {
-          results.push({
-            status: 'error',
-            title: 'Incorrect Schema Spelling (Container Photos)',
-            description: 'Warning: Found <bulkContainerPhotos>. The Ohio DPS portal expects the misspelling <bulkContainerPhoptos> (with a "p").',
-            tag: 'bulkContainerPhoptos'
-          });
-        } else {
-          results.push({
-            status: 'warning',
-            title: 'Missing Container Photos Block',
-            description: 'The <bulkContainerPhoptos> container block was not found.',
-            tag: 'bulkContainerPhoptos'
-          });
-        }
-
-        // Typo Check 2: licensePlateNumner
-        const correctPlateNum = firstTx.getElementsByTagName("licensePlateNumner");
-        const regularPlateNum = firstTx.getElementsByTagName("licensePlateNumber");
-        if (correctPlateNum.length > 0) {
-          results.push({
-            status: 'success',
-            title: 'Validated Schema Typo (License Plate)',
-            description: 'Verified correct spelling of required tag: <licensePlateNumner>.',
-            tag: 'licensePlateNumner'
-          });
-        } else if (regularPlateNum.length > 0) {
-          results.push({
-            status: 'error',
-            title: 'Incorrect Schema Spelling (License Plate)',
-            description: 'Error: Found <licensePlateNumber>. The Ohio DPS portal expects the exact tag name <licensePlateNumner> (ending in "ner").',
-            tag: 'licensePlateNumner'
-          });
-        } else {
-          results.push({
-            status: 'warning',
-            title: 'Missing License Plate Tag',
-            description: 'The <licensePlateNumner> tag was not found.',
-            tag: 'licensePlateNumner'
-          });
-        }
-
-        // Typo Check 3: recycMaterilasNotSpecialPurchaseArticles
-        const correctRecycMat = firstTx.getElementsByTagName("recycMaterilasNotSpecialPurchaseArticles");
-        const regularRecycMat = firstTx.getElementsByTagName("recycMaterialsNotSpecialPurchaseArticles");
-        if (correctRecycMat.length > 0) {
-          results.push({
-            status: 'success',
-            title: 'Validated Schema Typo (Recycled Materials)',
-            description: 'Verified correct spelling of required tag: <recycMaterilasNotSpecialPurchaseArticles>.',
-            tag: 'recycMaterilasNotSpecialPurchaseArticles'
-          });
-        } else if (regularRecycMat.length > 0) {
-          results.push({
-            status: 'error',
-            title: 'Incorrect Schema Spelling (Recycled Materials)',
-            description: 'Error: Found <recycMaterials...>. The Ohio DPS portal expects the exact tag name <recycMaterilasNotSpecialPurchaseArticles> (with "Materilas").',
-            tag: 'recycMaterilasNotSpecialPurchaseArticles'
-          });
-        } else {
-          results.push({
-            status: 'warning',
-            title: 'Missing Recycled Materials Tag',
-            description: 'The <recycMaterilasNotSpecialPurchaseArticles> tag was not found.',
-            tag: 'recycMaterilasNotSpecialPurchaseArticles'
-          });
-        }
-
-        // Generic checks
-        let emptyRegNumberCount = 0;
-        let missingNamesCount = 0;
-        let invalidDateTimeCount = 0;
-        let missingIdCount = 0;
+        // Tracking transaction IDs to detect duplicates (Error 129)
+        const txnNumbers = new Set<string>();
+        const seenTxns = new Set<string>();
 
         for (let i = 0; i < transactions.length; i++) {
           const tx = transactions[i];
-          const regNum = tx.getElementsByTagName("facilityRegNumber")[0]?.textContent || '';
-          if (!regNum || regNum.trim() === '') emptyRegNumberCount++;
+          const txLabel = `Transaction #${i + 1}`;
 
-          const firstName = tx.getElementsByTagName("firstName")[0]?.textContent || '';
-          const lastName = tx.getElementsByTagName("lastName")[0]?.textContent || '';
-          if (!firstName.trim() || !lastName.trim()) missingNamesCount++;
+          // Helper to get element text safely
+          const getVal = (tagName: string) => tx.getElementsByTagName(tagName)[0]?.textContent || '';
 
-          const dateTime = tx.getElementsByTagName("txnDateTime")[0]?.textContent || '';
-          if (!dateTime || isNaN(Date.parse(dateTime))) invalidDateTimeCount++;
+          const regNum = getVal('facilityRegNumber');
+          const txnNumber = getVal('txnNumber');
+          const firstName = getVal('firstName');
+          const middleName = getVal('middleName');
+          const lastName = getVal('lastName');
+          const suffix = getVal('suffix');
+          const add1 = getVal('add1');
+          const add2 = getVal('add2');
+          const city = getVal('city');
+          const state = getVal('state');
+          const zip = getVal('zip');
+          const txnDateTime = getVal('txnDateTime');
+          const bulkContainerDesc = getVal('bulkContainerDesc');
+          const numberOfBulkContainers = getVal('numberOfBulkContainers');
+          const weightOfBulkContainers = getVal('weightOfBulkContainers');
+          const licensePlateNumner = getVal('licensePlateNumner');
+          const licensePlateIssueState = getVal('licensePlateIssueState');
+          const recycMaterilasNotSpecialPurchaseArticles = getVal('recycMaterilasNotSpecialPurchaseArticles');
+          const recycMaterialsSpecialPurchaseArticles = getVal('recycMaterialsSpecialPurchaseArticles');
 
-          const idImg = tx.getElementsByTagName("idCardImage")[0]?.textContent || '';
-          if (!idImg || idImg.trim().length < 50) missingIdCount++;
+          const inc = (code: string) => {
+            const err = ohioErrors[code];
+            const isCritical = err ? err.critical : true;
+            results.push({
+              status: isCritical ? 'error' : 'warning',
+              title: `[Error ${code}] ${err ? err.desc : 'Validation Issue'}`,
+              description: `${txLabel} (${txnNumber || 'No Txn Num'}): ${err ? err.desc : `Issue detected with code ${code}.`}`,
+              tag: code
+            });
+          };
+
+          // Check 104: facilityRegNumber is missing or invalid
+          if (!regNum || regNum.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 104] Missing Facility Registration`,
+              description: `${txLabel} has a missing facility registration number.`,
+              tag: 'facilityRegNumber'
+            });
+          }
+
+          // Check 105: txnNumber is missing or > 20 characters
+          if (!txnNumber || txnNumber.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 105] Missing Transaction Number`,
+              description: `${txLabel} is missing a transaction number.`,
+              tag: 'txnNumber'
+            });
+          } else if (txnNumber.length > 20) {
+            results.push({
+              status: 'error',
+              title: `[Error 105] Transaction Number Too Long`,
+              description: `${txLabel} has transaction number '${txnNumber}' which exceeds 20 characters.`,
+              tag: 'txnNumber'
+            });
+          }
+
+          // Check 129: Duplicate transaction number
+          if (txnNumber) {
+            if (txnNumbers.has(txnNumber)) {
+              seenTxns.add(txnNumber);
+            } else {
+              txnNumbers.add(txnNumber);
+            }
+          }
+
+          // Check 106: firstName missing or > 33
+          if (!firstName || firstName.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 106] Missing Seller First Name`,
+              description: `${txLabel} (${txnNumber}) is missing the seller's first name.`,
+              tag: 'firstName'
+            });
+          } else if (firstName.length > 33) {
+            results.push({
+              status: 'error',
+              title: `[Error 106] First Name Too Long`,
+              description: `${txLabel} (${txnNumber}) first name '${firstName}' exceeds 33 characters.`,
+              tag: 'firstName'
+            });
+          }
+
+          // Check 107: middleName > 31
+          if (middleName && middleName.length > 31) {
+            results.push({
+              status: 'error',
+              title: `[Error 107] Middle Name Too Long`,
+              description: `${txLabel} (${txnNumber}) middle name exceeds 31 characters.`,
+              tag: 'middleName'
+            });
+          }
+
+          // Check 108: lastName missing or > 33
+          if (!lastName || lastName.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 108] Missing Seller Last Name`,
+              description: `${txLabel} (${txnNumber}) is missing the seller's last name.`,
+              tag: 'lastName'
+            });
+          } else if (lastName.length > 33) {
+            results.push({
+              status: 'error',
+              title: `[Error 108] Last Name Too Long`,
+              description: `${txLabel} (${txnNumber}) last name '${lastName}' exceeds 33 characters.`,
+              tag: 'lastName'
+            });
+          }
+
+          // Check 109: suffix > 5
+          if (suffix && suffix.length > 5) {
+            results.push({
+              status: 'error',
+              title: `[Error 109] Suffix Too Long`,
+              description: `${txLabel} (${txnNumber}) suffix '${suffix}' exceeds 5 characters.`,
+              tag: 'suffix'
+            });
+          }
+
+          // Check 110: address1 missing or > 40
+          if (!add1 || add1.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 110] Missing Seller Address Line 1`,
+              description: `${txLabel} (${txnNumber}) is missing the seller's street address.`,
+              tag: 'add1'
+            });
+          } else if (add1.length > 40) {
+            results.push({
+              status: 'error',
+              title: `[Error 110] Address Line 1 Too Long`,
+              description: `${txLabel} (${txnNumber}) address '${add1}' exceeds 40 characters.`,
+              tag: 'add1'
+            });
+          }
+
+          // Check 111: address2 > 40
+          if (add2 && add2.length > 40) {
+            results.push({
+              status: 'error',
+              title: `[Error 111] Address Line 2 Too Long`,
+              description: `${txLabel} (${txnNumber}) address line 2 exceeds 40 characters.`,
+              tag: 'add2'
+            });
+          }
+
+          // Check 112: city missing or > 40
+          if (!city || city.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 112] Missing Seller City`,
+              description: `${txLabel} (${txnNumber}) is missing the seller's city.`,
+              tag: 'city'
+            });
+          } else if (city.length > 40) {
+            results.push({
+              status: 'error',
+              title: `[Error 112] City Too Long`,
+              description: `${txLabel} (${txnNumber}) city '${city}' exceeds 40 characters.`,
+              tag: 'city'
+            });
+          }
+
+          // Check 113: state missing or invalid
+          if (!state || state.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 113] Missing Seller State`,
+              description: `${txLabel} (${txnNumber}) is missing the seller's state.`,
+              tag: 'state'
+            });
+          } else if (state.length !== 2) {
+            results.push({
+              status: 'error',
+              title: `[Error 113] Invalid Seller State`,
+              description: `${txLabel} (${txnNumber}) has an invalid state code '${state}'.`,
+              tag: 'state'
+            });
+          }
+
+          // Check 114: zip missing or > 9
+          if (!zip || zip.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 114] Missing Seller ZIP Code`,
+              description: `${txLabel} (${txnNumber}) is missing the seller's ZIP code.`,
+              tag: 'zip'
+            });
+          } else if (zip.length > 9) {
+            results.push({
+              status: 'error',
+              title: `[Error 114] ZIP Code Too Long`,
+              description: `${txLabel} (${txnNumber}) ZIP code '${zip}' exceeds 9 characters.`,
+              tag: 'zip'
+            });
+          }
+
+          // Check 115: purchase date and time missing or invalid
+          if (!txnDateTime || txnDateTime.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 115] Missing Transaction Timestamp`,
+              description: `${txLabel} (${txnNumber}) is missing the transaction timestamp.`,
+              tag: 'txnDateTime'
+            });
+          } else if (isNaN(Date.parse(txnDateTime))) {
+            results.push({
+              status: 'error',
+              title: `[Error 115] Invalid Transaction Timestamp`,
+              description: `${txLabel} (${txnNumber}) has an invalid ISO timestamp '${txnDateTime}'.`,
+              tag: 'txnDateTime'
+            });
+          }
+
+          // Check 116 & 117
+          const PLACEHOLDER_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+          const idCardImage = txt(tx, 'idCardImage');
+          if (!idCardImage || idCardImage.length < 100 || idCardImage === PLACEHOLDER_B64) inc('116');
+          else if (idCardImage.length > 1333333) inc('116');
+
+          const sellerPhoto = txt(tx, 'photoOfSeller');
+          if (!sellerPhoto || sellerPhoto.length < 100 || sellerPhoto === PLACEHOLDER_B64) inc('117');
+          else if (sellerPhoto.length > 1333333) inc('117');
+
+          // Check 118: Description of container(s) missing or too long (> 255)
+          if (bulkContainerDesc && bulkContainerDesc.length > 255) {
+            results.push({
+              status: 'error',
+              title: `[Error 118] Container Description Too Long`,
+              description: `${txLabel} (${txnNumber}) container description exceeds 255 characters.`,
+              tag: 'bulkContainerDesc'
+            });
+          }
+
+          // Check 119: Number of containers purchased is too long (> 5)
+          if (numberOfBulkContainers && numberOfBulkContainers.length > 5) {
+            results.push({
+              status: 'error',
+              title: `[Error 119] Container Count Too Long`,
+              description: `${txLabel} (${txnNumber}) number of containers exceeds 5 digits.`,
+              tag: 'numberOfBulkContainers'
+            });
+          }
+
+          // Check 120: Photograph of containers missing
+          const containerPhotosBlock = tx.getElementsByTagName("bulkContainerPhoptos")[0];
+          const containerPhotosCount = containerPhotosBlock ? containerPhotosBlock.getElementsByTagName("base64Binary").length : 0;
+          const containerCountInt = parseInt(numberOfBulkContainers) || 0;
+          if (containerCountInt > 0 && containerPhotosCount < 1) {
+            results.push({
+              status: 'error',
+              title: `[Error 120] Missing Container Photographs`,
+              description: `${txLabel} (${txnNumber}) requires at least one photograph inside <bulkContainerPhoptos>.`,
+              tag: 'bulkContainerPhoptos'
+            });
+          }
+
+          // Check 121: Weight of containers with articles is missing or too long (> 5)
+          if (!weightOfBulkContainers || weightOfBulkContainers.trim() === '') {
+            results.push({
+              status: 'error',
+              title: `[Error 121] Missing Bulk Weight`,
+              description: `${txLabel} (${txnNumber}) is missing the container weight.`,
+              tag: 'weightOfBulkContainers'
+            });
+          } else if (weightOfBulkContainers.length > 5) {
+            results.push({
+              status: 'error',
+              title: `[Error 121] Bulk Weight Too Long`,
+              description: `${txLabel} (${txnNumber}) container weight '${weightOfBulkContainers}' exceeds 5 characters.`,
+              tag: 'weightOfBulkContainers'
+            });
+          }
+
+          // Check 122: License plate is too long (> 20)
+          if (licensePlateNumner && licensePlateNumner.length > 20) {
+            results.push({
+              status: 'error',
+              title: `[Error 122] License Plate Too Long`,
+              description: `${txLabel} (${txnNumber}) license plate exceeds 20 characters.`,
+              tag: 'licensePlateNumner'
+            });
+          }
+
+          // Check 123: License plate state is too long (> 2) or invalid
+          if (licensePlateIssueState && licensePlateIssueState.length > 2) {
+            results.push({
+              status: 'error',
+              title: `[Error 123] Invalid License Plate State`,
+              description: `${txLabel} (${txnNumber}) has an invalid vehicle license plate state '${licensePlateIssueState}'.`,
+              tag: 'licensePlateIssueState'
+            });
+          }
+
+          // 124 — metalArticlesNotRecyclableDesc: max 255 chars
+          const bulkDesc = bulkContainerDesc;
+          const numContainers = numberOfBulkContainers;
+          const weightContainers = weightOfBulkContainers;
+          const nonSpecialRaw = recycMaterilasNotSpecialPurchaseArticles;
+
+          const metalDesc = txt(tx, 'metalArticlesNotRecyclableDesc');
+          if (metalDesc.length > 255) inc('124');
+
+          // 128 — at least one article info field must be present per transaction
+          const hasBulkInfo = !!(bulkDesc || numContainers || weightContainers);
+          const hasMetalInfo = !!(metalDesc || txt(tx, 'weightOfMetalArticlesNotRecyclable'));
+          const hasRecycInfo = !!(nonSpecialRaw || txt(tx, 'recycMaterialsSpecialPurchaseArticles'));
+          if (!hasBulkInfo && !hasMetalInfo && !hasRecycInfo) inc('128');
+
+          // Check 125: Recyclable materials not special purchase - invalid codes
+          if (recycMaterilasNotSpecialPurchaseArticles) {
+            const codes = recycMaterilasNotSpecialPurchaseArticles.split(',').map(c => c.trim()).filter(Boolean);
+            const invalidCodes = codes.filter(c => !VALID_OHIO_MATERIAL_CODES.has(c));
+            if (invalidCodes.length > 0) {
+              results.push({
+                status: 'error',
+                title: `[Error 125] Invalid Non-Special Material Code(s)`,
+                description: `${txLabel} (${txnNumber}) has invalid material codes: ${invalidCodes.join(', ')}.`,
+                tag: 'recycMaterilasNotSpecialPurchaseArticles'
+              });
+            }
+          }
+
+          // Check 126: Recyclable materials special purchase - invalid codes
+          if (recycMaterialsSpecialPurchaseArticles) {
+            const codes = recycMaterialsSpecialPurchaseArticles.split(',').map(c => c.trim()).filter(Boolean);
+            const invalidCodes = codes.filter(c => !VALID_OHIO_SPECIAL_CODES.has(c));
+            if (invalidCodes.length > 0) {
+              results.push({
+                status: 'error',
+                title: `[Error 126] Invalid Special Material Code(s)`,
+                description: `${txLabel} (${txnNumber}) has invalid special material codes: ${invalidCodes.join(', ')}.`,
+                tag: 'recycMaterialsSpecialPurchaseArticles'
+              });
+            }
+
+            // Check 127: Special purchase article photos count matches
+            const specialPhotosBlock = tx.getElementsByTagName("recycMaterialsSpecialPurchaseArticlePhotos")[0];
+            const specialPhotosCount = specialPhotosBlock ? specialPhotosBlock.getElementsByTagName("base64Binary").length : 0;
+            if (specialPhotosCount < codes.length) {
+              results.push({
+                status: 'error',
+                title: `[Error 127] Missing Special Material Photo(s)`,
+                description: `${txLabel} (${txnNumber}) requires at least ${codes.length} photo(s) inside <recycMaterialsSpecialPurchaseArticlePhotos> but found ${specialPhotosCount}.`,
+                tag: 'recycMaterialsSpecialPurchaseArticlePhotos'
+              });
+            }
+          }
         }
 
-        if (emptyRegNumberCount === 0) {
-          results.push({
-            status: 'success',
-            title: 'Facility ID Configured',
-            description: `All ${transactions.length} records contain a registered <facilityRegNumber>.`
-          });
-        } else {
-          results.push({
-            status: 'error',
-            title: 'Missing Facility Registry Number',
-            description: `Found ${emptyRegNumberCount} record(s) without a dealer registration number. Verify Settings.`
-          });
-        }
-
-        if (missingNamesCount === 0) {
-          results.push({
-            status: 'success',
-            title: 'Customer Data complete',
-            description: `All ${transactions.length} records have firstName and lastName fields populated.`
-          });
-        } else {
-          results.push({
-            status: 'error',
-            title: 'Missing Customer Name Data',
-            description: `Found ${missingNamesCount} record(s) missing mandatory firstName or lastName.`
-          });
-        }
-
-        if (invalidDateTimeCount === 0) {
-          results.push({
-            status: 'success',
-            title: 'Timestamps format OK',
-            description: 'All records have valid transaction date and time fields.'
-          });
-        } else {
-          results.push({
-            status: 'error',
-            title: 'Invalid ISO timestamps',
-            description: `Found ${invalidDateTimeCount} record(s) with invalid timestamps in <txnDateTime>.`
-          });
-        }
-
-        if (missingIdCount === 0) {
-          results.push({
-            status: 'success',
-            title: 'Compliance photo documentation found',
-            description: 'All transactions have embedded Base64 ID image files.'
-          });
-        } else {
-          results.push({
-            status: 'warning',
-            title: 'Missing ID Photo Data',
-            description: `Found ${missingIdCount} record(s) without base64 ID photo data.`
+        // Add 129 duplicate transaction number results
+        if (seenTxns.size > 0) {
+          seenTxns.forEach(dup => {
+            results.push({
+              status: 'error',
+              title: `[Error 129] Duplicate Transaction Number`,
+              description: `Transaction number '${dup}' is used more than once in the XML submission bundle.`,
+              tag: 'txnNumber'
+            });
           });
         }
       }
 
-      setXmlValidationResults(results);
-      const hasErrors = results.some(r => r.status === 'error');
-      setXmlValidationStatus(hasErrors ? 'failed' : 'passed');
+        errorCount = results.filter(r => r.status === 'error').length;
+        warningCount = results.filter(r => r.status === 'warning').length;
+
+        const hasErrors = errorCount > 0 || results.some(r => r.status === 'error');
+        results.unshift({
+          status: hasErrors ? 'error' : (warningCount > 0 ? 'warning' : 'success'),
+          title: hasErrors
+            ? `❌ NOT READY — ${errorCount} critical issue(s) will cause upload rejection`
+            : warningCount > 0
+              ? `⚠ REVIEW NEEDED — ${warningCount} warning(s), no blocking errors`
+              : `✅ READY TO SUBMIT — All ${transactions.length} transaction(s) passed all Ohio checks`,
+          description: hasErrors
+            ? 'Fix all critical errors before uploading to the Ohio DPS portal.'
+            : 'XML validated against Ohio error codes 104–129. Safe to submit.'
+        });
+
+        setXmlValidationResults(results);
+        setXmlValidationStatus(hasErrors ? 'failed' : 'passed');
 
     } catch (err: any) {
       results.push({
