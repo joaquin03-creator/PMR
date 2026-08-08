@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, query, where, addDoc, doc, updateDoc, deleteDoc, getDocs, orderBy, limit, deleteField } from 'firebase/firestore';
 import { CashSession, CashTransaction, BuyTicket, UserProfile, Material, AuditLog } from '../types';
@@ -351,6 +351,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [retroactiveDate, setRetroactiveDate] = useState<string>('');
   const [retroStatus, setRetroStatus] = useState<'open' | 'closed'>('closed');
   const [retroNotes, setRetroNotes] = useState<string>('');
+  const [retroBankRun, setRetroBankRun] = useState<string>('');
   const [useRetroOpeningDenoms, setUseRetroOpeningDenoms] = useState(false);
   const [retroOpeningDenoms, setRetroOpeningDenoms] = useState<DenominationCount>(initialDenominations);
   const [quickRetroOpeningCash, setQuickRetroOpeningCash] = useState<string>('');
@@ -376,13 +377,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [viewingDenoms, setViewingDenoms] = useState<{
     title: string;
     denoms: DenominationCount;
+    closedBy?: string;
   } | null>(null);
 
   const todayStr = useMemo(() => {
-    const d = new Date();
-    const offset = d.getTimezoneOffset();
-    const localDate = new Date(d.getTime() - offset * 60 * 1000);
-    return localDate.toISOString().split('T')[0];
+    return new Date().toLocaleDateString('en-CA');
   }, []);
 
   const mostRecentClosedSession = useMemo(() => {
@@ -508,8 +507,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
     const isTodayOpen = activeSession?.status === 'open' && selectedSession.id === activeSession.id;
     const isManager = profile.role === 'manager';
-    // Only auto-save if session is open, or if it is closed and user is a manager (authorized to edit)
-    if (!isTodayOpen && !isManager) return;
+    // STRICT SAFETY FIX: NEVER auto-save to Firestore for closed sessions!
+    // Auto-save must ONLY run if the selected session is currently OPEN.
+    if (!selectedSession || !profile || selectedSession.status !== 'open') return;
 
     setAutoSaveStatus('saving');
 
@@ -802,9 +802,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   }, [transactions, buyTickets]);
 
   const handleSheetDenomChange = (key: keyof DenominationCount, value: number) => {
-    const isTodayOpen = activeSession?.status === 'open' && selectedSession?.id === activeSession?.id;
-    const isManager = profile?.role === 'manager';
-    if (!isTodayOpen && !isManager) return;
+    if (!selectedSession) return;
     setSheetDenoms(prev => ({
       ...prev,
       [key]: Math.max(0, value)
@@ -1079,13 +1077,20 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
   }, [selectedSession?.id, profile]);
 
+  const getTicketLocalDate = useCallback((timestampStr?: string) => {
+    if (!timestampStr) return '';
+    const d = new Date(timestampStr);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleDateString('en-CA');
+  }, []);
+
   // Subscribe to Buy Tickets for the active/selected session's date
   useEffect(() => {
     if (!auth.currentUser) return;
 
     const targetDate = selectedSession ? selectedSession.date : todayStr;
-    const startOfDay = new Date(`${targetDate}T00:00:00.000Z`);
-    const endOfDay = new Date(`${targetDate}T23:59:59.999Z`);
+    const startOfDay = new Date(`${targetDate}T00:00:00`);
+    const endOfDay = new Date(`${targetDate}T23:59:59.999`);
 
     const unsubTickets = onSnapshot(
       query(
@@ -1152,8 +1157,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     const ticketDates = new Set<string>();
     recentTickets.forEach(t => {
       if (t.timestamp && t.status !== 'voided' && t.status !== 'cancelled') {
-        const dateStr = t.timestamp.split('T')[0];
-        ticketDates.add(dateStr);
+        const dateStr = getTicketLocalDate(t.timestamp);
+        if (dateStr) ticketDates.add(dateStr);
       }
     });
 
@@ -1162,7 +1167,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     
     ticketDates.forEach(date => {
       if (!sessionDates.has(date) && date !== todayStr) {
-        const dayTickets = recentTickets.filter(t => t.timestamp.startsWith(date) && t.status !== 'voided' && t.status !== 'cancelled');
+        const dayTickets = recentTickets.filter(t => getTicketLocalDate(t.timestamp) === date && t.status !== 'voided' && t.status !== 'cancelled');
         if (dayTickets.length > 0) {
           missing.push({
             date,
@@ -1174,7 +1179,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     });
 
     return missing.sort((a, b) => b.date.localeCompare(a.date));
-  }, [recentTickets, history, todayStr]);
+  }, [recentTickets, history, todayStr, getTicketLocalDate]);
 
   const chartData = useMemo(() => {
     const sortedClosed = [...closedSessions]
@@ -1343,13 +1348,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     return Math.round(val * 100) / 100;
   }, [selectedSession, editedOpeningCash, totalReplenishments, totalPayouts, totalExpenses]);
 
-  // Update expected cash in session document (if it changed and we're the manager)
+  // Update expected cash in session document when calculated values change
   useEffect(() => {
-    if (activeSession?.id && activeSession.status === 'open' && Math.abs(activeSession.expectedCash - expectedCash) > 0.01) {
-      updateDoc(doc(db, 'cashSessions', activeSession.id), { expectedCash })
+    if (selectedSession?.id && Math.abs((selectedSession.expectedCash || 0) - expectedCash) > 0.01) {
+      updateDoc(doc(db, 'cashSessions', selectedSession.id), { expectedCash })
         .catch((err) => console.error('Failed to update expected cash in background:', err));
+      setSelectedSession(prev => prev && prev.id === selectedSession.id ? { ...prev, expectedCash } : prev);
     }
-  }, [expectedCash, activeSession?.id, activeSession?.status, activeSession?.expectedCash]);
+  }, [expectedCash, selectedSession?.id, selectedSession?.expectedCash]);
 
   const calculateDenomTotal = (denoms: DenominationCount) => {
     const d = ensureDenomTotals(denoms);
@@ -1447,10 +1453,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       openingCash = Math.round(openingCash * 100) / 100;
 
       // Calculate Expected Cash
-      let expectedCash = openingCash;
+      const initialBankRunAmount = parseFloat(retroBankRun) || 0;
+      let expectedCash = openingCash + initialBankRunAmount;
       if (retroStatus === 'closed') {
-        const startOfDay = new Date(`${retroactiveDate}T00:00:00.000Z`);
-        const endOfDay = new Date(`${retroactiveDate}T23:59:59.999Z`);
+        const startOfDay = new Date(`${retroactiveDate}T00:00:00`);
+        const endOfDay = new Date(`${retroactiveDate}T23:59:59.999`);
 
         if (isNaN(startOfDay.getTime()) || isNaN(endOfDay.getTime())) {
           toastError('Invalid Date', 'Invalid target date. Please select a valid calendar date.');
@@ -1469,7 +1476,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         const dayTickets = ticketsSnap.docs.map(d => d.data() as BuyTicket)
           .filter(t => t.status !== 'voided' && t.status !== 'cancelled');
         const dayPayouts = dayTickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0);
-        expectedCash = Math.round((openingCash - dayPayouts) * 100) / 100;
+        expectedCash = Math.round((openingCash + initialBankRunAmount - dayPayouts) * 100) / 100;
       }
 
       // Calculate Actual / OverShort
@@ -1507,17 +1514,30 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
       const docRef = await addDoc(collection(db, 'cashSessions'), sessionDoc);
 
+      if (initialBankRunAmount > 0) {
+        await addDoc(collection(db, 'cashTransactions'), {
+          sessionId: docRef.id,
+          type: 'inflow',
+          category: 'Bank Run',
+          amount: initialBankRunAmount,
+          notes: 'Initial bank run deposit registered during retroactive session setup',
+          timestamp: `${retroactiveDate}T09:00:00.000Z`,
+          performedBy: profile.email
+        });
+      }
+
       await logAuditEvent(
         'cashDrawer',
         docRef.id,
         retroStatus === 'open' ? 'open' : 'close',
         { after: sessionDoc },
-        `Retroactively created cash drawer session for ${retroactiveDate} with status: ${retroStatus}. Opening cash: $${openingCash.toLocaleString()}${retroStatus === 'closed' ? `, Actual cash: $${actualCash.toLocaleString()}, Over/Short: $${overShort.toLocaleString()}` : ''}`
+        `Retroactively created cash drawer session for ${retroactiveDate} with status: ${retroStatus}. Opening cash: $${openingCash.toLocaleString()}${initialBankRunAmount > 0 ? `, Initial Bank Run: $${initialBankRunAmount.toLocaleString()}` : ''}${retroStatus === 'closed' ? `, Actual cash: $${actualCash.toLocaleString()}, Over/Short: $${overShort.toLocaleString()}` : ''}`
       );
 
       // Reset & Close
       setShowRetroactiveModal(false);
       setRetroNotes('');
+      setRetroBankRun('');
       setQuickRetroOpeningCash('');
       setQuickRetroClosingCash('');
       setRetroOpeningDenoms({ ...initialDenominations });
@@ -1542,6 +1562,38 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
 
   const [editingTransaction, setEditingTransaction] = useState<CashTransaction | null>(null);
+
+  const handleQuickCloseSession = async (session: CashSession) => {
+    if (!profile) return;
+    setProcessing(true);
+    try {
+      const now = new Date().toISOString();
+      const updatePayload: Record<string, any> = {
+        status: 'closed',
+        closedAt: now,
+        closedBy: profile.email
+      };
+
+      await updateDoc(doc(db, 'cashSessions', session.id), updatePayload);
+
+      await logAuditEvent(
+        'cashDrawer',
+        session.id,
+        'close',
+        {
+          before: { status: 'open' },
+          after: { status: 'closed', closedBy: profile.email }
+        },
+        `Retroactively closed session for ${session.date} from ledger history.`
+      );
+      
+      firestore('Session Closed', `Successfully finalized reconciliation for ${session.date}.`);
+    } catch (err: any) {
+      toastError('Failed to close session', err.message || err);
+    } finally {
+      setProcessing(false);
+    }
+  };
 
   const handleEditTransaction = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -1591,7 +1643,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
   const handleAddTransaction = async (e: React.FormEvent<HTMLFormElement>, type: 'inflow' | 'expense') => {
     e.preventDefault();
-    if (!activeSession || !profile) return;
+    const targetSession = selectedSession || activeSession;
+    if (!targetSession || !profile) return;
     setProcessing(true);
     
     const formData = new FormData(e.currentTarget);
@@ -1601,13 +1654,17 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     const notes = formData.get('notes') as string;
     
     try {
+      const sessionDateStr = targetSession.date || todayStr;
+      const timePart = new Date().toISOString().split('T')[1] || '12:00:00.000Z';
+      const txTimestamp = `${sessionDateStr}T${timePart}`;
+
       const docRef = await addDoc(collection(db, 'cashTransactions'), {
-        sessionId: activeSession.id,
+        sessionId: targetSession.id,
         type,
         category,
         amount,
         notes,
-        timestamp: new Date().toISOString(),
+        timestamp: txTimestamp,
         performedBy: profile.email
       } as Omit<CashTransaction, 'id'>);
 
@@ -1616,8 +1673,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         'cashTransaction',
         docRef.id,
         'adjustment',
-        { after: { type, category, amount, notes, sessionId: activeSession.id } },
-        `Cash drawer adjustment: Added ${type === 'inflow' ? 'Inflow' : 'Expense'} of $${amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} (${category}). Notes: ${notes || 'None'}`
+        { after: { type, category, amount, notes, sessionId: targetSession.id } },
+        `Cash drawer transaction for session ${targetSession.date}: Added ${type === 'inflow' ? 'Bank Run/Inflow' : 'Expense'} of $${amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} (${category}). Notes: ${notes || 'None'}`
       );
       
       if (type === 'inflow') setShowInflowModal(false);
@@ -1625,7 +1682,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
       firestore(
         'Transaction Recorded',
-        `Successfully logged ${type === 'inflow' ? 'Cash Drop' : 'Payout/Expense'} of $${amount.toFixed(2)} (${category}) in Cloud Firestore.`
+        `Successfully logged ${type === 'inflow' ? 'Bank Run' : 'Payout/Expense'} of $${amount.toFixed(2)} (${category}) for session on ${targetSession.date}.`
       );
     } catch (error: any) {
       toastError('Transaction Failed', `Failed to log cash transaction: ${error.message || error}`);
@@ -1637,7 +1694,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
   const handleCloseDay = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!activeSession || !profile) return;
+    const targetSession = selectedSession || activeSession;
+    if (!targetSession || !profile) return;
     setProcessing(true);
     
     const formData = new FormData(e.currentTarget);
@@ -1649,35 +1707,44 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
     actualCash = Math.round(actualCash * 100) / 100;
     const notes = formData.get('notes') as string;
-    const overShort = Math.round((actualCash - expectedCash) * 100) / 100;
+    const expectedVal = Math.round((targetSession.openingCash + totalReplenishments - totalPayouts - totalExpenses) * 100) / 100;
+    const overShort = Math.round((actualCash - expectedVal) * 100) / 100;
     
     try {
-      await updateDoc(doc(db, 'cashSessions', activeSession.id), {
-        status: 'closed',
+      const closedData = {
+        status: 'closed' as const,
         actualCash,
+        expectedCash: expectedVal,
         overShort,
         closedAt: new Date().toISOString(),
         closedBy: profile.email,
-        notes: notes || activeSession.notes || '',
+        notes: notes || targetSession.notes || '',
         ...(useClosingDenoms ? { closingDenominations: closingDenoms } : {})
-      });
+      };
+
+      await updateDoc(doc(db, 'cashSessions', targetSession.id), closedData);
 
       // Track in Audit Log
       await logAuditEvent(
         'cashDrawer',
-        activeSession.id,
+        targetSession.id,
         'close',
         {
-          before: { expectedCash },
-          after: { actualCash, overShort, notes }
+          before: { status: targetSession.status, expectedCash: targetSession.expectedCash },
+          after: { status: 'closed', actualCash, overShort, notes }
         },
-        `Closed cash drawer session for ${activeSession.date || todayStr}. Actual cash counted: $${actualCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}. Over/Short: $${overShort.toLocaleString(undefined, { minimumFractionDigits: 2 })}. Notes: ${notes || 'None'}`
+        `Closed and finalized cash drawer session for ${targetSession.date || todayStr}. Actual cash counted: $${actualCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}. Over/Short: $${overShort.toLocaleString(undefined, { minimumFractionDigits: 2 })}. Notes: ${notes || 'None'}`
       );
+
+      setSelectedSession(prev => prev && prev.id === targetSession.id ? { ...prev, ...closedData } : prev);
+      if (activeSession && activeSession.id === targetSession.id) {
+        setActiveSession(prev => prev ? { ...prev, ...closedData } : null);
+      }
 
       setShowCloseModal(false);
       firestore(
         'Shift Closed',
-        `Successfully closed and committed cash drawer session for ${activeSession.date || todayStr}. Counted: $${actualCash.toFixed(2)}.`
+        `Successfully closed and committed cash drawer session for ${targetSession.date || todayStr}. Counted: $${actualCash.toFixed(2)}.`
       );
     } catch (error: any) {
       toastError('Shift Close Failed', `Failed to close session: ${error.message || error}`);
@@ -1688,10 +1755,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   };
 
   const handleReOpenSession = async () => {
-    if (!activeSession || !profile) return;
+    const targetSession = selectedSession || activeSession;
+    if (!targetSession || !profile) return;
     setProcessing(true);
     try {
-      await updateDoc(doc(db, 'cashSessions', activeSession.id), {
+      await updateDoc(doc(db, 'cashSessions', targetSession.id), {
         status: 'open',
         actualCash: deleteField(),
         overShort: deleteField(),
@@ -1703,18 +1771,40 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       // Track in Audit Log
       await logAuditEvent(
         'cashDrawer',
-        activeSession.id,
+        targetSession.id,
         'open',
         {
           before: { status: 'closed' },
           after: { status: 'open' }
         },
-        `Re-opened cash drawer session for ${activeSession.date}`
+        `Re-opened cash drawer session for ${targetSession.date}`
       );
 
+      setSelectedSession(prev => prev && prev.id === targetSession.id ? {
+        ...prev,
+        status: 'open',
+        actualCash: undefined,
+        overShort: undefined,
+        closedAt: undefined,
+        closedBy: undefined,
+        closingDenominations: undefined
+      } : prev);
+
+      if (activeSession && activeSession.id === targetSession.id) {
+        setActiveSession(prev => prev ? {
+          ...prev,
+          status: 'open',
+          actualCash: undefined,
+          overShort: undefined,
+          closedAt: undefined,
+          closedBy: undefined,
+          closingDenominations: undefined
+        } : null);
+      }
+
       firestore(
-        'Shift Reopened',
-        `Cash drawer session for ${activeSession.date} is now reopened & active.`
+        'Session Reopened',
+        `Cash drawer session for ${targetSession.date} is now reopened & active.`
       );
     } catch (error: any) {
       toastError('Reopen Failed', `Failed to reopen session: ${error.message || error}`);
@@ -1748,6 +1838,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         },
         `Updated starting cash for ${selectedSession.date} from $${oldOpening.toLocaleString(undefined, { minimumFractionDigits: 2 })} to $${openingCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
       );
+
+      setSelectedSession(prev => prev && prev.id === selectedSession.id ? { ...prev, openingCash } : prev);
+      setEditedOpeningCash(openingCash);
 
       setShowEditOpeningModal(false);
       firestore(
@@ -2002,7 +2095,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             <Bar dataKey="Over / Short" radius={[4, 4, 0, 0]}>
                               {chartData.map((entry: any, index: number) => {
                                 const val = entry['Over / Short'];
-                                const tCount = recentTickets.filter(t => t.timestamp && t.timestamp.startsWith(entry.date) && t.status !== 'voided' && t.status !== 'cancelled').length;
+                                const tCount = recentTickets.filter(t => t.timestamp && getTicketLocalDate(t.timestamp) === entry.date && t.status !== 'voided' && t.status !== 'cancelled').length;
                                 const status = getShortageStatus(val, tCount);
                                 
                                 let color = '#94a3b8'; // balanced
@@ -2067,8 +2160,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           )}
 
           {historyTab === 'ledgers' && (
-            <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-sm animate-in fade-in duration-200">
-              <table className="w-full text-left">
+            <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-sm animate-in fade-in duration-200 overflow-x-auto">
+              <table className="w-full text-left min-w-[700px]">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-100">
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Date</th>
@@ -2076,7 +2169,6 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Expected</th>
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Actual</th>
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Diff</th>
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Closed By</th>
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Actions</th>
                   </tr>
                 </thead>
@@ -2096,7 +2188,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   type="button"
                                   onClick={() => setViewingDenoms({
                                     title: `Opening Count Breakdown (${session.date})`,
-                                    denoms: session.openingDenominations!
+                                    denoms: session.openingDenominations!,
+                                    closedBy: session.closedBy
                                   })}
                                   className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
                                 >
@@ -2108,7 +2201,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   type="button"
                                   onClick={() => setViewingDenoms({
                                     title: `Closing Count Breakdown (${session.date})`,
-                                    denoms: session.closingDenominations!
+                                    denoms: session.closingDenominations!,
+                                    closedBy: session.closedBy
                                   })}
                                   className="px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
                                 >
@@ -2136,7 +2230,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                       <td className="px-6 py-4 text-right">
                         {session.overShort !== undefined ? (
                           (() => {
-                            const tCount = recentTickets.filter(t => t.timestamp && t.timestamp.startsWith(session.date) && t.status !== 'voided' && t.status !== 'cancelled').length;
+                            const tCount = recentTickets.filter(t => t.timestamp && getTicketLocalDate(t.timestamp) === session.date && t.status !== 'voided' && t.status !== 'cancelled').length;
                             const status = getShortageStatus(session.overShort, tCount);
                             return (
                               <div className="flex flex-col items-end">
@@ -2155,20 +2249,32 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           <span className="text-slate-400 font-bold">-</span>
                         )}
                       </td>
-                      <td className="px-6 py-4 text-slate-500 text-sm font-medium">
-                        {session.closedBy || '-'}
-                      </td>
                       <td className="px-6 py-4 text-right">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSelectedSession(session);
-                            setShowHistory(false);
-                          }}
-                          className="px-3.5 py-2 bg-slate-900 hover:bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
-                        >
-                          View Ledger
-                        </button>
+                        <div className="flex items-center justify-end gap-2">
+                          {session.status === 'open' && session.date !== todayStr && session.actualCash !== undefined && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (window.confirm(`Are you sure you want to finalize and close the session for ${session.date}?`)) {
+                                  handleQuickCloseSession(session);
+                                }
+                              }}
+                              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-sm"
+                            >
+                              Close Day
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedSession(session);
+                              setShowHistory(false);
+                            }}
+                            className="px-3.5 py-2 bg-slate-900 hover:bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
+                          >
+                            View Ledger
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -2267,16 +2373,34 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   </p>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedSession(activeSession);
-                  setShowHistory(false);
-                }}
-                className="px-5 py-3.5 bg-white text-slate-900 hover:bg-slate-100 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 shadow-lg shrink-0 cursor-pointer"
-              >
-                Back to Today
-              </button>
+              <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => setShowInflowModal(true)}
+                  className="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
+                >
+                  <ArrowUpCircle className="w-4 h-4" />
+                  Record Bank Run
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowExpenseModal(true)}
+                  className="px-4 py-2.5 bg-rose-500 hover:bg-rose-400 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
+                >
+                  <ArrowDownCircle className="w-4 h-4" />
+                  Record Expense
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedSession(activeSession);
+                    setShowHistory(false);
+                  }}
+                  className="px-5 py-2.5 bg-white text-slate-900 hover:bg-slate-100 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 shadow-lg shrink-0 cursor-pointer"
+                >
+                  Back to Today
+                </button>
+              </div>
             </div>
           )}
 
@@ -2344,6 +2468,72 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 </button>
               </div>
 
+              {/* Quick Actions Toolbar */}
+              <div className="bg-slate-900 text-white p-5 rounded-[2rem] border border-slate-800 shadow-xl flex flex-wrap items-center justify-between gap-4 print:hidden">
+                <div className="flex items-center gap-3.5">
+                  <div className="p-3 bg-blue-500/20 text-blue-400 rounded-2xl border border-blue-500/30">
+                    <Wallet className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-black uppercase tracking-wider text-white">
+                      Active Session: {selectedSession.date}
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest block">
+                      Status: {selectedSession.status.toUpperCase()}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowInflowModal(true)}
+                    className="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
+                  >
+                    <ArrowUpCircle className="w-4 h-4" />
+                    Bank Run / Inflow
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowExpenseModal(true)}
+                    className="px-4 py-2.5 bg-rose-500 hover:bg-rose-400 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
+                  >
+                    <ArrowDownCircle className="w-4 h-4" />
+                    Payout / Expense
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowEditOpeningModal(true)}
+                    className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all border border-slate-700 cursor-pointer active:scale-95"
+                  >
+                    <Edit2 className="w-4 h-4 text-blue-400" />
+                    Edit Starting Cash
+                  </button>
+                  {selectedSession.status === 'open' ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowCloseModal(true)}
+                      className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
+                    >
+                      <CheckCircle2 className="w-4 h-4 text-emerald-300" />
+                      Finalize Reconciliation
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm('Re-open this session to make adjustments?')) {
+                          handleReOpenSession();
+                        }
+                      }}
+                      className="px-4 py-2.5 bg-amber-600/30 hover:bg-amber-600/40 text-amber-300 border border-amber-500/30 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all cursor-pointer active:scale-95"
+                    >
+                      <RotateCcw className="w-4 h-4 text-amber-300" />
+                      Re-open Session
+                    </button>
+                  )}
+                </div>
+              </div>
+
               {viewMode === 'dashboard' ? (
                 <>
                   {/* Stat Grid */}
@@ -2371,7 +2561,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     <button
                       onClick={() => setViewingDenoms({
                         title: 'Opening Cash Count Breakdown',
-                        denoms: selectedSession.openingDenominations!
+                        denoms: selectedSession.openingDenominations!,
+                        closedBy: selectedSession.closedBy
                       })}
                       className="mt-2 inline-flex items-center gap-1.5 px-3 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-full text-[10px] font-black uppercase tracking-widest transition-all"
                     >
@@ -2557,24 +2748,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         {selectedSession.id === activeSession?.id ? "Today's Transactions" : "Session Transactions"}
                       </h3>
                     </div>
-                    {selectedSession.status === 'open' && selectedSession.id === activeSession?.id && (
-                      <div className="flex gap-2">
-                        <button 
-                          onClick={() => setShowInflowModal(true)}
-                          className="px-4 py-2 bg-emerald-50 text-emerald-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-emerald-100 hover:bg-emerald-100 transition-all flex items-center gap-2"
-                        >
-                          <ArrowUpCircle className="w-4 h-4" />
-                          Bank Run
-                        </button>
-                        <button 
-                          onClick={() => setShowExpenseModal(true)}
-                          className="px-4 py-2 bg-red-50 text-red-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-red-100 hover:bg-red-100 transition-all flex items-center gap-2"
-                        >
-                          <ArrowDownCircle className="w-4 h-4" />
-                          Expense
-                        </button>
-                      </div>
-                    )}
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => setShowInflowModal(true)}
+                        className="px-4 py-2 bg-emerald-50 text-emerald-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-emerald-100 hover:bg-emerald-100 transition-all flex items-center gap-2 cursor-pointer"
+                      >
+                        <ArrowUpCircle className="w-4 h-4" />
+                        Bank Run
+                      </button>
+                      <button 
+                        onClick={() => setShowExpenseModal(true)}
+                        className="px-4 py-2 bg-red-50 text-red-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-red-100 hover:bg-red-100 transition-all flex items-center gap-2 cursor-pointer"
+                      >
+                        <ArrowDownCircle className="w-4 h-4" />
+                        Expense
+                      </button>
+                    </div>
                   </div>
 
                   <div className="bg-white rounded-[2rem] border border-slate-200 overflow-hidden shadow-sm">
@@ -2615,7 +2804,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                 <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{tx.performedBy.split('@')[0]}</p>
                               </div>
 
-                              {selectedSession.status === 'open' && selectedSession.id === activeSession?.id && profile?.role === 'manager' && (
+                              {(profile?.role === 'manager' || selectedSession) && (
                                 <div className="flex items-center gap-1">
                                   <button 
                                     onClick={() => setEditingTransaction(tx)}
@@ -2712,7 +2901,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             <button
                               onClick={() => setViewingDenoms({
                                 title: 'Closing Physical Cash Count Breakdown',
-                                denoms: selectedSession.closingDenominations!
+                                denoms: selectedSession.closingDenominations!,
+                                closedBy: selectedSession.closedBy
                               })}
                               className="w-full py-2.5 bg-white/5 hover:bg-white/10 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center justify-center gap-1.5 border border-white/10"
                             >
@@ -2727,7 +2917,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                 This session is finalized. Reconciliation record is archived.
                               </p>
                             </div>
-                            {selectedSession.id === activeSession?.id && profile?.role === 'manager' && (
+                            {(profile?.role === 'manager' || selectedSession) && (
                               <button 
                                 onClick={() => {
                                   if (window.confirm('Are you sure you want to re-open this session? This will remove the final actual count and over/short calculation.')) {
@@ -2789,7 +2979,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   type="number"
                                   step="0.01"
                                   min="0"
-                                  disabled={!(selectedSession.status === 'open' && selectedSession.id === activeSession?.id) && profile?.role !== 'manager'}
+                                  disabled={false}
                                   value={totalVal || ''}
                                   onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, parseFloat(e.target.value) || 0)}
                                   className="w-24 pl-6 pr-2 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
@@ -2827,7 +3017,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   type="number"
                                   step="0.01"
                                   min="0"
-                                  disabled={!(selectedSession.status === 'open' && selectedSession.id === activeSession?.id) && profile?.role !== 'manager'}
+                                  disabled={false}
                                   value={totalVal || ''}
                                   onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, parseFloat(e.target.value) || 0)}
                                   className="w-24 pl-6 pr-2 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
@@ -2860,7 +3050,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         </span>
                       </div>
 
-                      {((selectedSession.status === 'open' && selectedSession.id === activeSession?.id) || profile?.role === 'manager') && (
+                      {(selectedSession || profile?.role === 'manager') && (
                         <button
                           type="button"
                           onClick={handleSaveSheetCount}
@@ -2903,11 +3093,27 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest mt-0.5">Automated from register transactions</p>
                   </div>
                 </div>
-                <div className="flex items-center gap-2.5 w-full sm:w-auto">
+                <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    onClick={() => setShowInflowModal(true)}
+                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-black text-[10px] uppercase tracking-widest transition-all shadow-md cursor-pointer active:scale-95"
+                  >
+                    <ArrowUpCircle className="w-4 h-4" />
+                    Record Bank Run
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowExpenseModal(true)}
+                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-3 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-black text-[10px] uppercase tracking-widest transition-all shadow-md cursor-pointer active:scale-95"
+                  >
+                    <ArrowDownCircle className="w-4 h-4" />
+                    Record Expense
+                  </button>
                   <button
                     type="button"
                     onClick={() => window.print()}
-                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-5 py-3 bg-slate-900 text-white rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-slate-800 transition-all shadow-lg"
+                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-3 bg-slate-900 text-white rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-slate-800 transition-all shadow-lg"
                   >
                     <Printer className="w-4 h-4 text-slate-300" />
                     Print Template
@@ -2915,7 +3121,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   <button
                     type="button"
                     onClick={handleExportSheetCsv}
-                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-5 py-3 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all"
+                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-3 bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all"
                   >
                     <FileSpreadsheet className="w-4 h-4 text-green-600" />
                     Export for Sheets
@@ -3301,7 +3507,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                         type="number"
                                         step="0.01"
                                         min="0"
-                                        disabled={!(selectedSession.status === 'open' && selectedSession.id === activeSession?.id) && profile?.role !== 'manager'}
+                                        disabled={false}
                                         value={totalVal || ''}
                                         onChange={(e) => {
                                           const val = parseFloat(e.target.value) || 0;
@@ -3353,7 +3559,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                         type="number"
                                         step="0.01"
                                         min="0"
-                                        disabled={!(selectedSession.status === 'open' && selectedSession.id === activeSession?.id) && profile?.role !== 'manager'}
+                                        disabled={false}
                                         value={totalVal || ''}
                                         onChange={(e) => {
                                           const val = parseFloat(e.target.value) || 0;
@@ -3413,7 +3619,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         </div>
                       </div>
                       
-                      {((selectedSession.status === 'open' && selectedSession.id === activeSession?.id) || profile?.role === 'manager') && (
+                      {(selectedSession || profile?.role === 'manager') && (
                         <button
                           type="button"
                           onClick={handleSaveSheetCount}
@@ -4202,7 +4408,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
             <div className="bg-white rounded-[2.5rem] p-6 md:p-10 max-w-3xl w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
               <div className="space-y-2 mb-8">
-                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">{viewingDenoms.title}</h3>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">{viewingDenoms.title}</h3>
+                  {viewingDenoms.closedBy && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-100 text-slate-700 rounded-full text-xs font-bold border border-slate-200 shrink-0">
+                      <span className="text-slate-400 font-medium uppercase tracking-wider text-[10px]">Closed By:</span> {viewingDenoms.closedBy}
+                    </span>
+                  )}
+                </div>
                 <p className="text-slate-500 font-medium text-xs uppercase tracking-widest">Saved Denomination Totals</p>
               </div>
               
@@ -4359,6 +4572,30 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     />
                   </div>
                 )}
+              </div>
+
+              {/* Bank Run / Cash Inflow Input Container */}
+              <div className="bg-emerald-50/50 rounded-3xl p-6 border border-emerald-100 space-y-3">
+                <div>
+                  <h4 className="text-sm font-black text-emerald-900 uppercase tracking-tight flex items-center gap-2">
+                    <ArrowUpCircle className="w-4 h-4 text-emerald-600" />
+                    Bank Run / Cash Inflow Deposit (Optional)
+                  </h4>
+                  <p className="text-[10px] text-emerald-700 font-bold uppercase tracking-wider">Additional cash added to register drawer during this retroactive session</p>
+                </div>
+                <div className="relative max-w-sm">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-lg font-bold text-slate-400">$</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={retroBankRun}
+                    onChange={(e) => setRetroBankRun(e.target.value)}
+                    onBlur={(e) => setRetroBankRun(parseFloat(e.target.value) ? (Math.round(parseFloat(e.target.value) * 100) / 100).toFixed(2) : '')}
+                    className="w-full pl-8 pr-4 py-3 bg-white border border-emerald-200 rounded-xl font-mono text-sm font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/20"
+                    placeholder="0.00"
+                  />
+                </div>
               </div>
 
               {/* Closing Cash Input Container (Only shown for 'closed' status) */}

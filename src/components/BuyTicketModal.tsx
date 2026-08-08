@@ -25,16 +25,18 @@ import {
   Fingerprint,
   Check,
   ExternalLink,
-  Copy
+  Copy,
+  Clock
 } from 'lucide-react';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, setDoc, query, where, orderBy, limit, getDocs, deleteDoc } from 'firebase/firestore';
 import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, UserProfile } from '../types';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from './BrandLogo';
-import { cn, generateTicketId } from '../lib/utils';
+import { cn, generateTicketId, getCustomerDataGaps } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { useSettings } from '../context/SettingsContext';
+import { useToast } from '../context/ToastContext';
 import ManagerPinModal from './ManagerPinModal';
 import { ScaleCaptureButton } from './ScaleCaptureButton';
 import { CameraCapture } from './CameraCapture';
@@ -43,6 +45,7 @@ import { printTicket } from '../lib/printTicket';
 import { BuyTicketPrint } from './BuyTicketPrint';
 import { logAuditEvent } from '../lib/audit';
 import { roundNetWeight } from '../lib/weightUtils';
+import { isCatalyticConverterMat, checkCatalyticConverterLimit } from '../lib/catalyticUtils';
 
 const normalizeName = (name: string) =>
   name.toLowerCase().replace(/[^a-z\s]/g, '').replace(/\s+/g, ' ').trim();
@@ -109,6 +112,7 @@ interface BuyTicketModalProps {
 }
 
 export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId }: BuyTicketModalProps) {
+  const { success: showToastSuccess } = useToast();
   const [step, setStep] = useState(1);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -137,10 +141,12 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
     vehicleType: '',
     paymentMethod: 'cash' as 'cash' | 'check' | 'other',
     notes: '',
+    customTimestamp: '',
     customerPhotoUrl: '',
     signatureUrl: '',
     idImageUrl: '',
     vehiclePhotoUrl: '',
+    loadPhotoUrl: '',
     ohioDatabaseStatus: 'not_checked' as 'not_checked' | 'cleared' | 'flagged'
   });
 
@@ -221,9 +227,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: nameToCheck,
-          idNumber: idNum || selectedCustomer?.idNumber || newCustomer.idNumber || '',
-          username: settings.ohioScrapUsername,
-          password: settings.ohioScrapPassword
+          idNumber: idNum || selectedCustomer?.idNumber || newCustomer.idNumber || ''
         })
       });
 
@@ -404,6 +408,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
           customerPhotoUrl: ticketDetails.customerPhotoUrl || '',
           idImageUrl: ticketDetails.idImageUrl || '',
           vehiclePhotoUrl: ticketDetails.vehiclePhotoUrl || '',
+          loadPhotoUrl: ticketDetails.loadPhotoUrl || '',
           signatureUrl: ticketDetails.signatureUrl || '',
           ohioDatabaseStatus: ticketDetails.ohioDatabaseStatus || 'not_checked'
         }
@@ -516,7 +521,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       })),
       totalAmount,
       status: 'completed',
-      timestamp: new Date().toISOString(),
+      timestamp: ticketDetails.customTimestamp ? new Date(ticketDetails.customTimestamp).toISOString() : new Date().toISOString(),
       ...ticketDetails
     };
     setLastCreatedTicket(previewTicket);
@@ -570,7 +575,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
   const totalAmount = items.reduce((sum, i) => sum + i.totalAmount, 0);
   const totalWeight = items.reduce((sum, i) => sum + i.netWeight, 0);
 
-  const handleNext = () => {
+  const handleNext = async () => {
     if (step === 1) {
       if (!selectedCustomer && (!isNewCustomer || !newCustomer.name)) return;
       // Check DNB
@@ -615,6 +620,25 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       setStep(2);
     } else if (step === 2) {
       if (items.some(i => !i.material || i.netWeight <= 0)) return;
+
+      const sellerIdNum = isNewCustomer ? (newCustomer.idNumber || '') : (selectedCustomer?.idNumber || '');
+      const bName = isNewCustomer ? (newCustomer.businessName || '') : (selectedCustomer?.businessName || '');
+
+      const catalyticCheck = await checkCatalyticConverterLimit(
+        items,
+        materials,
+        sellerIdNum,
+        bName,
+        db,
+        selectedCustomer?.id,
+        customers
+      );
+
+      if (!catalyticCheck.allowed) {
+        alert(catalyticCheck.errorMessage);
+        return;
+      }
+
       setStep(3);
     } else if (step === 3) {
       // Compliance check: vehicle license plate and vehicle photo captured
@@ -654,6 +678,25 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
   const saveTicket = async () => {
     setQtProcessing(true);
     try {
+      const sellerIdNum = isNewCustomer ? (newCustomer.idNumber || '') : (selectedCustomer?.idNumber || '');
+      const bName = isNewCustomer ? (newCustomer.businessName || '') : (selectedCustomer?.businessName || '');
+
+      const catalyticCheck = await checkCatalyticConverterLimit(
+        items,
+        materials,
+        sellerIdNum,
+        bName,
+        db,
+        selectedCustomer?.id,
+        customers
+      );
+
+      if (!catalyticCheck.allowed) {
+        alert(catalyticCheck.errorMessage);
+        setQtProcessing(false);
+        return;
+      }
+
       let customerId = selectedCustomer?.id;
 
       if (isNewCustomer && !customerId) {
@@ -689,13 +732,16 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
         materials: ticketMaterials,
         totalAmount,
         status: 'completed',
-        timestamp: new Date().toISOString(),
+        timestamp: ticketDetails.customTimestamp ? new Date(ticketDetails.customTimestamp).toISOString() : new Date().toISOString(),
+        businessName: bName,
+        idNumber: sellerIdNum,
         vehiclePlate: ticketDetails.vehiclePlate || '',
         vehicleType: ticketDetails.vehicleType || '',
         paymentMethod: ticketDetails.paymentMethod || 'cash',
         notes: ticketDetails.notes || '',
         customerPhotoUrl: ticketDetails.customerPhotoUrl || '',
         vehiclePhotoUrl: ticketDetails.vehiclePhotoUrl || '',
+        loadPhotoUrl: ticketDetails.loadPhotoUrl || '',
         idImageUrl: ticketDetails.idImageUrl || '',
         signatureUrl: ticketDetails.signatureUrl || '',
         sellerAffirmed: !!(ticketDetails.signatureUrl),
@@ -758,6 +804,19 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
           ...customerUpdate,
           updatedAt: new Date().toISOString()
         });
+
+        if (selectedCustomer) {
+          const initialGaps = getCustomerDataGaps(selectedCustomer);
+          const updatedCustomerObj = {
+            ...selectedCustomer,
+            photoUrl: customerUpdate.photoUrl || selectedCustomer.photoUrl,
+            idImageUrl: customerUpdate.idImageUrl || selectedCustomer.idImageUrl
+          };
+          const remainingGaps = getCustomerDataGaps(updatedCustomerObj);
+          if (initialGaps.length > 0 && remainingGaps.length === 0) {
+            showToastSuccess('Profile Complete', `${selectedCustomer.name}'s file is now complete. Run Data Repair in Settings to update their older tickets.`);
+          }
+        }
       }
       setLastCreatedTicket({ id: docRef.id, ...ticketData });
 
@@ -887,7 +946,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
     setNewCustomer({ name: '', phone: '', address: '', businessName: '', idNumber: '', idType: '', idExpiration: '' });
     setIsNewCustomer(false);
     setItems([{ id: Math.random().toString(36).substr(2, 9), materialId: '', material: null, grossWeight: 0, tareWeight: 0, netWeight: 0, pricePerUnit: 0, totalAmount: 0, materialSearch: '', isDropdownOpen: false }]);
-    setTicketDetails({ vehiclePlate: '', vehicleType: '', paymentMethod: 'cash', notes: '', customerPhotoUrl: '', signatureUrl: '', idImageUrl: '', vehiclePhotoUrl: '', ohioDatabaseStatus: 'not_checked' });
+    setTicketDetails({ vehiclePlate: '', vehicleType: '', paymentMethod: 'cash', notes: '', customTimestamp: '', customerPhotoUrl: '', signatureUrl: '', idImageUrl: '', vehiclePhotoUrl: '', loadPhotoUrl: '', ohioDatabaseStatus: 'not_checked' });
     setIdImageSource('new');
     setLightboxUrl(null);
     setQtSuccess(false);
@@ -1074,7 +1133,14 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                           />
                         </div>
                         <div className="space-y-1">
-                          <label className="text-[10px] font-bold text-slate-500 uppercase">Business Name (Optional)</label>
+                          <label className="text-[10px] font-bold text-slate-500 uppercase flex items-center justify-between">
+                            <span>Business Name</span>
+                            {items.some(i => isCatalyticConverterMat(i.material || materials.find(m => m.id === i.materialId))) ? (
+                              <span className="text-rose-600 font-extrabold">* Required for Cat Converters</span>
+                            ) : (
+                              <span>(Optional)</span>
+                            )}
+                          </label>
                           <input 
                             className="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-sm"
                             value={newCustomer.businessName}
@@ -1197,28 +1263,59 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                       )}
                       {selectedCustomer && (
                         <div className="space-y-4 animate-in fade-in duration-250">
-                          <div className="p-4 bg-blue-50 border border-blue-100 rounded-xl flex items-center justify-between gap-4">
-                            <div className="flex items-center gap-4">
-                              <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center text-blue-600 shadow-sm">
-                                <User className="w-6 h-6" />
+                          <div className="p-4 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
+                            <div className="flex items-center justify-between gap-4">
+                              <div className="flex items-center gap-4">
+                                <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center text-blue-600 shadow-sm shrink-0">
+                                  <User className="w-6 h-6" />
+                                </div>
+                                <div>
+                                  <p className="font-bold text-blue-900">{selectedCustomer.name}</p>
+                                  <p className="text-xs text-blue-600">{selectedCustomer.phone || 'No phone'} • {selectedCustomer.address || 'No address'}</p>
+                                </div>
                               </div>
-                              <div>
-                                <p className="font-bold text-blue-900">{selectedCustomer.name}</p>
-                                <p className="text-xs text-blue-600">{selectedCustomer.phone || 'No phone'} • {selectedCustomer.address || 'No address'}</p>
-                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedCustomer(null);
+                                  setCustomerSearch('');
+                                }}
+                                className="p-1.5 text-slate-400 hover:text-slate-600 bg-white hover:bg-slate-50 border border-slate-200 rounded-full transition-colors shrink-0"
+                                title="Clear customer"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
                             </div>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setSelectedCustomer(null);
-                                setCustomerSearch('');
-                              }}
-                              className="p-1.5 text-slate-400 hover:text-slate-600 bg-white hover:bg-slate-50 border border-slate-200 rounded-full transition-colors shrink-0"
-                              title="Clear customer"
-                            >
-                              <X className="w-4 h-4" />
-                            </button>
+
+                            <div className="pt-2 border-t border-blue-100">
+                              <label className="text-[10px] font-bold text-slate-500 uppercase flex items-center justify-between mb-1">
+                                <span>Business Name</span>
+                                {items.some(i => isCatalyticConverterMat(i.material || materials.find(m => m.id === i.materialId))) ? (
+                                  <span className="text-rose-600 font-extrabold">* Required for Cat Converters</span>
+                                ) : (
+                                  <span className="text-slate-400 font-normal">(Optional)</span>
+                                )}
+                              </label>
+                              <input 
+                                type="text"
+                                className="w-full px-3 py-1.5 bg-white border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-xs font-semibold text-slate-900"
+                                value={selectedCustomer.businessName || ''}
+                                onChange={e => setSelectedCustomer({ ...selectedCustomer, businessName: e.target.value })}
+                                placeholder="Business Name..."
+                              />
+                            </div>
                           </div>
+
+                          {(() => {
+                            const gaps = getCustomerDataGaps(selectedCustomer);
+                            if (gaps.length === 0) return null;
+                            return (
+                              <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 font-medium flex items-center gap-2">
+                                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                                <span>This customer's file is missing: <strong>{gaps.join(', ')}</strong>. Capture them during this ticket to bring their record up to date.</span>
+                              </div>
+                            );
+                          })()}
 
                           <div className="p-6 bg-slate-50 rounded-2xl border border-slate-200 space-y-2">
                             <h5 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -1391,39 +1488,6 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                             </button>
                           </div>
                         </div>
-
-                        {/* Credentials helper */}
-                        <div className="space-y-1.5 border-t sm:border-t-0 sm:border-l border-slate-200 sm:pl-3 pt-3 sm:pt-0">
-                          <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Portal Credentials (Click to copy)</p>
-                          <div className="grid grid-cols-1 gap-1 text-[11px]">
-                            <div className="flex items-center justify-between px-2.5 py-1.5 bg-white rounded-lg border border-slate-200 font-semibold text-slate-700">
-                              <span className="truncate">User: <span className="font-mono font-bold text-slate-900">{settings.ohioScrapUsername || 'Not Configured'}</span></span>
-                              {settings.ohioScrapUsername && (
-                                <button
-                                  type="button"
-                                  onClick={() => navigator.clipboard.writeText(settings.ohioScrapUsername)}
-                                  className="p-0.5 hover:bg-slate-100 rounded border border-slate-200 text-slate-500 hover:text-slate-700 transition-all shrink-0 ml-1.5"
-                                  title="Copy Username"
-                                >
-                                  <Copy className="w-2.5 h-2.5" />
-                                </button>
-                              )}
-                            </div>
-                            <div className="flex items-center justify-between px-2.5 py-1.5 bg-white rounded-lg border border-slate-200 font-semibold text-slate-700">
-                              <span className="truncate">Pass: <span className="font-mono font-bold text-slate-900">{settings.ohioScrapPassword ? '••••••••' : 'Not Configured'}</span></span>
-                              {settings.ohioScrapPassword && (
-                                <button
-                                  type="button"
-                                  onClick={() => navigator.clipboard.writeText(settings.ohioScrapPassword)}
-                                  className="p-0.5 hover:bg-slate-100 rounded border border-slate-200 text-slate-500 hover:text-slate-700 transition-all shrink-0 ml-1.5"
-                                  title="Copy Password"
-                                >
-                                  <Copy className="w-2.5 h-2.5" />
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        </div>
                       </div>
 
                       <div className="flex flex-wrap gap-2 pt-1">
@@ -1554,6 +1618,12 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                           <div className="space-y-1 relative">
                             <label className="text-[10px] font-bold text-slate-500 uppercase">Material</label>
                             <div className="relative">
+                              {isCatalyticConverterMat(item.material || materials.find(m => m.id === item.materialId)) && (
+                                <div className="p-2.5 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-2 text-amber-900 text-xs font-medium mb-2">
+                                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                                  <span><strong>Ohio Law Notice (ORC 4737.04(F)(5)):</strong> Limit of <strong>1 catalytic converter per person per day</strong>. Tied to seller's ID number.</span>
+                                </div>
+                              )}
                               <input
                                 type="text"
                                 autoFocus={index > 0 && index === items.length - 1}
@@ -1805,7 +1875,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                     Additional Ticket Details
                   </h4>
 
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                     <div className="space-y-4">
                       <div className="space-y-1">
                         <label className="text-[10px] font-bold text-slate-500 uppercase">Vehicle Plate</label>
@@ -1856,6 +1926,31 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                       />
                     </div>
 
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-bold text-slate-500 uppercase flex items-center justify-between">
+                        <span>Load Photo</span>
+                        {ticketDetails.loadPhotoUrl ? (
+                          <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-black uppercase">Captured</span>
+                        ) : (
+                          <span className="text-[8px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-black uppercase">Optional</span>
+                        )}
+                      </label>
+                      <CameraCapture 
+                        label="Take Load Photo"
+                        onCapture={(url) => {
+                          setTicketDetails({ ...ticketDetails, loadPhotoUrl: url });
+                        }}
+                        networkUrl={settings.useSwannCams ? settings.swannCams.scale : undefined}
+                        className="aspect-video w-full rounded-xl overflow-hidden"
+                      />
+                      <p className="text-[10px] text-slate-500 mt-1">Photo of the materials at the scale.</p>
+                      {!ticketDetails.loadPhotoUrl && (
+                        <p className="text-[10px] font-medium text-amber-700 bg-amber-50 p-1.5 rounded border border-amber-200 mt-1">
+                          No load photo — the seller photo will be used for state reporting.
+                        </p>
+                      )}
+                    </div>
+
                     <div className="space-y-4">
                       <div className="space-y-1">
                         <label className="text-[10px] font-bold text-slate-500 uppercase">Payment Method</label>
@@ -1876,6 +1971,23 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                             </button>
                           ))}
                         </div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-center">
+                          <label className="text-[10px] font-bold text-slate-500 uppercase flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-blue-500" />
+                            Transaction Date & Time
+                          </label>
+                          <span className="text-[9px] font-bold text-slate-400 uppercase">
+                            {ticketDetails.customTimestamp ? 'Custom' : 'Real-Time'}
+                          </span>
+                        </div>
+                        <input 
+                          type="datetime-local"
+                          className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 text-sm font-bold text-slate-800"
+                          value={ticketDetails.customTimestamp}
+                          onChange={e => setTicketDetails({...ticketDetails, customTimestamp: e.target.value})}
+                        />
                       </div>
                       <div className="space-y-1">
                         <label className="text-[10px] font-bold text-slate-500 uppercase">Ticket Notes</label>
@@ -2204,6 +2316,10 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                     <p className="text-[10px] font-bold text-slate-400 uppercase">Items</p>
                     {(lastCreatedTicket.materials || []).map((item, idx) => {
                       const material = materials.find(m => m.id === item.materialId);
+                      const displayNetWeight = (item.netWeight || 0) - (item.deductionWeight || 0);
+                      const itemTotal = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0)
+                        ? item.totalAmount
+                        : (displayNetWeight * (item.pricePerUnit || 0));
                       return (
                         <div key={idx} className="space-y-1 border-b border-slate-50 pb-2 last:border-0">
                           <div className="flex justify-between gap-4 text-[11px]">
@@ -2212,7 +2328,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                               <span className="font-bold">{material?.name || 'N/A'}</span>
                             </div>
                             <div className="text-right font-bold">
-                              ${item.totalAmount.toFixed(2)}
+                              ${itemTotal.toFixed(2)}
                             </div>
                           </div>
                           <div className="flex justify-between text-[9px] text-slate-500 pl-5">
@@ -2220,7 +2336,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                               {item.netWeight} lb
                               {item.deductionWeight ? ` (Ded: -${item.deductionWeight} lb)` : ''}
                             </span>
-                            <span>@ ${item.pricePerUnit.toFixed(2)}/lb</span>
+                            <span>@ ${(item.pricePerUnit || 0).toFixed(2)}/lb</span>
                           </div>
                           {item.notes && (
                             <p className="text-[9px] text-slate-400 italic pl-5">Note: {item.notes}</p>
@@ -2233,7 +2349,19 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                   <div className="flex justify-between gap-4 text-base border-t border-slate-900 pt-3 mt-4">
                     <span className="font-black uppercase">Total Weight</span>
                     <span className="font-black">
-                      {(lastCreatedTicket.materials || []).reduce((sum, m) => sum + (m.netWeight - (m.deductionWeight || 0)), 0)} lb
+                      {(lastCreatedTicket.materials || []).reduce((sum, m) => sum + ((m.netWeight || 0) - (m.deductionWeight || 0)), 0)} lb
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-4 text-xl border-t-2 border-slate-900 pt-4 mt-4">
+                    <span className="font-black uppercase">Total Payout</span>
+                    <span className="font-black">
+                      ${((lastCreatedTicket.totalAmount !== undefined && lastCreatedTicket.totalAmount > 0)
+                        ? lastCreatedTicket.totalAmount
+                        : (lastCreatedTicket.materials || []).reduce((sum, m) => {
+                            const net = (m.netWeight || 0) - (m.deductionWeight || 0);
+                            return sum + (m.totalAmount || (net * (m.pricePerUnit || 0)));
+                          }, 0)
+                      ).toFixed(2)}
                     </span>
                   </div>
                 </div>
@@ -2380,37 +2508,47 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                   );
                 }
 
-                return filtered.map(c => (
-                  <div
-                    key={c.id}
-                    className="p-3 border border-slate-100 hover:border-slate-200 rounded-xl hover:bg-slate-50 flex items-center justify-between transition-all"
-                  >
-                    <div>
-                      <h4 className="font-black text-slate-900 text-xs">{c.name}</h4>
-                      <p className="text-[10px] text-slate-500 font-semibold mt-0.5">
-                        {c.phone || 'No Phone'} {c.address ? `• ${c.address}` : ''}
-                      </p>
-                      {c.businessName && (
-                        <div className="mt-1">
-                          <span className="px-1.5 py-0.5 bg-slate-100 text-slate-600 text-[8px] font-black uppercase rounded border border-slate-200">
-                            {c.businessName}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSelectedCustomer(c);
-                        setIsCustomerLookupOpen(false);
-                        setCustomerSearch('');
-                      }}
-                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 shadow-sm"
+                return filtered.map(c => {
+                  const gaps = getCustomerDataGaps(c);
+                  return (
+                    <div
+                      key={c.id}
+                      className="p-3 border border-slate-100 hover:border-slate-200 rounded-xl hover:bg-slate-50 flex items-center justify-between gap-3 transition-all"
                     >
-                      Select
-                    </button>
-                  </div>
-                ));
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h4 className="font-black text-slate-900 text-xs">{c.name}</h4>
+                          {gaps.length > 0 && (
+                            <span className="px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 text-[9px] font-bold rounded-full shrink-0">
+                              Needs {gaps.join(' + ')}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[10px] text-slate-500 font-semibold mt-0.5">
+                          {c.phone || 'No Phone'} {c.address ? `• ${c.address}` : ''}
+                        </p>
+                        {c.businessName && (
+                          <div className="mt-1">
+                            <span className="px-1.5 py-0.5 bg-slate-100 text-slate-600 text-[8px] font-black uppercase rounded border border-slate-200">
+                              {c.businessName}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedCustomer(c);
+                          setIsCustomerLookupOpen(false);
+                          setCustomerSearch('');
+                        }}
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 shadow-sm shrink-0"
+                      >
+                        Select
+                      </button>
+                    </div>
+                  );
+                });
               })()}
             </div>
           </div>

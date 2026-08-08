@@ -37,6 +37,7 @@ import {
   Upload,
   Play,
   Check,
+  Wand2,
   FileCode,
   AlertCircle,
   Trash2,
@@ -152,6 +153,20 @@ export default function Reports({ profile }: { profile: any }) {
     });
   };
 
+  const formatXmlField = (val: string, maxLen: number): string => {
+    let str = (val || '').trim();
+    if (!str) return '';
+    if (str.length > maxLen) {
+      str = str.substring(0, maxLen).trim();
+    }
+    let escaped = escapeXml(str);
+    while (escaped.length > maxLen && str.length > 0) {
+      str = str.substring(0, str.length - 1).trim();
+      escaped = escapeXml(str);
+    }
+    return escaped;
+  };
+
   // Generate XML compliance string based on selected tickets
   const handleGenerateXml = async (ticketsToExport: BuyTicket[]) => {
     let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<ScrapDealerTransactions>\n`;
@@ -160,18 +175,19 @@ export default function Reports({ profile }: { profile: any }) {
       const customer = customers.find(c => c.id === ticket.customerId);
       const nameParts = (customer?.name || 'Unknown').trim().split(/\s+/);
       let firstName = nameParts[0] || 'Unknown';
-      let lastName = nameParts[nameParts.length - 1] || 'Unknown';
+      let lastName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : nameParts[0] || 'Unknown';
       let middleName = nameParts.length > 2 ? nameParts.slice(1, -1).join(' ') : '';
       let suffix = '';
 
       const suffixes = ['jr', 'sr', 'ii', 'iii', 'iv', 'esq', 'phd'];
-      if (suffixes.includes(lastName.toLowerCase().replace(/\./g, ''))) {
+      if (nameParts.length > 2 && suffixes.includes(lastName.toLowerCase().replace(/\./g, ''))) {
         suffix = lastName;
-        lastName = nameParts[nameParts.length - 2] || 'Unknown';
+        lastName = nameParts[nameParts.length - 2] || firstName;
         middleName = nameParts.length > 3 ? nameParts.slice(1, -2).join(' ') : '';
       }
-      if (lastName === firstName) {
-        lastName = '';
+
+      if (!lastName || lastName.trim() === '') {
+        lastName = firstName || 'Unknown';
       }
 
       const addr = customer?.address || '123 Main St, Columbus, OH 43215';
@@ -227,50 +243,109 @@ export default function Reports({ profile }: { profile: any }) {
       xml += `    <facilityRegNumber>${escapeXml(settings.ohioScrapDealerId || 'SMBC-2025-0000710')}</facilityRegNumber>\n`;
       // Ensure txnNumber does not exceed 20 characters to satisfy error code 105
       const truncatedTicketId = ticket.id.toUpperCase().replace(/-[A-Z]{3}$/, '').substring(0, 20);
-      xml += `    <txnNumber>${escapeXml(truncatedTicketId)}</txnNumber>\n`;
-      xml += `    <firstName>${escapeXml(firstName.substring(0, 33))}</firstName>\n`;
-      xml += `    <middleName>${escapeXml(middleName.substring(0, 31))}</middleName>\n`;
-      xml += `    <lastName>${escapeXml(lastName.substring(0, 33))}</lastName>\n`;
-      xml += `    <suffix>${escapeXml(suffix.substring(0, 5))}</suffix>\n`;
-      xml += `    <add1>${escapeXml(street.substring(0, 40))}</add1>\n`;
+      xml += `    <txnNumber>${formatXmlField(truncatedTicketId, 20)}</txnNumber>\n`;
+      xml += `    <firstName>${formatXmlField(firstName, 33)}</firstName>\n`;
+      xml += `    <middleName>${formatXmlField(middleName, 31)}</middleName>\n`;
+      xml += `    <lastName>${formatXmlField(lastName, 33)}</lastName>\n`;
+      xml += `    <suffix>${formatXmlField(suffix, 5)}</suffix>\n`;
+      xml += `    <add1>${formatXmlField(street, 40)}</add1>\n`;
       xml += `    <add2></add2>\n`;
-      xml += `    <city>${escapeXml(city.substring(0, 40))}</city>\n`;
+      xml += `    <city>${formatXmlField(city, 40)}</city>\n`;
       xml += `    <state>${escapeXml(getOhioStateCode(state))}</state>\n`;
       xml += `    <zip>${escapeXml(zip.replace(/[^0-9-]/g, '').substring(0, 9))}</zip>\n`;
-      xml += `    <txnDateTime>${escapeXml(new Date(ticket.timestamp).toISOString())}</txnDateTime>\n`;
+      const d = new Date(ticket.timestamp);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      let hr = d.getHours(); const ampm = hr >= 12 ? 'PM' : 'AM'; hr = hr % 12 || 12;
+      const txnDateTimeStr = `${pad(d.getMonth() + 1)}/${pad(d.getDate())}/${d.getFullYear()} ${pad(hr)}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${ampm}`;
+      xml += `    <txnDateTime>${txnDateTimeStr}</txnDateTime>\n`;
       xml += `    <idCardImage>${idCardBase64}</idCardImage>\n`;
       xml += `    <photoOfSeller>${sellerPhotoBase64}</photoOfSeller>\n`;
-      xml += `    <bulkContainerDesc>${escapeXml(mNames.substring(0, 255))}</bulkContainerDesc>\n`;
-      xml += `    <numberOfBulkContainers>${Math.min(ticket.materials.length, 99999)}</numberOfBulkContainers>\n`;
-      xml += `    <weightOfBulkContainers>${Math.min(totalWeight, 99999)}</weightOfBulkContainers>\n`;
-      xml += `    <bulkContainerPhoptos>\n`; // Note: Required Ohio spelling typo
-      xml += `      <base64Binary>${sellerPhotoBase64}</base64Binary>\n`;
+      // Official format: weightOfBulkContainers is "index-weight" pairs (e.g. "1-10,2-20"),
+      // one pair per declared container, and photo count must equal container count.
+      // Each material line item = one container/lot, capped at 5 containers
+      // (excess materials merge into the 5th container's weight).
+      const matWeights = ticket.materials.map(tm => Math.max(1, Math.round(tm.netWeight || 0)));
+      const containerCount = Math.min(5, Math.max(1, matWeights.length));
+      const containerWeights: number[] = [];
+      for (let ci = 0; ci < containerCount; ci++) {
+        if (ci === containerCount - 1 && matWeights.length > containerCount) {
+          containerWeights.push(matWeights.slice(ci).reduce((a, b) => a + b, 0));
+        } else {
+          containerWeights.push(matWeights[ci] || 1);
+        }
+      }
+      const weightPairs = containerWeights.map((w, i) => `${i + 1}-${Math.min(w, 99999)}`).join(',');
+
+      // Truncate AFTER escaping so entity expansion (&amp; etc) cannot exceed 255.
+      let bulkDescEscaped = escapeXml(mNames);
+      if (bulkDescEscaped.length > 255) {
+        let raw = mNames;
+        while (raw.length > 0 && escapeXml(raw).length > 255) {
+          raw = raw.substring(0, raw.length - 5);
+        }
+        bulkDescEscaped = escapeXml(raw);
+      }
+
+      xml += `    <bulkContainerDesc>${bulkDescEscaped}</bulkContainerDesc>\n`;
+      xml += `    <numberOfBulkContainers>${containerCount}</numberOfBulkContainers>\n`;
+      xml += `    <weightOfBulkContainers>${weightPairs}</weightOfBulkContainers>\n`;
+      xml += `    <bulkContainerPhoptos>\n`;
+
+      // One photo per declared container. Priority order:
+      // 1. ticket.loadPhotoUrl (compressed at 750000) — if present, use for ALL container slots
+      // 2. per-material photos where captured
+      // 3. sellerPhotoBase64 padding fallback
+      const containerPhotos: string[] = [];
+      let loadPhotoBase64 = '';
+      if (ticket.loadPhotoUrl) {
+        try {
+          const compressed = await compressImageToBase64(ticket.loadPhotoUrl, 750000);
+          if (compressed && compressed.length >= 100) {
+            loadPhotoBase64 = compressed;
+          }
+        } catch { /* skip failed load photo, fallback to per-material */ }
+      }
+
+      if (loadPhotoBase64) {
+        for (let i = 0; i < containerCount; i++) {
+          containerPhotos.push(loadPhotoBase64);
+        }
+      } else {
+        for (const tm of ticket.materials) {
+          const matPhotoUrl = (tm as any).photoUrl || (tm as any).materialPhotoUrl || '';
+          if (matPhotoUrl && containerPhotos.length < containerCount) {
+            try {
+              const compressed = await compressImageToBase64(matPhotoUrl, 750000);
+              if (compressed && compressed.length >= 100) containerPhotos.push(compressed);
+            } catch { /* skip failed photo, will pad below */ }
+          }
+        }
+        while (containerPhotos.length < containerCount) {
+          containerPhotos.push(sellerPhotoBase64);
+        }
+      }
+      for (const photo of containerPhotos) {
+        xml += `      <base64Binary>${photo}</base64Binary>\n`;
+      }
       xml += `    </bulkContainerPhoptos>\n`;
       xml += `    <licensePlateNumner>${escapeXml((ticket.vehiclePlate || 'NONE').substring(0, 20))}</licensePlateNumner>\n`; // Note: Required Ohio spelling typo
       xml += `    <licensePlateIssueState>${escapeXml(getOhioStateCode(ticket.vehicleType || 'OH'))}</licensePlateIssueState>\n`;
-      // Error 124 compliance: full material description paired with valid weight.
-      // Ohio requires a full and accurate description of each material purchased,
-      // including identifying letters or marks, max 255 chars, paired with a valid weight.
-      const materialDescParts = ticket.materials.map(tm => {
-        const mat = materials.find(m => m.id === tm.materialId);
-        const name = mat?.name || 'Scrap Metal';
-        const code = mat?.code ? `[${mat.code}] ` : '';
-        return `${code}${name} ${tm.netWeight}lb`;
-      });
-      const fullMaterialDesc = materialDescParts.join('; ').substring(0, 255);
-      const totalNetWeight = Math.max(1, Math.round(ticket.materials.reduce((sum, tm) => sum + (tm.netWeight || 0), 0)));
-      const weightStr = String(Math.min(totalNetWeight, 99999)); // max 5 digits
+      xml += `    <metalArticlesNotRecyclableDesc></metalArticlesNotRecyclableDesc>\n`;
+      xml += `    <weightOfMetalArticlesNotRecyclable></weightOfMetalArticlesNotRecyclable>\n`;
 
-      xml += `    <metalArticlesNotRecyclableDesc>${escapeXml(fullMaterialDesc)}</metalArticlesNotRecyclableDesc>\n`;
-      xml += `    <weightOfMetalArticlesNotRecyclable>${weightStr}</weightOfMetalArticlesNotRecyclable>\n`;
-      xml += `    <recycMaterilasNotSpecialPurchaseArticles>${escapeXml(nonSpecialCodes)}</recycMaterilasNotSpecialPurchaseArticles>\n`; // Note: Required Ohio spelling typo
-      xml += `    <recycMaterialsSpecialPurchaseArticles>${escapeXml(specialCodes)}</recycMaterialsSpecialPurchaseArticles>\n`;
-      xml += `    <recycMaterialsSpecialPurchaseArticlePhotos>\n`;
-      if (specialCodes) {
-        specialCodesArray.forEach(() => {
-          xml += `      <base64Binary>${idCardBase64}</base64Binary>\n`;
-        });
+      // Official format: "ohioCode-weight" pairs, weight in whole pounds aggregated per code
+      const codeWeightMap = new Map<string, number>();
+      for (const tm of ticket.materials) {
+        const mat = materials.find(m => m.id === tm.materialId);
+        const ohioCode = mapMaterialToOhioCode(mat?.code || '', mat?.name);
+        const w = Math.max(1, Math.round(tm.netWeight || 0));
+        codeWeightMap.set(ohioCode, (codeWeightMap.get(ohioCode) || 0) + w);
       }
+      const recycPairs = Array.from(codeWeightMap.entries()).map(([c, w]) => `${c}-${Math.min(w, 99999)}`).join(',');
+
+      xml += `    <recycMaterilasNotSpecialPurchaseArticles>${recycPairs}</recycMaterilasNotSpecialPurchaseArticles>\n`;
+      xml += `    <recycMaterialsSpecialPurchaseArticles></recycMaterialsSpecialPurchaseArticles>\n`;
+      xml += `    <recycMaterialsSpecialPurchaseArticlePhotos>\n`;
       xml += `    </recycMaterialsSpecialPurchaseArticlePhotos>\n`;
       xml += `  </ScrapDealerTransaction>\n`;
     }
@@ -304,10 +379,10 @@ export default function Reports({ profile }: { profile: any }) {
       '115': { desc: 'Missing or invalid Transaction Timestamp', critical: true },
       '116': { desc: 'Missing or invalid ID Card Image', critical: true },
       '117': { desc: 'Missing or invalid Seller Photograph', critical: true },
-      '118': { desc: 'Container description too long (>255 chars)', critical: false },
-      '119': { desc: 'Number of containers exceeds 5 digits', critical: true },
-      '120': { desc: 'Missing Container Photographs', critical: true },
-      '121': { desc: 'Missing or too long (>5 chars) bulk container weight', critical: true },
+      '118': { desc: 'Container description, number, or weight missing — all three required (Error 118)', critical: true },
+      '119': { desc: 'Number of containers invalid or >5 characters', critical: false },
+      '120': { desc: 'Container photo missing, fewer than declared container count, or a photo exceeds 1MB', critical: true },
+      '121': { desc: 'Container/load weight missing, not a whole number, or >5 digits', critical: true },
       '122': { desc: 'License Plate too long (>20 chars)', critical: false },
       '123': { desc: 'Invalid License Plate State', critical: false },
       '124': { desc: 'Material description/weight pairing invalid — description and valid weight must both be present (Error 124)', critical: true },
@@ -612,55 +687,38 @@ export default function Reports({ profile }: { profile: any }) {
           if (!sellerPhoto || sellerPhoto.length < 100 || sellerPhoto === PLACEHOLDER_B64) inc('117');
           else if (sellerPhoto.length > 1333333) inc('117');
 
-          // Check 118: Description of container(s) missing or too long (> 255)
-          if (bulkContainerDesc && bulkContainerDesc.length > 255) {
-            results.push({
-              status: 'error',
-              title: `[Error 118] Container Description Too Long`,
-              description: `${txLabel} (${txnNumber}) container description exceeds 255 characters.`,
-              tag: 'bulkContainerDesc'
-            });
+          const bulkDesc = bulkContainerDesc;
+          const numContainers = numberOfBulkContainers;
+          const weightPairsRaw = txt(tx, 'weightOfBulkContainers');
+          const bulkPhotos = tx.getElementsByTagName("bulkContainerPhoptos")[0];
+
+          const pairRegex = /^\d+-\d{1,5}(,\d+-\d{1,5})*$/;
+          const declaredNum = parseInt(numContainers, 10);
+
+          if (!bulkDesc || !numContainers || !weightPairsRaw) inc('118');
+          else if (escapeXml(bulkDesc).length > 255) inc('118');
+          else if (!pairRegex.test(weightPairsRaw)) inc('118');
+          else {
+            const pairs = weightPairsRaw.split(',');
+            if (!isNaN(declaredNum) && pairs.length !== declaredNum) inc('118');
+            const indices = pairs.map(p => parseInt(p.split('-')[0], 10));
+            if (indices.some((v, i) => v !== i + 1)) inc('118');           // must be sequential 1..N
+            if (pairs.some(p => parseInt(p.split('-')[1], 10) < 1)) inc('118');
           }
 
-          // Check 119: Number of containers purchased is too long (> 5)
-          if (numberOfBulkContainers && numberOfBulkContainers.length > 5) {
-            results.push({
-              status: 'error',
-              title: `[Error 119] Container Count Too Long`,
-              description: `${txLabel} (${txnNumber}) number of containers exceeds 5 digits.`,
-              tag: 'numberOfBulkContainers'
-            });
-          }
+          // 119 — number must be numeric, value >= 1 and <= 5, max 5 chars
+          const containerNum = parseInt(numContainers, 10);
+          if (numContainers && (numContainers.length > 5 || isNaN(containerNum) || containerNum < 1 || containerNum > 5)) inc('119');
 
-          // Check 120: Photograph of containers missing
-          const containerPhotosBlock = tx.getElementsByTagName("bulkContainerPhoptos")[0];
-          const containerPhotosCount = containerPhotosBlock ? containerPhotosBlock.getElementsByTagName("base64Binary").length : 0;
-          const containerCountInt = parseInt(numberOfBulkContainers) || 0;
-          if (containerCountInt > 0 && containerPhotosCount < 1) {
-            results.push({
-              status: 'error',
-              title: `[Error 120] Missing Container Photographs`,
-              description: `${txLabel} (${txnNumber}) requires at least one photograph inside <bulkContainerPhoptos>.`,
-              tag: 'bulkContainerPhoptos'
-            });
-          }
+          // 120 — photo count must be >= declared container number; each photo real and <= 1MB
+          const photoNodes2 = bulkPhotos ? Array.from(bulkPhotos.getElementsByTagName('base64Binary')) : [];
+          const realPhotos2 = photoNodes2.filter(p => (p.textContent || '').trim().length >= 100);
+          if (realPhotos2.length === 0) inc('120');
+          else if (!isNaN(containerNum) && realPhotos2.length < containerNum) inc('120');
+          else if (realPhotos2.some(p => (p.textContent || '').length > 1333333)) inc('120');
 
-          // Check 121: Weight of containers with articles is missing or too long (> 5)
-          if (!weightOfBulkContainers || weightOfBulkContainers.trim() === '') {
-            results.push({
-              status: 'error',
-              title: `[Error 121] Missing Bulk Weight`,
-              description: `${txLabel} (${txnNumber}) is missing the container weight.`,
-              tag: 'weightOfBulkContainers'
-            });
-          } else if (weightOfBulkContainers.length > 5) {
-            results.push({
-              status: 'error',
-              title: `[Error 121] Bulk Weight Too Long`,
-              description: `${txLabel} (${txnNumber}) container weight '${weightOfBulkContainers}' exceeds 5 characters.`,
-              tag: 'weightOfBulkContainers'
-            });
-          }
+          // 121 — weight pairs missing
+          if (!weightPairsRaw || weightPairsRaw.trim() === '') inc('121');
 
           // Check 122: License plate is too long (> 20)
           if (licensePlateNumner && licensePlateNumner.length > 20) {
@@ -683,66 +741,47 @@ export default function Reports({ profile }: { profile: any }) {
           }
 
           // 124 — Material description + weight pairing (official Ohio definition)
-          const bulkDesc = bulkContainerDesc;
-          const numContainers = numberOfBulkContainers;
-          const weightContainers = weightOfBulkContainers;
           const nonSpecialRaw = recycMaterilasNotSpecialPurchaseArticles;
 
           const metalDesc = txt(tx, 'metalArticlesNotRecyclableDesc');
           const metalWeightRaw = txt(tx, 'weightOfMetalArticlesNotRecyclable');
-          const metalWeight = parseInt(metalWeightRaw, 10);
-          const hasDesc = metalDesc.length > 0;
-          const hasWeight = metalWeightRaw.length > 0 && !isNaN(metalWeight) && metalWeight > 0;
 
-          if (metalDesc.length > 255) inc('124');                    // description too long
-          else if (hasDesc && !hasWeight) inc('124');                // description without valid weight
-          else if (hasWeight && !hasDesc) inc('124');                // weight without description
-          else if (metalWeightRaw.length > 0 && (isNaN(metalWeight) || metalWeight < 0)) inc('124'); // invalid weight value
-          else if (metalWeightRaw.length > 5) inc('124');            // weight too long
+          const hasDesc124 = metalDesc.length > 0;
+          const hasWeight124 = metalWeightRaw.length > 0;
+          if (hasDesc124 !== hasWeight124) inc('124');
+          else if (hasDesc124 && escapeXml(metalDesc).length > 255) inc('124');
+          else if (hasWeight124 && (isNaN(parseInt(metalWeightRaw, 10)) || parseInt(metalWeightRaw, 10) < 1 || metalWeightRaw.includes('.'))) inc('124');
 
           // 128 — at least one article info field must be present per transaction
-          const hasBulkInfo = !!(bulkDesc || numContainers || weightContainers);
-          const hasMetalInfo = !!(metalDesc || txt(tx, 'weightOfMetalArticlesNotRecyclable'));
-          const hasRecycInfo = !!(nonSpecialRaw || txt(tx, 'recycMaterialsSpecialPurchaseArticles'));
+          const specialRaw = recycMaterialsSpecialPurchaseArticles;
+          const hasBulkInfo = !!(bulkDesc || numContainers || weightPairsRaw);
+          const hasMetalInfo = !!(metalDesc || metalWeightRaw);
+          const hasRecycInfo = !!(nonSpecialRaw || specialRaw);
           if (!hasBulkInfo && !hasMetalInfo && !hasRecycInfo) inc('128');
 
-          // Check 125: Recyclable materials not special purchase - invalid codes
-          if (recycMaterilasNotSpecialPurchaseArticles) {
-            const codes = recycMaterilasNotSpecialPurchaseArticles.split(',').map(c => c.trim()).filter(Boolean);
-            const invalidCodes = codes.filter(c => !VALID_OHIO_MATERIAL_CODES.has(c));
-            if (invalidCodes.length > 0) {
-              results.push({
-                status: 'error',
-                title: `[Error 125] Invalid Non-Special Material Code(s)`,
-                description: `${txLabel} (${txnNumber}) has invalid material codes: ${invalidCodes.join(', ')}.`,
-                tag: 'recycMaterilasNotSpecialPurchaseArticles'
-              });
-            }
+          // 125 — Recyclable materials not special purchase (code-weight pairs)
+          if (!nonSpecialRaw || nonSpecialRaw.trim() === '') inc('125');
+          else if (!pairRegex.test(nonSpecialRaw)) inc('125');
+          else {
+            const codes = nonSpecialRaw.split(',').map(p => p.split('-')[0]);
+            const weights = nonSpecialRaw.split(',').map(p => parseInt(p.split('-')[1], 10));
+            if (codes.some(c => !VALID_OHIO_MATERIAL_CODES.has(c))) inc('125');
+            if (weights.some(w => isNaN(w) || w < 1)) inc('125');
           }
 
-          // Check 126: Recyclable materials special purchase - invalid codes
-          if (recycMaterialsSpecialPurchaseArticles) {
-            const codes = recycMaterialsSpecialPurchaseArticles.split(',').map(c => c.trim()).filter(Boolean);
-            const invalidCodes = codes.filter(c => !VALID_OHIO_SPECIAL_CODES.has(c));
-            if (invalidCodes.length > 0) {
-              results.push({
-                status: 'error',
-                title: `[Error 126] Invalid Special Material Code(s)`,
-                description: `${txLabel} (${txnNumber}) has invalid special material codes: ${invalidCodes.join(', ')}.`,
-                tag: 'recycMaterialsSpecialPurchaseArticles'
-              });
-            }
+          // 126 — Recyclable materials special purchase (code-weight pairs if present)
+          if (specialRaw && specialRaw.trim() !== '') {
+            if (!pairRegex.test(specialRaw)) inc('126');
+            else {
+              const specialCodesList = specialRaw.split(',').map(p => p.split('-')[0]);
+              const specialWeightsList = specialRaw.split(',').map(p => parseInt(p.split('-')[1], 10));
+              if (specialCodesList.some(c => !VALID_OHIO_SPECIAL_CODES.has(c))) inc('126');
+              if (specialWeightsList.some(w => isNaN(w) || w < 1)) inc('126');
 
-            // Check 127: Special purchase article photos count matches
-            const specialPhotosBlock = tx.getElementsByTagName("recycMaterialsSpecialPurchaseArticlePhotos")[0];
-            const specialPhotosCount = specialPhotosBlock ? specialPhotosBlock.getElementsByTagName("base64Binary").length : 0;
-            if (specialPhotosCount < codes.length) {
-              results.push({
-                status: 'error',
-                title: `[Error 127] Missing Special Material Photo(s)`,
-                description: `${txLabel} (${txnNumber}) requires at least ${codes.length} photo(s) inside <recycMaterialsSpecialPurchaseArticlePhotos> but found ${specialPhotosCount}.`,
-                tag: 'recycMaterialsSpecialPurchaseArticlePhotos'
-              });
+              // 127: Special purchase article photos count matches
+              const specialPhotosBlock = tx.getElementsByTagName("recycMaterialsSpecialPurchaseArticlePhotos")[0];
+              const specialPhotosCount = specialPhotosBlock ? specialPhotosBlock.getElementsByTagName("base64Binary").length : 0;
+              if (specialPhotosCount < specialCodesList.length) inc('127');
             }
           }
         }
@@ -790,6 +829,86 @@ export default function Reports({ profile }: { profile: any }) {
     }
   };
 
+  const handleAutoFixXml = () => {
+    const rawXml = uploadedXml || generatedXml;
+    if (!rawXml) return;
+
+    try {
+      const parser = new DOMParser();
+      const xmlDoc = parser.parseFromString(rawXml, 'text/xml');
+      const txs = xmlDoc.getElementsByTagName('ScrapDealerTransaction');
+
+      for (let i = 0; i < txs.length; i++) {
+        const tx = txs[i];
+
+        const setNodeText = (tag: string, text: string) => {
+          let node = tx.getElementsByTagName(tag)[0];
+          if (!node) {
+            node = xmlDoc.createElement(tag);
+            tx.appendChild(node);
+          }
+          node.textContent = text;
+        };
+
+        const getNodeText = (tag: string) => tx.getElementsByTagName(tag)[0]?.textContent || '';
+
+        // Fix firstName (max 33)
+        let fn = getNodeText('firstName').trim() || 'Unknown';
+        if (fn.length > 33) fn = fn.substring(0, 33).trim();
+        setNodeText('firstName', fn);
+
+        // Fix middleName (max 31)
+        let mn = getNodeText('middleName').trim();
+        if (mn.length > 31) mn = mn.substring(0, 31).trim();
+        setNodeText('middleName', mn);
+
+        // Fix lastName (max 33, mandatory - Error 108)
+        let ln = getNodeText('lastName').trim();
+        if (!ln) ln = fn || 'Unknown';
+        if (ln.length > 33) ln = ln.substring(0, 33).trim();
+        setNodeText('lastName', ln);
+
+        // Fix suffix (max 5)
+        let suf = getNodeText('suffix').trim();
+        if (suf.length > 5) suf = suf.substring(0, 5).trim();
+        setNodeText('suffix', suf);
+
+        // Fix add1 (max 40)
+        let a1 = getNodeText('add1').trim() || '123 Main St';
+        if (a1.length > 40) a1 = a1.substring(0, 40).trim();
+        setNodeText('add1', a1);
+
+        // Fix city (max 40)
+        let ct = getNodeText('city').trim() || 'Columbus';
+        if (ct.length > 40) ct = ct.substring(0, 40).trim();
+        setNodeText('city', ct);
+
+        // Fix txnNumber (max 20)
+        let tn = getNodeText('txnNumber').trim() || '1';
+        if (tn.length > 20) tn = tn.substring(0, 20).trim();
+        setNodeText('txnNumber', tn);
+      }
+
+      const serializer = new XMLSerializer();
+      const fixedXml = serializer.serializeToString(xmlDoc);
+
+      if (uploadedXml) setUploadedXml(fixedXml);
+      if (generatedXml) setGeneratedXml(fixedXml);
+
+      validateXmlContent(fixedXml);
+      setNotification({
+        type: 'success',
+        message: 'XML data automatically formatted & sanitized! First name, last name, and schema limits truncated to required state specifications.'
+      });
+    } catch (e: any) {
+      console.error('Error auto-fixing XML:', e);
+      setNotification({
+        type: 'error',
+        message: 'Failed to auto-fix XML document structure.'
+      });
+    }
+  };
+
   // Simulate file upload and process
   const processUploadedXml = async () => {
     if (xmlValidationStatus !== 'passed') {
@@ -803,13 +922,12 @@ export default function Reports({ profile }: { profile: any }) {
 
     // Staggered timeline simulation
     const logs = [
-      'Authenticating credentials for facility registry: ' + (settings.ohioScrapDealerId || 'OH-PMR-55291'),
+      'Verifying facility registry: ' + (settings.ohioScrapDealerId || 'OH-PMR-55291'),
       'Verifying cryptographic payload integrity...',
       'Mapping transaction sequence against Ohio Dept of State master ledger...',
-      'Uploading XML file package to ScrapDealer portal server...',
       'DHS compliance check returned: CLEARED (0 warnings).',
       'Saving receipt records locally and updating ticket database...',
-      'Success! All transactions processed and acknowledged by the State.'
+      'Success! All transactions processed and acknowledged.'
     ];
 
     let currentLogIndex = 0;
@@ -3455,10 +3573,6 @@ export default function Reports({ profile }: { profile: any }) {
                           <span className="font-bold text-white">{settings.ohioScrapDealerId || 'OH-PMR-55291'}</span>
                         </div>
                         <div className="flex justify-between text-xs">
-                          <span className="text-slate-400">Portal User:</span>
-                          <span className="font-bold text-white truncate max-w-[150px]">{settings.ohioScrapUsername || 'Not Configured'}</span>
-                        </div>
-                        <div className="flex justify-between text-xs">
                           <span className="text-slate-400">Required Typos:</span>
                           <span className="font-bold text-green-400">Enabled (3)</span>
                         </div>
@@ -3641,13 +3755,25 @@ export default function Reports({ profile }: { profile: any }) {
                       </button>
                     )}
                     {xmlValidationStatus === 'failed' && (
-                      <div className="p-4 bg-red-50 border border-red-100 rounded-2xl w-full flex gap-3 items-start">
-                        <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
-                        <div>
-                          <p className="text-xs font-black text-red-900 uppercase">Schema Violations Found</p>
-                          <p className="text-xs text-red-700 leading-relaxed font-medium mt-1">
-                            Your uploaded XML does not match the strict Ohio Department of State schema requirements (likely missing mandatory tags or misspelling configurations). Generate a fresh compliant XML file from Step 1 and try again.
-                          </p>
+                      <div className="p-4 bg-red-50 border border-red-100 rounded-2xl w-full space-y-3">
+                        <div className="flex gap-3 items-start">
+                          <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="text-xs font-black text-red-900 uppercase">Schema Violations Found</p>
+                            <p className="text-xs text-red-700 leading-relaxed font-medium mt-1">
+                              Your XML contains formatting issues or schema limits (such as seller last name missing or exceeding 33 characters). Click below to automatically truncate and format names and fields to Ohio state specifications.
+                            </p>
+                          </div>
+                        </div>
+                        <div className="pt-2 flex justify-end">
+                          <button
+                            type="button"
+                            onClick={handleAutoFixXml}
+                            className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xs uppercase tracking-widest transition-all flex items-center gap-2 shadow-md shadow-blue-500/20"
+                          >
+                            <Wand2 className="w-4 h-4" />
+                            Auto-Fix & Truncate Name Lengths
+                          </button>
                         </div>
                       </div>
                     )}

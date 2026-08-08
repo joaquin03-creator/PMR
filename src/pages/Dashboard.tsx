@@ -32,10 +32,12 @@ import {
   Check,
   ExternalLink,
   Copy,
-  Camera
+  Camera,
+  AlertTriangle
 } from 'lucide-react';
-import { cn, generateTicketId } from '../lib/utils';
-import { Link } from 'react-router-dom';
+import { cn, generateTicketId, getCustomerDataGaps } from '../lib/utils';
+import { Link, useNavigate } from 'react-router-dom';
+import { ArcGauge } from '../components/ArcGauge';
 import ManagerPinModal from '../components/ManagerPinModal';
 import BuyTicketModal from '../components/BuyTicketModal';
 import { CameraCapture } from '../components/CameraCapture';
@@ -117,7 +119,7 @@ interface DashboardProps {
 }
 
 export default function Dashboard({ profile }: DashboardProps) {
-  const { firestore, error: toastError } = useToast();
+  const { firestore, success, error: toastError } = useToast();
   const { settings } = useSettings();
   const { scan, isScanning } = useIDScanner();
 
@@ -198,6 +200,16 @@ export default function Dashboard({ profile }: DashboardProps) {
     return 'none';
   }, [complianceSubmissions, yesterdayInfo]);
 
+  const incompleteCustomersWithTickets = useMemo(() => {
+    const completedCustomerIds = new Set(
+      buyTickets.filter(t => t.status === 'completed' && t.customerId).map(t => t.customerId)
+    );
+    return customers.filter(c => {
+      if (!completedCustomerIds.has(c.id)) return false;
+      return getCustomerDataGaps(c).length > 0;
+    });
+  }, [buyTickets, customers]);
+
   const handleMarkDnbUpdated = async () => {
     if (profile?.role !== 'manager') return;
     try {
@@ -230,6 +242,38 @@ export default function Dashboard({ profile }: DashboardProps) {
     }
   };
   
+  const navigate = useNavigate();
+
+  // Floating Compliance Stack State
+  const [complianceDismissals, setComplianceDismissals] = useState<Record<string, string>>(() => {
+    try {
+      const d = localStorage.getItem('pmr_compliance_dismissals');
+      return d ? JSON.parse(d) : {};
+    } catch { return {}; }
+  });
+
+  const [complianceSnoozes, setComplianceSnoozes] = useState<Record<string, number>>(() => {
+    try {
+      const s = localStorage.getItem('pmr_compliance_snoozes');
+      return s ? JSON.parse(s) : {};
+    } catch { return {}; }
+  });
+
+  const [isComplianceStackExpanded, setIsComplianceStackExpanded] = useState(false);
+
+  const dismissAmberCard = (cardId: string) => {
+    const updated = { ...complianceDismissals, [cardId]: todayLocalDateString };
+    setComplianceDismissals(updated);
+    localStorage.setItem('pmr_compliance_dismissals', JSON.stringify(updated));
+  };
+
+  const snoozeRedCard = (cardId: string) => {
+    const snoozeUntil = Date.now() + 3600000; // 1 hour
+    const updated = { ...complianceSnoozes, [cardId]: snoozeUntil };
+    setComplianceSnoozes(updated);
+    localStorage.setItem('pmr_compliance_snoozes', JSON.stringify(updated));
+  };
+
   // Quick Ticket State
   const [showQuickTicket, setShowQuickTicket] = useState(false);
   const [showFullTicket, setShowFullTicket] = useState(false);
@@ -260,6 +304,7 @@ export default function Dashboard({ profile }: DashboardProps) {
   const [isPreviewOnly, setIsPreviewOnly] = useState(false);
   const [qtCustomerPhotoUrl, setQtCustomerPhotoUrl] = useState('');
   const [qtVehiclePhotoUrl, setQtVehiclePhotoUrl] = useState('');
+  const [qtLoadPhotoUrl, setQtLoadPhotoUrl] = useState('');
   const [qtIdImageUrl, setQtIdImageUrl] = useState('');
   const [qtIdImageSource, setQtIdImageSource] = useState<'new' | 'on_file' | 'updated'>('new');
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
@@ -394,9 +439,7 @@ export default function Dashboard({ profile }: DashboardProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: nameToCheck,
-          idNumber: idNum || qtCustomer?.idNumber || qtNewCustomer.idNumber || '',
-          username: settings.ohioScrapUsername,
-          password: settings.ohioScrapPassword
+          idNumber: idNum || qtCustomer?.idNumber || qtNewCustomer.idNumber || ''
         })
       });
 
@@ -680,6 +723,7 @@ export default function Dashboard({ profile }: DashboardProps) {
           setQtCustomerPhotoUrl(draft.ticketDetails.customerPhotoUrl || '');
           setQtIdImageUrl(draft.ticketDetails.idImageUrl || '');
           setQtVehiclePhotoUrl(draft.ticketDetails.vehiclePhotoUrl || '');
+          setQtLoadPhotoUrl(draft.ticketDetails.loadPhotoUrl || '');
           setQtSignatureUrl(draft.ticketDetails.signatureUrl || '');
           setQtIdBypassed(draft.ticketDetails.idBypassed || false);
           setQtVehicleBypassed(draft.ticketDetails.vehicleBypassed || false);
@@ -740,6 +784,7 @@ export default function Dashboard({ profile }: DashboardProps) {
           customerPhotoUrl: qtCustomerPhotoUrl || '',
           idImageUrl: qtIdImageUrl || '',
           vehiclePhotoUrl: qtVehiclePhotoUrl || '',
+          loadPhotoUrl: qtLoadPhotoUrl || '',
           signatureUrl: qtSignatureUrl || '',
           idBypassed: qtIdBypassed,
           vehicleBypassed: qtVehicleBypassed
@@ -916,6 +961,31 @@ export default function Dashboard({ profile }: DashboardProps) {
     };
   })();
 
+  const uniqueCustomersCountToday = useMemo(() => {
+    const custIds = new Set<string>();
+    todayTickets.forEach(t => {
+      if (t.customerId) custIds.add(t.customerId);
+    });
+    return custIds.size;
+  }, [todayTickets]);
+
+  const topMaterialsToday = useMemo(() => {
+    const weights: Record<string, { name: string; weight: number }> = {};
+    todayTickets.forEach(t => {
+      (t.materials || []).forEach(m => {
+        if (!m.materialId) return;
+        const matName = materials.find(mat => mat.id === m.materialId)?.name || 'Material';
+        if (!weights[m.materialId]) {
+          weights[m.materialId] = { name: matName, weight: 0 };
+        }
+        weights[m.materialId].weight += m.netWeight;
+      });
+    });
+    return Object.values(weights)
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, 3);
+  }, [todayTickets, materials]);
+
   const handleIDScan = async () => {
     const result = await scan();
     if (result.success) {
@@ -1063,6 +1133,7 @@ export default function Dashboard({ profile }: DashboardProps) {
         notes: '',
         customerPhotoUrl: qtCustomerPhotoUrl || '',
         vehiclePhotoUrl: qtVehiclePhotoUrl || '',
+        loadPhotoUrl: qtLoadPhotoUrl || '',
         idImageUrl: qtIdImageUrl || '',
         signatureUrl: qtSignatureUrl || '',
         sellerAffirmed: !!(qtSignatureUrl),
@@ -1134,6 +1205,19 @@ export default function Dashboard({ profile }: DashboardProps) {
           ...customerUpdate,
           updatedAt: new Date().toISOString()
         });
+
+        if (qtCustomer) {
+          const initialGaps = getCustomerDataGaps(qtCustomer);
+          const updatedCustomerObj = {
+            ...qtCustomer,
+            photoUrl: customerUpdate.photoUrl || qtCustomer.photoUrl,
+            idImageUrl: customerUpdate.idImageUrl || qtCustomer.idImageUrl
+          };
+          const remainingGaps = getCustomerDataGaps(updatedCustomerObj);
+          if (initialGaps.length > 0 && remainingGaps.length === 0) {
+            success('Profile Complete', `${qtCustomer.name}'s file is now complete. Run Data Repair in Settings to update their older tickets.`);
+          }
+        }
       }
 
       // Update Inventory for each material
@@ -1243,6 +1327,7 @@ export default function Dashboard({ profile }: DashboardProps) {
         paymentMethod: 'cash',
         customerPhotoUrl: qtCustomerPhotoUrl || '',
         vehiclePhotoUrl: qtVehiclePhotoUrl || '',
+        loadPhotoUrl: qtLoadPhotoUrl || '',
         idImageUrl: qtIdImageUrl || '',
         vehiclePlate: qtVehiclePlate || '',
         vehicleType: qtVehicleType || '',
@@ -1294,6 +1379,7 @@ export default function Dashboard({ profile }: DashboardProps) {
     setQtItems([{ id: Math.random().toString(36).substr(2, 9), material: null, gross: 0, tare: 0, deduction: 0, materialSearch: '', isDropdownOpen: false, photoUrl: '' }]);
     setQtCustomerPhotoUrl('');
     setQtVehiclePhotoUrl('');
+    setQtLoadPhotoUrl('');
     setQtIdImageUrl('');
     setQtIdImageSource('new');
     setQtVehiclePlate('');
@@ -1322,14 +1408,6 @@ export default function Dashboard({ profile }: DashboardProps) {
     setStep(4);
   };
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
-      </div>
-    );
-  }
-
   const noonToday = new Date();
   noonToday.setHours(12, 0, 0, 0);
   const isBeforeNoon = currentTime < noonToday;
@@ -1349,261 +1427,267 @@ export default function Dashboard({ profile }: DashboardProps) {
 
   const showCard1 = yesterdayCompletedTickets.length > 0;
 
+  // Derived active floating compliance cards
+  const activeComplianceCards = useMemo(() => {
+    const cards: Array<{
+      id: string;
+      severity: 'red' | 'amber';
+      title: string;
+      description: string;
+      actionText?: string;
+      actionHref?: string;
+      actionOnClick?: () => void;
+      canDismiss?: boolean;
+      canSnooze?: boolean;
+    }> = [];
+
+    // Card 1: Daily State Report
+    if (showCard1) {
+      if (yesterdaySubmissionState === 'rejected' || (!isBeforeNoon && yesterdaySubmissionState === 'none')) {
+        const cardId = 'daily_report_red';
+        if (!(complianceSnoozes[cardId] && complianceSnoozes[cardId] > Date.now())) {
+          cards.push({
+            id: cardId,
+            severity: 'red',
+            title: yesterdaySubmissionState === 'rejected' ? 'Ohio Rejected Report' : 'State Report Overdue',
+            description: yesterdaySubmissionState === 'rejected' 
+              ? 'Fix errors and resend immediately.' 
+              : `${yesterdayCompletedTickets.length} tickets must be reported to Ohio immediately.`,
+            actionText: yesterdaySubmissionState === 'rejected' ? 'Fix and Resend' : 'Send Report Now',
+            actionHref: '/reports?tab=xml_portal',
+            canSnooze: true
+          });
+        }
+      } else if (yesterdaySubmissionState === 'submitted' || (isBeforeNoon && yesterdaySubmissionState === 'none')) {
+        const cardId = 'daily_report_amber';
+        if (complianceDismissals[cardId] !== todayLocalDateString) {
+          cards.push({
+            id: cardId,
+            severity: 'amber',
+            title: yesterdaySubmissionState === 'submitted' ? 'Report Needs Verification' : 'State Report Due Today',
+            description: yesterdaySubmissionState === 'submitted' 
+              ? 'Confirm submission in Ohio portal.' 
+              : `Due by noon (${countdownString} remaining).`,
+            actionText: yesterdaySubmissionState === 'submitted' ? 'Verify Now' : 'Send Report',
+            actionHref: '/reports?tab=xml_portal',
+            canDismiss: true
+          });
+        }
+      }
+    }
+
+    // Card 2: Police Do-Not-Buy List
+    if (dnbDaysElapsed > 90) {
+      const cardId = 'dnb_red';
+      if (!(complianceSnoozes[cardId] && complianceSnoozes[cardId] > Date.now())) {
+        cards.push({
+          id: cardId,
+          severity: 'red',
+          title: 'Police List Overdue',
+          description: `DNB list is ${dnbDaysElapsed} days old. Update required!`,
+          actionText: 'Mark Updated',
+          actionOnClick: handleMarkDnbUpdated,
+          canSnooze: true
+        });
+      }
+    } else if (dnbDaysElapsed > 80) {
+      const cardId = 'dnb_amber';
+      if (complianceDismissals[cardId] !== todayLocalDateString) {
+        cards.push({
+          id: cardId,
+          severity: 'amber',
+          title: 'Police List Update Soon',
+          description: `Update needed in ${90 - dnbDaysElapsed} days.`,
+          actionText: 'Mark Updated',
+          actionOnClick: handleMarkDnbUpdated,
+          canDismiss: true
+        });
+      }
+    }
+
+    // Card 3: Camera Calibration
+    if (systemConfig?.cameraSetupComplete !== true) {
+      const cardId = 'camera_amber';
+      if (complianceDismissals[cardId] !== todayLocalDateString) {
+        cards.push({
+          id: cardId,
+          severity: 'amber',
+          title: 'Camera Calibration Needed',
+          description: 'Ensure date/time overlay stamp is visible.',
+          actionText: 'Confirm Calibration',
+          actionOnClick: handleCameraSetupDone,
+          canDismiss: true
+        });
+      }
+    }
+
+    // Card 4: Customer Files
+    if (incompleteCustomersWithTickets.length > 0) {
+      const cardId = 'customers_amber';
+      if (complianceDismissals[cardId] !== todayLocalDateString) {
+        cards.push({
+          id: cardId,
+          severity: 'amber',
+          title: `${incompleteCustomersWithTickets.length} Missing Customer Photos`,
+          description: 'Missing ID or seller photo on file.',
+          actionText: 'See Customers',
+          actionHref: '/customers?filter=missing_photos',
+          canDismiss: true
+        });
+      }
+    }
+
+    return cards;
+  }, [showCard1, yesterdaySubmissionState, isBeforeNoon, yesterdayCompletedTickets.length, countdownString, dnbDaysElapsed, systemConfig, incompleteCustomersWithTickets.length, complianceDismissals, complianceSnoozes, todayLocalDateString]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
+      </div>
+    );
+  }
+
   return (
     <main className={cn("space-y-8", settings.compactMode && "space-y-4")}>
-      {/* Brand Header */}
-      <div className="bg-white rounded-3xl p-6 border border-slate-200 shadow-sm flex flex-col items-center justify-center text-center space-y-4 animate-in fade-in slide-in-from-top-4 duration-500 overflow-hidden relative group">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(184,115,51,0.02),transparent)] pointer-events-none" />
-        <div className="w-full max-w-[240px] aspect-[2/1] flex items-center justify-center overflow-hidden relative">
-          <BrandLogo className="w-full h-full object-contain" />
-        </div>
-        <div className="flex flex-col items-center">
-          <p className="text-slate-400 font-bold text-[9px] uppercase tracking-[0.3em]">Professional Yard Management System</p>
-          <div className="mt-2 flex items-center gap-1.5 opacity-20">
-            <div className="h-px w-6 bg-slate-400" />
-            <div className="w-1 h-1 rounded-full bg-slate-400" />
-            <div className="h-px w-6 bg-slate-400" />
+      {/* Compact Single-Row Header (<60px height) */}
+      <header className="bg-white dark:bg-slate-900 px-4 py-2.5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between gap-4 max-h-[58px]">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="h-8 w-auto flex items-center shrink-0">
+            <BrandLogo className="h-8 w-auto object-contain" />
+          </div>
+          <div className="border-l border-slate-200 dark:border-slate-800 pl-3 min-w-0">
+            <h1 className="text-xs sm:text-sm font-black text-slate-900 dark:text-white uppercase tracking-tight truncate">
+              {COMPANY_NAME}
+            </h1>
+            <p className="text-[10px] font-bold text-slate-400 tracking-wider uppercase">Yard Dashboard</p>
           </div>
         </div>
-      </div>
 
-      <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className={cn("text-3xl font-black text-slate-900 font-display tracking-tight", settings.theme === 'dark' && "text-white")}>Yard Dashboard</h1>
-          <p className="text-slate-500 font-medium">Welcome back. Here's what's happening today.</p>
-        </div>
-        <div className="flex gap-3">
-          <button
-            onClick={() => setShowQuickTicket(true)}
-            aria-label="Create Quick Ticket"
-            className="flex items-center justify-center gap-2 px-6 py-4 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all shadow-lg shadow-slate-200 active:scale-95 outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2"
-          >
-            <Plus className="w-5 h-5" aria-hidden="true" />
-            Quick Ticket
-          </button>
-          <button
-            onClick={() => setShowFullTicket(true)}
-            aria-label="Create Full Buy Ticket"
-            className="flex items-center justify-center gap-2 px-6 py-4 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-200 active:scale-95 outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-          >
-            <FileText className="w-5 h-5" aria-hidden="true" />
-            Full Buy Ticket
-          </button>
+        <div className="flex items-center gap-3 shrink-0">
+          <div className="hidden sm:block text-right pr-2">
+            <p className="text-xs font-bold text-slate-700 dark:text-slate-300">
+              {currentTime.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
+            </p>
+            <p className="text-[10px] font-semibold text-slate-400">
+              {currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowQuickTicket(true)}
+              className="flex items-center gap-1.5 px-3 py-2 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition-all shadow-sm active:scale-95"
+            >
+              <Plus className="w-4 h-4" />
+              <span className="hidden sm:inline">Quick Ticket</span>
+            </button>
+            <button
+              onClick={() => setShowFullTicket(true)}
+              className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 transition-all shadow-sm active:scale-95"
+            >
+              <FileText className="w-4 h-4" />
+              <span className="hidden sm:inline">Full Ticket</span>
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* Compliance Status Strip */}
-      {(showCard1 || systemConfig?.cameraSetupComplete !== true || dnbDaysElapsed > 0 || !dnbLastImportDate) && (
-        <section id="compliance-status-strip" className="space-y-4" aria-label="Compliance Status Dashboard">
-          <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest">Compliance Status</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {/* Card 1 - Daily State Report */}
-            {showCard1 && (
-              <div 
-                id="compliance-card-daily-state-report"
-                className={cn(
-                  "p-5 rounded-xl border flex flex-col justify-between transition-all",
-                  yesterdaySubmissionState === 'verified'
-                    ? "bg-emerald-50/40 border-emerald-200 text-emerald-950 dark:bg-emerald-950/10 dark:border-emerald-900"
-                    : yesterdaySubmissionState === 'submitted'
-                      ? "bg-amber-50/40 border-amber-200 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900"
-                      : yesterdaySubmissionState === 'rejected'
-                        ? "bg-rose-50/40 border-rose-200 text-rose-950 dark:bg-rose-950/10 dark:border-rose-900"
-                        : isBeforeNoon
-                          ? "bg-amber-50/40 border-amber-200 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900"
-                          : "bg-rose-50/40 border-rose-200 text-rose-950 dark:bg-rose-950/10 dark:border-rose-900"
-                )}
-              >
-                <div>
-                  <div className="flex items-center gap-3">
-                    <div className={cn(
-                      "p-2 rounded-lg",
-                      yesterdaySubmissionState === 'verified'
-                        ? "bg-emerald-100/80 text-emerald-700 dark:bg-emerald-900/30"
-                        : yesterdaySubmissionState === 'submitted'
-                          ? "bg-amber-100/80 text-amber-700 dark:bg-amber-900/30"
-                          : yesterdaySubmissionState === 'rejected'
-                            ? "bg-rose-100/80 text-rose-700 dark:bg-rose-900/30"
-                            : isBeforeNoon
-                              ? "bg-amber-100/80 text-amber-700 dark:bg-amber-900/30"
-                              : "bg-rose-100/80 text-rose-700 dark:bg-rose-900/30"
-                    )}>
-                      {yesterdaySubmissionState === 'verified' ? (
-                        <ShieldCheck className="w-5 h-5" />
-                      ) : (
-                        <AlertCircle className="w-5 h-5" />
-                      )}
-                    </div>
-                    <div>
-                      <h3 className="font-bold text-sm tracking-tight">
-                        {yesterdaySubmissionState === 'verified'
-                          ? "Yesterday's state report is done ✓"
-                          : yesterdaySubmissionState === 'submitted'
-                            ? "Report sent — needs a quick check"
-                            : yesterdaySubmissionState === 'rejected'
-                              ? "Ohio rejected the last report"
-                              : isBeforeNoon 
-                                ? "Yesterday's state report is due by noon" 
-                                : "Yesterday's state report is OVERDUE"}
-                      </h3>
-                      <p className="text-xs opacity-80 mt-1">
-                        {yesterdaySubmissionState === 'verified'
-                          ? "Submitted and verified with Ohio portal. Nothing to do."
-                          : yesterdaySubmissionState === 'submitted'
-                            ? "Log into the Ohio portal to confirm the transactions went through."
-                            : yesterdaySubmissionState === 'rejected'
-                              ? "Fix the errors and send it again."
-                              : isBeforeNoon 
-                                ? `${yesterdayCompletedTickets.length} tickets need to be sent. Time remaining: ${countdownString}` 
-                                : `${yesterdayCompletedTickets.length} tickets must be reported immediately.`}
-                      </p>
-                    </div>
-                  </div>
-                </div>
+      {/* Performance Gauges Row (MANAGERS ONLY) */}
+      {profile?.role === 'manager' && (
+        <section aria-label="Performance Gauges" className="space-y-3">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <ArcGauge
+              title="Material Spend"
+              value={totalSpent}
+              formattedValue={`$${Math.round(totalSpent).toLocaleString()}`}
+              target={settings.dailySpendTarget || 5000}
+              unit="$"
+              color="#3b82f6"
+              onClick={() => navigate('/reports?tab=financial')}
+            />
+            <ArcGauge
+              title="Customers Today"
+              value={uniqueCustomersCountToday}
+              formattedValue={String(uniqueCustomersCountToday)}
+              target={settings.dailyCustomerTarget || 30}
+              unit="customers"
+              color="#8b5cf6"
+              onClick={() => navigate('/buy-tickets')}
+            />
+            <ArcGauge
+              title="Expected Profit"
+              value={todayEstProfit}
+              formattedValue={`$${Math.round(todayEstProfit).toLocaleString()}`}
+              targetLabel="Spread Profit"
+              color="#10b981"
+              onClick={() => navigate('/reports?tab=margin')}
+            />
+            <ArcGauge
+              title="Margin %"
+              value={todayProfitMargin}
+              formattedValue={`${todayProfitMargin.toFixed(1)}%`}
+              targetLabel="Min 15% Target"
+              isMargin={true}
+              marginVal={todayProfitMargin}
+              onClick={() => navigate('/reports?tab=margin')}
+            />
+          </div>
 
-                {yesterdaySubmissionState !== 'verified' && (
-                  <div className="mt-4 pt-3 border-t border-current/10">
-                    <Link 
-                      to="/reports?tab=xml_portal"
-                      className={cn(
-                        "inline-flex items-center justify-center gap-1.5 px-4 py-2 font-bold rounded-lg text-xs transition-all text-white",
-                        yesterdaySubmissionState === 'submitted'
-                          ? "bg-amber-600 hover:bg-amber-700"
-                          : yesterdaySubmissionState === 'rejected'
-                            ? "bg-rose-600 hover:bg-rose-700"
-                            : isBeforeNoon
-                              ? "bg-amber-600 hover:bg-amber-700"
-                              : "bg-rose-600 hover:bg-rose-700"
-                      )}
-                    >
-                      {yesterdaySubmissionState === 'submitted'
-                        ? "Verify Now"
-                        : yesterdaySubmissionState === 'rejected'
-                          ? "Fix and Resend"
-                          : "Send Report Now"}
-                    </Link>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Card 2 - Do-Not-Buy List Refresh */}
-            <div 
-              id="compliance-card-dnb-list"
-              className={cn(
-                "p-5 rounded-xl border flex flex-col justify-between transition-all",
-                dnbDaysElapsed <= 80
-                  ? "bg-emerald-50/40 border-emerald-200 text-emerald-950 dark:bg-emerald-950/10 dark:border-emerald-900"
-                  : dnbDaysElapsed <= 90
-                    ? "bg-amber-50/40 border-amber-200 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900"
-                    : "bg-rose-50/40 border-rose-200 text-rose-950 dark:bg-rose-950/10 dark:border-rose-900"
+          {/* Slim Top-Materials Strip & Cash Drawer Chip */}
+          <div className="bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs font-semibold">
+            <div className="flex items-center gap-2 text-slate-700 dark:text-slate-300 overflow-x-auto">
+              <span className="font-black text-slate-400 uppercase text-[10px] tracking-wider shrink-0">Top Materials Today:</span>
+              {topMaterialsToday.length > 0 ? (
+                topMaterialsToday.map((m, idx) => (
+                  <span key={idx} className="bg-white dark:bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 font-bold shrink-0">
+                    #{idx + 1} {m.name} <span className="text-amber-600 font-extrabold">{m.weight.toLocaleString()} lb</span>
+                  </span>
+                ))
+              ) : (
+                <span className="text-slate-400 font-medium italic">No material volume recorded today</span>
               )}
-            >
-              <div>
-                <div className="flex items-center gap-3">
-                  <div className={cn(
-                    "p-2 rounded-lg",
-                    dnbDaysElapsed <= 80
-                      ? "bg-emerald-100/80 text-emerald-700 dark:bg-emerald-900/30"
-                      : dnbDaysElapsed <= 90
-                        ? "bg-amber-100/80 text-amber-700 dark:bg-amber-900/30"
-                        : "bg-rose-100/80 text-rose-700 dark:bg-rose-900/30"
-                  )}>
-                    <Database className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h3 className="font-bold text-sm tracking-tight">
-                      {dnbDaysElapsed <= 80 
-                        ? "Police list is fresh" 
-                        : dnbDaysElapsed <= 90 
-                          ? "Police list update needed soon" 
-                          : "POLICE LIST UPDATE OVERDUE"}
-                    </h3>
-                    <p className="text-xs opacity-80 mt-1">
-                      {dnbDaysElapsed <= 80 
-                        ? `Last updated ${formatShortDate(dnbLastImportDate)}. Next update in ${90 - dnbDaysElapsed} days.` 
-                        : dnbDaysElapsed <= 90 
-                          ? `Last updated ${formatShortDate(dnbLastImportDate)}. ${90 - dnbDaysElapsed} days until required update.` 
-                          : `Required update was due on ${dnbLastImportDate ? formatShortDate(new Date(dnbLastImportDate.getTime() + 90 * 24 * 60 * 60 * 1000)) : 'due date'}. Please refresh now!`}
-                    </p>
-                  </div>
-                </div>
-              </div>
+            </div>
 
-              <div className="mt-4 pt-3 border-t border-current/10 flex flex-col gap-2">
-                <div className="flex flex-wrap gap-2">
-                  <a 
-                    href="https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList" 
-                    target="_blank" 
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 border border-current/20 hover:bg-current/5 font-bold rounded-lg text-xs transition-all"
-                  >
-                    Open State List
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                  <button
-                    onClick={handleMarkDnbUpdated}
-                    disabled={profile?.role !== 'manager'}
-                    title={profile?.role !== 'manager' ? "Manager only" : "Mark database updated"}
-                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 bg-slate-900 dark:bg-slate-800 hover:bg-slate-850 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-lg text-xs transition-all"
-                  >
-                    Mark as Updated
-                  </button>
-                </div>
-                <div>
-                  <a 
-                    href="https://www.cincinnati-oh.gov/police/community-involvement/scrap-metal-dealers-no-buy-list/" 
-                    target="_blank" 
-                    rel="noopener noreferrer"
-                    className="text-[11px] font-medium underline opacity-70 hover:opacity-100 transition-all inline-flex items-center gap-1"
-                  >
-                    Cincinnati PD list
-                    <ExternalLink className="w-2.5 h-2.5" />
-                  </a>
-                </div>
+            <Link
+              to="/reports?tab=daily_closing"
+              className="flex items-center gap-1.5 px-3 py-1 bg-emerald-50 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 rounded-lg text-xs font-bold hover:bg-emerald-100 transition-colors shrink-0"
+            >
+              <DollarSign className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Cash Drawer Active</span>
+            </Link>
+          </div>
+        </section>
+      )}
+
+      {/* Cashier View Front Page */}
+      {profile?.role !== 'manager' && (
+        <section aria-label="Cashier Overview" className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+              <div>
+                <p className="text-xs font-black text-slate-400 uppercase tracking-widest">Customers Today</p>
+                <p className="text-3xl font-black text-slate-900 dark:text-white mt-1 font-display">
+                  {uniqueCustomersCountToday}
+                </p>
+                <p className="text-[10px] text-slate-400 mt-1 font-semibold">{todayTickets.length} Total Tickets Completed</p>
+              </div>
+              <div className="p-3 bg-purple-50 dark:bg-purple-900/30 rounded-2xl text-purple-600">
+                <Users className="w-8 h-8" />
               </div>
             </div>
 
-            {/* Card 3 - One-time Camera Setup */}
-            {systemConfig?.cameraSetupComplete !== true && (
-              <div 
-                id="compliance-card-camera-setup"
-                className="p-5 rounded-xl border border-amber-200 bg-amber-50/40 text-amber-950 dark:bg-amber-950/10 dark:border-amber-900 flex flex-col justify-between transition-all"
-              >
-                <div>
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 rounded-lg bg-amber-100/80 text-amber-700 dark:bg-amber-900/30">
-                      <Camera className="w-5 h-5" />
-                    </div>
-                    <div>
-                      <h3 className="font-bold text-sm tracking-tight">
-                        One-time camera calibration needed
-                      </h3>
-                      <p className="text-xs opacity-80 mt-1">
-                        Ensure date/time overlay stamp is visible and legible on all camera views.
-                      </p>
-                    </div>
-                  </div>
-
-                  <ul className="text-xs opacity-90 space-y-1.5 mt-3 pl-3 list-disc">
-                    <li>Date & Time stamp legible</li>
-                    <li>Valid mm/dd/yyyy and standard AM/PM format</li>
-                    <li>Positioned in high-contrast box</li>
-                  </ul>
-                </div>
-
-                <div className="mt-4 pt-3 border-t border-amber-200/40">
-                  <button
-                    onClick={handleCameraSetupDone}
-                    disabled={profile?.role !== 'manager'}
-                    title={profile?.role !== 'manager' ? "Manager only" : "Mark camera calibration done"}
-                    className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-lg text-xs transition-all"
-                  >
-                    All Done
-                  </button>
-                </div>
+            <div className="bg-white dark:bg-slate-900 p-5 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
+              <div>
+                <p className="text-xs font-black text-slate-400 uppercase tracking-widest">Scrap Volume Today</p>
+                <p className="text-3xl font-black text-slate-900 dark:text-white mt-1 font-display">
+                  {totalWeight.toLocaleString()} <span className="text-sm font-bold text-slate-400">lb</span>
+                </p>
+                <p className="text-[10px] text-slate-400 mt-1 font-semibold">Total Net Weight Received</p>
               </div>
-            )}
+              <div className="p-3 bg-amber-50 dark:bg-amber-900/30 rounded-2xl text-amber-600">
+                <Package className="w-8 h-8" />
+              </div>
+            </div>
           </div>
         </section>
       )}
@@ -1686,57 +1770,351 @@ export default function Dashboard({ profile }: DashboardProps) {
         </section>
       )}
 
-      {/* Stats Overview */}
-      <section className={cn("grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6", settings.compactMode && "gap-4")} aria-label="Daily Statistics">
-        <div className={cn("bg-white p-6 rounded-xl border border-slate-200 shadow-sm", settings.theme === 'dark' && "bg-slate-900 border-slate-800", settings.compactMode && "p-4")}>
-          <div className="flex items-center justify-between mb-4">
-            <div className="p-2 bg-blue-50 rounded-lg">
-              <DollarSign className="w-5 h-5 text-blue-600" aria-hidden="true" />
-            </div>
-            <ArrowUpRight className="w-4 h-4 text-green-500" aria-hidden="true" />
+      {/* Today's Sales Performance & Hourly Granularity Chart */}
+      <section className={cn("bg-white p-6 rounded-3xl border border-slate-200 shadow-sm space-y-6", settings.theme === 'dark' && "bg-slate-900 border-slate-800")} aria-label="Today's Sales Velocity">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <h3 className={cn("font-black text-slate-900 uppercase tracking-widest text-xs", settings.theme === 'dark' && "text-white")}>Today's Performance Velocity</h3>
+            <p className="text-xs text-slate-400 font-medium mt-0.5">
+              {profile?.role === 'manager' && chartMode === 'financial' ? "Hourly distribution of purchases, est. resale value, and spread profit." : "Hourly distribution of scrap volume received in pounds."}
+            </p>
           </div>
-          <p className="text-sm font-black text-slate-400 uppercase tracking-widest">Today's Payouts</p>
-          <p className={cn("text-3xl font-black text-slate-900 mt-1 font-display tracking-tight", settings.theme === 'dark' && "text-white")}>${totalSpent.toLocaleString()}</p>
+          
+          <div className="flex flex-wrap items-center gap-4">
+            {/* Toggle controls - MANAGERS ONLY */}
+            {profile?.role === 'manager' && (
+              <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+                <button
+                  onClick={() => setChartMode('financial')}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider transition-all",
+                    chartMode === 'financial' 
+                      ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white" 
+                      : "text-slate-500 hover:text-slate-800 dark:text-slate-400"
+                  )}
+                >
+                  Financial Spread
+                </button>
+                <button
+                  onClick={() => setChartMode('volume')}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-black uppercase tracking-wider transition-all",
+                    chartMode === 'volume' 
+                      ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white" 
+                      : "text-slate-500 hover:text-slate-800 dark:text-slate-400"
+                  )}
+                >
+                  Volume (lb)
+                </button>
+              </div>
+            )}
+
+            {/* Custom Legend */}
+            <div className="flex items-center gap-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">
+              {profile?.role === 'manager' && chartMode === 'financial' ? (
+                <>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 bg-blue-600 rounded-full"></span>
+                    <span>Payout (Cost)</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 bg-purple-500 rounded-full"></span>
+                    <span>Est. Resale</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 bg-emerald-500 rounded-full"></span>
+                    <span>Spread Profit</span>
+                  </div>
+                </>
+              ) : (
+                <div className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 bg-amber-500 rounded-full"></span>
+                  <span>Scrap Volume (lb)</span>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
-        <div className={cn("bg-white p-6 rounded-xl border border-slate-200 shadow-sm", settings.theme === 'dark' && "bg-slate-900 border-slate-800", settings.compactMode && "p-4")}>
-          <div className="flex items-center justify-between mb-4">
-            <div className="p-2 bg-green-50 rounded-lg">
-              <Package className="w-5 h-5 text-green-600" aria-hidden="true" />
+
+        <div className="h-64 w-full">
+          {todayTickets.length > 0 ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={todayHourlyData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="colorSales" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#2563eb" stopOpacity={0.15}/>
+                    <stop offset="95%" stopColor="#2563eb" stopOpacity={0}/>
+                  </linearGradient>
+                  <linearGradient id="colorRevenue" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#a855f7" stopOpacity={0.15}/>
+                    <stop offset="95%" stopColor="#a855f7" stopOpacity={0}/>
+                  </linearGradient>
+                  <linearGradient id="colorProfit" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.15}/>
+                    <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                  </linearGradient>
+                  <linearGradient id="colorWeight" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.15}/>
+                    <stop offset="95%" stopColor="#f59e0b" stopOpacity={0}/>
+                  </linearGradient>
+                </defs>
+                <XAxis 
+                  dataKey="hour" 
+                  stroke="#94a3b8" 
+                  fontSize={10} 
+                  fontWeight="bold"
+                  tickLine={false} 
+                  axisLine={false}
+                />
+                <YAxis 
+                  stroke="#94a3b8" 
+                  fontSize={10} 
+                  fontWeight="bold"
+                  tickLine={false} 
+                  axisLine={false}
+                  tickFormatter={(v) => (profile?.role === 'manager' && chartMode === 'financial') ? `$${v}` : `${v}lb`}
+                />
+                <Tooltip 
+                  contentStyle={{ 
+                    backgroundColor: settings.theme === 'dark' ? '#1e293b' : '#ffffff', 
+                    borderRadius: '12px', 
+                    border: '1px solid #e2e8f0',
+                    fontSize: '11px',
+                    fontWeight: 'bold'
+                  }} 
+                />
+                {profile?.role === 'manager' && chartMode === 'financial' ? (
+                  <>
+                    <Area 
+                      type="monotone" 
+                      dataKey="revenue" 
+                      stroke="#a855f7" 
+                      strokeWidth={2.5}
+                      fillOpacity={1} 
+                      fill="url(#colorRevenue)" 
+                      name="Est. Resale ($)"
+                    />
+                    <Area 
+                      type="monotone" 
+                      dataKey="sales" 
+                      stroke="#2563eb" 
+                      strokeWidth={2}
+                      fillOpacity={1} 
+                      fill="url(#colorSales)" 
+                      name="Payout Cost ($)"
+                    />
+                    <Area 
+                      type="monotone" 
+                      dataKey="profit" 
+                      stroke="#10b981" 
+                      strokeWidth={2}
+                      fillOpacity={1} 
+                      fill="url(#colorProfit)" 
+                      name="Spread Profit ($)"
+                    />
+                  </>
+                ) : (
+                  <Area 
+                    type="monotone" 
+                    dataKey="weight" 
+                    stroke="#f59e0b" 
+                    strokeWidth={2.5}
+                    fillOpacity={1} 
+                    fill="url(#colorWeight)" 
+                    name="Volume (lb)"
+                  />
+                )}
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-full w-full flex flex-col items-center justify-center text-slate-400 bg-slate-50 dark:bg-slate-800/40 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+              <BarChart3 className="w-8 h-8 text-slate-300 mb-2 animate-pulse" />
+              <p className="text-xs font-bold uppercase tracking-wider">No Sales Velocity Data Yet</p>
+              <p className="text-[10px] text-slate-400 mt-1">Transactions logged today will populate this real-time hourly graph.</p>
             </div>
-            <ArrowUpRight className="w-4 h-4 text-green-500" aria-hidden="true" />
-          </div>
-          <p className="text-sm font-black text-slate-400 uppercase tracking-widest">Today's Volume</p>
-          <p className={cn("text-3xl font-black text-slate-900 mt-1 font-display tracking-tight", settings.theme === 'dark' && "text-white")}>
-            {totalWeight.toLocaleString()} <span className="text-sm font-bold text-slate-400">lb</span>
-          </p>
-        </div>
-        <div className={cn("bg-white p-6 rounded-xl border border-slate-200 shadow-sm", settings.theme === 'dark' && "bg-slate-900 border-slate-800", settings.compactMode && "p-4")}>
-          <div className="flex items-center justify-between mb-4">
-            <div className="p-2 bg-purple-50 rounded-lg">
-              <TrendingUp className="w-5 h-5 text-purple-600" aria-hidden="true" />
-            </div>
-            {todayTickets.length > 0 && <ArrowUpRight className="w-4 h-4 text-purple-500" aria-hidden="true" />}
-          </div>
-          <p className="text-sm font-black text-slate-400 uppercase tracking-widest">Est. Sales (Revenue)</p>
-          <p className={cn("text-3xl font-black text-slate-900 mt-1 font-display tracking-tight", settings.theme === 'dark' && "text-white")}>
-            ${todayEstResale.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </p>
-        </div>
-        <div className={cn("bg-white p-6 rounded-xl border border-slate-200 shadow-sm", settings.theme === 'dark' && "bg-slate-900 border-slate-800", settings.compactMode && "p-4")}>
-          <div className="flex items-center justify-between mb-4">
-            <div className="p-2 bg-emerald-50 rounded-lg">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600" aria-hidden="true" />
-            </div>
-            <span className="text-[10px] font-black px-2 py-0.5 bg-emerald-50 text-emerald-700 rounded-md">
-              {todayProfitMargin.toFixed(1)}% Spread
-            </span>
-          </div>
-          <p className="text-sm font-black text-slate-400 uppercase tracking-widest">Est. Spread Profit</p>
-          <p className={cn("text-3xl font-black text-emerald-600 mt-1 font-display tracking-tight")}>
-            ${todayEstProfit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </p>
+          )}
         </div>
       </section>
+
+      <div className={cn("grid grid-cols-1 lg:grid-cols-2 gap-8", settings.compactMode && "gap-4")}>
+        {/* Recent Activity */}
+        <section className={cn("bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden", settings.theme === 'dark' && "bg-slate-900 border-slate-800")} aria-label="Recent Activity">
+          <div className={cn("p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50", settings.theme === 'dark' && "bg-slate-800 border-slate-700")}>
+            <h3 className={cn("font-black text-slate-900 uppercase tracking-widest text-xs", settings.theme === 'dark' && "text-white")}>Today's Transactions</h3>
+            <Link to="/buy-tickets" className="text-xs font-black text-blue-600 hover:text-blue-700 uppercase tracking-widest outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-md px-1">View All</Link>
+          </div>
+          <div className="divide-y divide-slate-50 dark:divide-slate-800">
+            {todayTickets.slice(0, settings.compactMode ? 3 : 5).map((ticket) => (
+              <div key={ticket.id} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
+                <div className="flex items-center gap-4">
+                  <div className="w-10 h-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-400">
+                    <User className="w-5 h-5" aria-hidden="true" />
+                  </div>
+                  <div>
+                    <p className={cn("text-sm font-bold text-slate-900", settings.theme === 'dark' && "text-white")}>
+                      {customers.find(c => c.id === ticket.customerId)?.name || 'Unknown'}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {(ticket.materials || []).length > 1 ? `${ticket.materials.length} Materials` : materials.find(m => m.id === (ticket.materials || [])[0]?.materialId)?.name} • {(ticket.materials || []).reduce((sum, m) => sum + m.netWeight, 0)} lb
+                    </p>
+                  </div>
+                </div>
+                <div className="text-right">
+                  {profile?.role === 'manager' ? (
+                    <p className={cn("text-sm font-bold text-slate-900", settings.theme === 'dark' && "text-white")}>${ticket.totalAmount.toFixed(2)}</p>
+                  ) : (
+                    <p className="text-xs font-bold text-slate-500 font-mono">#{ticket.id.slice(-6)}</p>
+                  )}
+                  <p className="text-[10px] text-slate-400 uppercase font-semibold">{formatTicketTime(ticket.timestamp)}</p>
+                </div>
+              </div>
+            ))}
+            {todayTickets.length === 0 && (
+              <div className="p-12 text-center text-slate-400">
+                <p>No transactions recorded today.</p>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Inventory Summary */}
+        <section className={cn("bg-white rounded-3xl border border-slate-200 shadow-sm p-6", settings.theme === 'dark' && "bg-slate-900 border-slate-800")} aria-label="Inventory Summary">
+          <div className="flex flex-col mb-6">
+            <h3 className={cn("font-black text-slate-900 uppercase tracking-widest text-xs", settings.theme === 'dark' && "text-white")}>{activeMaterials.title}</h3>
+            <span className="text-[10px] text-slate-400 font-bold uppercase mt-0.5">{activeMaterials.description}</span>
+          </div>
+          <div className={cn("space-y-6", settings.compactMode && "space-y-4")}>
+            {activeMaterials.items.slice(0, settings.compactMode ? 3 : 5).map((item) => {
+              const maxWeightInGroup = Math.max(...activeMaterials.items.map(i => i.weight), 500);
+              const percentage = Math.min((item.weight / maxWeightInGroup) * 100, 100);
+              
+              return (
+                <div key={item.material.id} className="space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span className={cn("font-semibold text-slate-700", settings.theme === 'dark' && "text-slate-300")}>{item.material.name}</span>
+                    <span className="text-slate-500 font-bold">{item.weight.toLocaleString()} lb</span>
+                  </div>
+                  <div className={cn("h-2 bg-slate-100 rounded-full overflow-hidden", settings.theme === 'dark' && "bg-slate-800")} role="progressbar" aria-valuenow={percentage} aria-valuemin={0} aria-valuemax={100}>
+                    <div 
+                      className={cn(
+                        "h-full rounded-full transition-all duration-500",
+                        item.weight < 500 ? "bg-amber-500" : "bg-blue-600"
+                      )}
+                      style={{ width: `${percentage}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+            {activeMaterials.items.length === 0 && (
+              <div className="py-8 text-center text-slate-400 text-sm font-medium">
+                No active material transactions to show.
+              </div>
+            )}
+          </div>
+          <div className="mt-8">
+            <Link to="/inventory" className={cn("block text-center py-3 bg-slate-50 text-slate-600 rounded-lg text-sm font-bold hover:bg-slate-100 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400", settings.theme === 'dark' && "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white")}>
+              Full Inventory Report
+            </Link>
+          </div>
+        </section>
+      </div>
+
+      {/* Floating Compliance Notification Stack (Bottom Right) */}
+      {activeComplianceCards.length > 0 && (
+        <aside 
+          aria-label="Compliance Notifications" 
+          className="fixed bottom-6 right-6 z-40 max-w-sm w-full space-y-2.5 pointer-events-none"
+        >
+          {(isComplianceStackExpanded ? activeComplianceCards : activeComplianceCards.slice(0, 2)).map((card) => (
+            <div
+              key={card.id}
+              className={cn(
+                "pointer-events-auto p-4 rounded-2xl border shadow-lg backdrop-blur-md transition-all animate-in slide-in-from-bottom-5 duration-300 flex items-start gap-3 relative",
+                card.severity === 'red'
+                  ? "bg-rose-900/95 border-rose-700 text-white shadow-rose-950/20"
+                  : "bg-amber-900/95 border-amber-700 text-white shadow-amber-950/20"
+              )}
+            >
+              <div className="shrink-0 pt-0.5">
+                {card.severity === 'red' ? (
+                  <ShieldAlert className="w-5 h-5 text-rose-300 animate-pulse" />
+                ) : (
+                  <AlertTriangle className="w-5 h-5 text-amber-300" />
+                )}
+              </div>
+
+              <div className="flex-1 min-w-0 pr-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="text-xs font-black uppercase tracking-wider text-white truncate">{card.title}</h4>
+                  <span className={cn(
+                    "text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded tracking-widest shrink-0",
+                    card.severity === 'red' ? "bg-rose-800 text-rose-200" : "bg-amber-800 text-amber-200"
+                  )}>
+                    {card.severity === 'red' ? 'REQUIRED' : 'NOTICE'}
+                  </span>
+                </div>
+                <p className="text-[11px] font-medium text-slate-200 mt-1 leading-snug">{card.description}</p>
+
+                <div className="mt-2.5 flex items-center gap-2">
+                  {card.actionHref ? (
+                    <Link
+                      to={card.actionHref}
+                      className="px-3 py-1 bg-white text-slate-900 rounded-lg text-[11px] font-black uppercase tracking-wider hover:bg-slate-100 transition-all shadow-sm"
+                    >
+                      {card.actionText}
+                    </Link>
+                  ) : card.actionOnClick ? (
+                    <button
+                      onClick={card.actionOnClick}
+                      disabled={profile?.role !== 'manager'}
+                      className="px-3 py-1 bg-white text-slate-900 disabled:opacity-50 rounded-lg text-[11px] font-black uppercase tracking-wider hover:bg-slate-100 transition-all shadow-sm"
+                    >
+                      {card.actionText}
+                    </button>
+                  ) : null}
+
+                  {card.canSnooze && (
+                    <button
+                      onClick={() => snoozeRedCard(card.id)}
+                      className="text-[10px] font-bold text-rose-200 hover:text-white underline underline-offset-2 ml-auto"
+                    >
+                      Snooze 1h
+                    </button>
+                  )}
+
+                  {card.canDismiss && (
+                    <button
+                      onClick={() => dismissAmberCard(card.id)}
+                      className="text-[10px] font-bold text-amber-200 hover:text-white underline underline-offset-2 ml-auto"
+                    >
+                      Dismiss today
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <button
+                onClick={() => card.severity === 'red' ? snoozeRedCard(card.id) : dismissAmberCard(card.id)}
+                className="absolute top-3 right-3 text-slate-300 hover:text-white transition-colors"
+                title="Dismiss notification"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          ))}
+
+          {activeComplianceCards.length > 2 && (
+            <button
+              onClick={() => setIsComplianceStackExpanded(!isComplianceStackExpanded)}
+              className="pointer-events-auto w-full py-1.5 px-3 bg-slate-900/90 text-white border border-slate-700/80 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 transition-all shadow-md flex items-center justify-center gap-1.5 backdrop-blur-md"
+            >
+              <span>{isComplianceStackExpanded ? 'Collapse Notifications' : `+${activeComplianceCards.length - 2} More Notifications`}</span>
+              <ChevronDown className={cn("w-3.5 h-3.5 transition-transform", isComplianceStackExpanded && "rotate-180")} />
+            </button>
+          )}
+        </aside>
+      )}
 
       {/* Today's Sales Performance & Hourly Granularity Chart */}
       <section className={cn("bg-white p-6 rounded-3xl border border-slate-200 shadow-sm space-y-6", settings.theme === 'dark' && "bg-slate-900 border-slate-800")} aria-label="Today's Sales Velocity">
@@ -1901,87 +2279,6 @@ export default function Dashboard({ profile }: DashboardProps) {
           )}
         </div>
       </section>
-
-      <div className={cn("grid grid-cols-1 lg:grid-cols-2 gap-8", settings.compactMode && "gap-4")}>
-        {/* Recent Activity */}
-        <section className={cn("bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden", settings.theme === 'dark' && "bg-slate-900 border-slate-800")} aria-label="Recent Activity">
-          <div className={cn("p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50", settings.theme === 'dark' && "bg-slate-800 border-slate-700")}>
-            <h3 className={cn("font-black text-slate-900 uppercase tracking-widest text-xs", settings.theme === 'dark' && "text-white")}>Today's Transactions</h3>
-            <Link to="/buy-tickets" className="text-xs font-black text-blue-600 hover:text-blue-700 uppercase tracking-widest outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-md px-1">View All</Link>
-          </div>
-          <div className="divide-y divide-slate-50 dark:divide-slate-800">
-            {todayTickets.slice(0, settings.compactMode ? 3 : 5).map((ticket) => (
-              <div key={ticket.id} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
-                <div className="flex items-center gap-4">
-                  <div className="w-10 h-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-400">
-                    <User className="w-5 h-5" aria-hidden="true" />
-                  </div>
-                  <div>
-                    <p className={cn("text-sm font-bold text-slate-900", settings.theme === 'dark' && "text-white")}>
-                      {customers.find(c => c.id === ticket.customerId)?.name || 'Unknown'}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      {(ticket.materials || []).length > 1 ? `${ticket.materials.length} Materials` : materials.find(m => m.id === (ticket.materials || [])[0]?.materialId)?.name} • {(ticket.materials || []).reduce((sum, m) => sum + m.netWeight, 0)} lb
-                    </p>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <p className={cn("text-sm font-bold text-slate-900", settings.theme === 'dark' && "text-white")}>${ticket.totalAmount.toFixed(2)}</p>
-                  <p className="text-[10px] text-slate-400 uppercase font-semibold">{formatTicketTime(ticket.timestamp)}</p>
-                </div>
-              </div>
-            ))}
-            {todayTickets.length === 0 && (
-              <div className="p-12 text-center text-slate-400">
-                <p>No transactions recorded today.</p>
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* Inventory Summary */}
-        <section className={cn("bg-white rounded-3xl border border-slate-200 shadow-sm p-6", settings.theme === 'dark' && "bg-slate-900 border-slate-800")} aria-label="Inventory Summary">
-          <div className="flex flex-col mb-6">
-            <h3 className={cn("font-black text-slate-900 uppercase tracking-widest text-xs", settings.theme === 'dark' && "text-white")}>{activeMaterials.title}</h3>
-            <span className="text-[10px] text-slate-400 font-bold uppercase mt-0.5">{activeMaterials.description}</span>
-          </div>
-          <div className={cn("space-y-6", settings.compactMode && "space-y-4")}>
-            {activeMaterials.items.slice(0, settings.compactMode ? 3 : 5).map((item) => {
-              // Calculate relative progress bar width based on the highest weight in activeMaterials.items (with a min denominator of 500 lb)
-              const maxWeightInGroup = Math.max(...activeMaterials.items.map(i => i.weight), 500);
-              const percentage = Math.min((item.weight / maxWeightInGroup) * 100, 100);
-              
-              return (
-                <div key={item.material.id} className="space-y-2">
-                  <div className="flex justify-between text-sm">
-                    <span className={cn("font-semibold text-slate-700", settings.theme === 'dark' && "text-slate-300")}>{item.material.name}</span>
-                    <span className="text-slate-500 font-bold">{item.weight.toLocaleString()} lb</span>
-                  </div>
-                  <div className={cn("h-2 bg-slate-100 rounded-full overflow-hidden", settings.theme === 'dark' && "bg-slate-800")} role="progressbar" aria-valuenow={percentage} aria-valuemin={0} aria-valuemax={100}>
-                    <div 
-                      className={cn(
-                        "h-full rounded-full transition-all duration-500",
-                        item.weight < 500 ? "bg-amber-500" : "bg-blue-600"
-                      )}
-                      style={{ width: `${percentage}%` }}
-                    />
-                  </div>
-                </div>
-              );
-            })}
-            {activeMaterials.items.length === 0 && (
-              <div className="py-8 text-center text-slate-400 text-sm font-medium">
-                No active material transactions to show.
-              </div>
-            )}
-          </div>
-          <div className="mt-8">
-            <Link to="/inventory" className={cn("block text-center py-3 bg-slate-50 text-slate-600 rounded-lg text-sm font-bold hover:bg-slate-100 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400", settings.theme === 'dark' && "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white")}>
-              Full Inventory Report
-            </Link>
-          </div>
-        </section>
-      </div>
 
       {/* Version Footer */}
       <footer id="dashboard-version-footer" className="text-center pt-10 pb-4">
@@ -2528,6 +2825,17 @@ export default function Dashboard({ profile }: DashboardProps) {
                               </button>
                             </div>
 
+                            {qtCustomer && (() => {
+                              const gaps = getCustomerDataGaps(qtCustomer);
+                              if (gaps.length === 0) return null;
+                              return (
+                                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 font-medium flex items-center gap-2">
+                                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                                  <span>This customer's file is missing: <strong>{gaps.join(', ')}</strong>. Capture them during this ticket to bring their record up to date.</span>
+                                </div>
+                              );
+                            })()}
+
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                               {/* General / Contact Details Section */}
                               <div className="space-y-4">
@@ -2831,39 +3139,6 @@ export default function Dashboard({ profile }: DashboardProps) {
                               </button>
                             </div>
                           </div>
-
-                          {/* Credentials helper */}
-                          <div className="space-y-2 border-t md:border-t-0 md:border-l border-slate-200 md:pl-4 pt-4 md:pt-0">
-                            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Portal Credentials (Click to copy)</p>
-                            <div className="grid grid-cols-1 gap-1.5 text-xs">
-                              <div className="flex items-center justify-between px-3 py-2 bg-white rounded-xl border border-slate-200 text-[11px] font-semibold text-slate-700">
-                                <span className="truncate">User: <span className="font-mono font-bold text-slate-900">{settings.ohioScrapUsername || 'Not Configured'}</span></span>
-                                {settings.ohioScrapUsername && (
-                                  <button
-                                    type="button"
-                                    onClick={() => navigator.clipboard.writeText(settings.ohioScrapUsername)}
-                                    className="p-1 hover:bg-slate-100 rounded-lg border border-slate-200 text-slate-500 hover:text-slate-700 transition-all shrink-0 ml-2"
-                                    title="Copy Username"
-                                  >
-                                    <Copy className="w-3 h-3" />
-                                  </button>
-                                )}
-                              </div>
-                              <div className="flex items-center justify-between px-3 py-2 bg-white rounded-xl border border-slate-200 text-[11px] font-semibold text-slate-700">
-                                <span className="truncate">Pass: <span className="font-mono font-bold text-slate-900">{settings.ohioScrapPassword ? '••••••••' : 'Not Configured'}</span></span>
-                                {settings.ohioScrapPassword && (
-                                  <button
-                                    type="button"
-                                    onClick={() => navigator.clipboard.writeText(settings.ohioScrapPassword)}
-                                    className="p-1 hover:bg-slate-100 rounded-lg border border-slate-200 text-slate-500 hover:text-slate-700 transition-all shrink-0 ml-2"
-                                    title="Copy Password"
-                                  >
-                                    <Copy className="w-3 h-3" />
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          </div>
                         </div>
 
                         <div className="flex flex-wrap gap-2 pt-2">
@@ -3154,6 +3429,33 @@ export default function Dashboard({ profile }: DashboardProps) {
                                       placeholder="e.g. Pickup"
                                     />
                                   </div>
+                                </div>
+                              </div>
+                              
+                              <div className="p-6 bg-slate-50 rounded-3xl border border-slate-200 shadow-sm flex flex-col gap-4">
+                                <div>
+                                  <h5 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                                    <span>Load Photo (Scale)</span>
+                                    {qtLoadPhotoUrl ? (
+                                      <span className="text-[8px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-black uppercase">Captured</span>
+                                    ) : (
+                                      <span className="text-[8px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-black uppercase">Optional</span>
+                                    )}
+                                  </h5>
+                                  <CameraCapture 
+                                    label="Capture Load Photo"
+                                    onCapture={(url) => {
+                                      setQtLoadPhotoUrl(url);
+                                    }}
+                                    networkUrl={settings.useSwannCams ? settings.swannCams.scale : undefined}
+                                    className="h-full"
+                                  />
+                                  <p className="text-[10px] text-slate-500 mt-1">Photo of the materials at the scale.</p>
+                                  {!qtLoadPhotoUrl && (
+                                    <p className="text-[10px] font-medium text-amber-700 bg-amber-50 p-1.5 rounded border border-amber-200 mt-1">
+                                      No load photo — the seller photo will be used for state reporting.
+                                    </p>
+                                  )}
                                 </div>
                               </div>
                               
@@ -3731,49 +4033,59 @@ export default function Dashboard({ profile }: DashboardProps) {
                   );
                 }
 
-                return filtered.map(c => (
-                  <div
-                    key={c.id}
-                    className="p-4 border border-slate-100 hover:border-slate-200 rounded-2xl hover:bg-slate-50 flex items-center justify-between transition-all"
-                  >
-                    <div>
-                      <h4 className="font-black text-slate-900 text-sm">{c.name}</h4>
-                      <p className="text-xs text-slate-500 font-semibold mt-0.5">
-                        {c.phone || 'No Phone'} {c.address ? `• ${c.address}` : ''}
-                      </p>
-                      {c.businessName && (
-                        <div className="mt-1.5">
-                          <span className="px-2 py-0.5 bg-slate-100 text-slate-600 text-[9px] font-black uppercase rounded border border-slate-200">
-                            {c.businessName}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setQtCustomer(c);
-                        setQtNewCustomer({
-                          name: '',
-                          phone: '',
-                          secondaryPhone: '',
-                          email: '',
-                          address: '',
-                          businessName: '',
-                          idNumber: '',
-                          idType: "Driver's License",
-                          idExpiration: ''
-                        });
-                        setIsQtNewCustomer(false);
-                        setIsCustomerLookupOpen(false);
-                        setCustomerSearch('');
-                      }}
-                      className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all active:scale-95 shadow-sm"
+                return filtered.map(c => {
+                  const gaps = getCustomerDataGaps(c);
+                  return (
+                    <div
+                      key={c.id}
+                      className="p-4 border border-slate-100 hover:border-slate-200 rounded-2xl hover:bg-slate-50 flex items-center justify-between gap-3 transition-all"
                     >
-                      Select
-                    </button>
-                  </div>
-                ));
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h4 className="font-black text-slate-900 text-sm">{c.name}</h4>
+                          {gaps.length > 0 && (
+                            <span className="px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 text-[9px] font-bold rounded-full shrink-0">
+                              Needs {gaps.join(' + ')}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-slate-500 font-semibold mt-0.5">
+                          {c.phone || 'No Phone'} {c.address ? `• ${c.address}` : ''}
+                        </p>
+                        {c.businessName && (
+                          <div className="mt-1.5">
+                            <span className="px-2 py-0.5 bg-slate-100 text-slate-600 text-[9px] font-black uppercase rounded border border-slate-200">
+                              {c.businessName}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setQtCustomer(c);
+                          setQtNewCustomer({
+                            name: '',
+                            phone: '',
+                            secondaryPhone: '',
+                            email: '',
+                            address: '',
+                            businessName: '',
+                            idNumber: '',
+                            idType: "Driver's License",
+                            idExpiration: ''
+                          });
+                          setIsQtNewCustomer(false);
+                          setIsCustomerLookupOpen(false);
+                          setCustomerSearch('');
+                        }}
+                        className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all active:scale-95 shadow-sm shrink-0"
+                      >
+                        Select
+                      </button>
+                    </div>
+                  );
+                });
               })()}
             </div>
           </div>

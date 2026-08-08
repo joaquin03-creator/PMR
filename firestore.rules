@@ -218,6 +218,10 @@ service cloud.firestore {
              data.date is string &&
              data.recordedAt is string &&
              data.recordedBy is string &&
+             (!('buyerName' in data) || (data.buyerName is string && data.buyerName.size() <= 200)) &&
+             (!('items' in data) || data.items is list) &&
+             (!('totalWeight' in data) || data.totalWeight is number) &&
+             (!('totalRevenue' in data) || data.totalRevenue is number) &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
     }
 
@@ -232,6 +236,38 @@ service cloud.firestore {
              data.recordedBy is string &&
              (!('carrier' in data) || (data.carrier is string && data.carrier.size() <= 200)) &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
+    }
+
+    function isValidMaterialConversion(data) {
+      return data.keys().hasAll(['sourceMaterialId', 'destinationMaterialId', 'consumedWeight', 'producedWeight', 'yieldPercent', 'timestamp', 'status']) &&
+             data.sourceMaterialId is string &&
+             data.destinationMaterialId is string &&
+             data.consumedWeight is number && data.consumedWeight > 0 &&
+             data.producedWeight is number && data.producedWeight >= 0 &&
+             data.yieldPercent is number &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             data.status in ['completed', 'voided'] &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('recordedBy' in data) || (data.recordedBy is string && data.recordedBy.size() <= 200)) &&
+             (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 200)) &&
+             (!('createdByName' in data) || (data.createdByName is string && data.createdByName.size() <= 200)) &&
+             (!('voidedAt' in data) || (data.voidedAt is string || data.voidedAt is timestamp)) &&
+             (!('voidedBy' in data) || (data.voidedBy is string && data.voidedBy.size() <= 200));
+    }
+
+    function isValidInventoryAdjustment(data) {
+      return data.keys().hasAll(['materialId', 'adjustmentAmount', 'reason', 'isEstimate', 'timestamp', 'recordedBy']) &&
+             data.materialId is string &&
+             data.adjustmentAmount is number &&
+             data.reason is string && data.reason.size() > 0 && data.reason.size() <= 2000 &&
+             data.isEstimate is bool &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             data.recordedBy is string &&
+             (!('materialName' in data) || (data.materialName is string && data.materialName.size() <= 200)) &&
+             (!('materialCode' in data) || (data.materialCode is string && data.materialCode.size() <= 50)) &&
+             (!('previousWeight' in data) || data.previousWeight is number) &&
+             (!('resultingWeight' in data) || data.resultingWeight is number) &&
+             (!('recordedByUid' in data) || (data.recordedByUid is string && data.recordedByUid.size() <= 100));
     }
 
     function isValidDailySnapshot(data) {
@@ -339,7 +375,12 @@ service cloud.firestore {
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
              (!('paymentTerms' in data) || (data.paymentTerms is string && data.paymentTerms.size() <= 100)) &&
              (!('buyerAddress' in data) || (data.buyerAddress is string && data.buyerAddress.size() <= 500)) &&
-             (!('buyerPhone' in data) || (data.buyerPhone is string && data.buyerPhone.size() <= 50));
+             (!('buyerPhone' in data) || (data.buyerPhone is string && data.buyerPhone.size() <= 50)) &&
+             (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 100)) &&
+             (!('createdByName' in data) || (data.createdByName is string && data.createdByName.size() <= 200)) &&
+             (!('loadPlanId' in data) || (data.loadPlanId is string && data.loadPlanId.size() <= 100)) &&
+             (!('inventoryDeducted' in data) || (data.inventoryDeducted is bool)) &&
+             (!('inventoryDeductedAt' in data) || (data.inventoryDeductedAt is string || data.inventoryDeductedAt is timestamp));
     }
 
     function isValidUserSession(data) {
@@ -464,6 +505,19 @@ service cloud.firestore {
       allow read: if isStaff();
       allow create, update: if (canManageInventory() || isStaff()) && isValidLoadPlan(request.resource.data);
       allow delete: if canDeleteData() || isManager();
+    }
+
+    match /materialConversions/{conversionId} {
+      allow read: if isStaff();
+      allow create, update: if (canManageInventory() || isStaff()) && isValidMaterialConversion(request.resource.data);
+      allow delete: if false;
+    }
+
+    match /inventoryAdjustments/{adjustmentId} {
+      allow read: if isStaff();
+      allow create: if (canManageInventory() || isStaff()) && isValidInventoryAdjustment(request.resource.data);
+      allow update: if false;
+      allow delete: if canDeleteData();
     }
 
     match /dailySnapshots/{snapshotId} {

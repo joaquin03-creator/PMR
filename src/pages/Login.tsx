@@ -177,7 +177,6 @@ If this is your administrator account, please check the "Create Account" option 
       try {
         if (isManagementMode) {
           localStorage.setItem('pm_force_manager_registration', cleanedEmail);
-          localStorage.setItem('pm_force_manager_password', adminPassword);
           try {
             await createUserWithEmailAndPassword(auth, cleanedEmail, adminPassword);
           } catch (createErr: any) {
@@ -205,7 +204,6 @@ If this is your administrator account, please check the "Create Account" option 
             )) {
               console.log('Master account not yet present. Cooperating on the fly...');
               localStorage.setItem('pm_force_manager_registration', cleanedEmail);
-              localStorage.setItem('pm_force_manager_password', adminPassword);
               await createUserWithEmailAndPassword(auth, cleanedEmail, adminPassword);
             } else {
               throw loginErr;

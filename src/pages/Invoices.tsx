@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { auth, db } from '../firebase';
 import { useSettings } from '../context/SettingsContext';
-import { collection, onSnapshot, addDoc, doc, updateDoc, query, orderBy, getDoc, deleteDoc } from 'firebase/firestore';
+import { collection, onSnapshot, addDoc, doc, updateDoc, query, orderBy, getDoc, deleteDoc, writeBatch, increment } from 'firebase/firestore';
 import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfile, BuyTicket, LoadPlan } from '../types';
 import { logAuditEvent } from '../lib/audit';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
@@ -30,7 +30,8 @@ import {
   History,
   Edit2,
   Save,
-  ChevronDown
+  ChevronDown,
+  Package
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
@@ -344,6 +345,10 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
+  const [inventoryMap, setInventoryMap] = useState<Record<string, number>>({});
+  const [expandedInvoiceIds, setExpandedInvoiceIds] = useState<Record<string, boolean>>({});
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   
   // Standalone Invoice Form State
@@ -528,6 +533,14 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       (error) => handleFirestoreError(error, OperationType.LIST, 'loadPlans')
     );
 
+    const unsubInventory = onSnapshot(collection(db, 'inventory'), (snapshot) => {
+      const map: Record<string, number> = {};
+      snapshot.docs.forEach(docSnap => {
+        map[docSnap.id] = Number(docSnap.data().currentWeight) || 0;
+      });
+      setInventoryMap(map);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'inventory'));
+
     return () => {
       try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
       try { unsubTrips(); } catch (e) { console.warn('unsubTrips error', e); }
@@ -535,6 +548,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
       try { unsubBuyTickets(); } catch (e) { console.warn('unsubBuyTickets error', e); }
       try { unsubLoadPlans(); } catch (e) { console.warn('unsubLoadPlans error', e); }
+      try { unsubInventory(); } catch (e) { console.warn('unsubInventory error', e); }
     };
   }, [profile]);
 
@@ -550,6 +564,97 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   }, [showInvoicePreview, autoPrint, settings.debugPrintMode]);
 
   const handleUpdateInvoiceStatus = async (invoiceId: string, status: Invoice['status']) => {
+    setActionError(null);
+    setActionSuccess(null);
+    const inv = invoices.find(i => i.id === invoiceId) || (selectedInvoice?.id === invoiceId ? selectedInvoice : null);
+    if (!inv) return;
+
+    // Requirement 5: Block status change away from Paid if inventory was already deducted
+    if (inv.inventoryDeducted && status !== 'paid') {
+      const msg = `Status change blocked: Inventory was already deducted for this invoice. Changing status away from Paid is blocked to prevent inventory discrepancies.`;
+      setActionError(msg);
+      alert(msg);
+      return;
+    }
+
+    // Requirement 3 & 4: Deduct inventory when transitioning to Paid
+    if (status === 'paid' && !inv.inventoryDeducted) {
+      const requiredByMaterial: Record<string, number> = {};
+      inv.materials?.forEach(item => {
+        if (item.materialId) {
+          const w = Number(item.weight) || 0;
+          requiredByMaterial[item.materialId] = (requiredByMaterial[item.materialId] || 0) + w;
+        }
+      });
+
+      const insufficientLines: string[] = [];
+      for (const [matId, reqWeight] of Object.entries(requiredByMaterial)) {
+        const availWeight = inventoryMap[matId] ?? 0;
+        if (availWeight < reqWeight) {
+          const mat = materials.find(m => m.id === matId);
+          const matName = mat ? `${mat.name} (${mat.code})` : matId;
+          const shortfall = reqWeight - availWeight;
+          insufficientLines.push(`${matName}: required ${reqWeight.toLocaleString()} lbs, available ${availWeight.toLocaleString()} lbs (short by ${shortfall.toLocaleString()} lbs)`);
+        }
+      }
+
+      if (insufficientLines.length > 0) {
+        const msg = `Cannot mark invoice as Paid due to insufficient live inventory:\n• ${insufficientLines.join('\n• ')}`;
+        setActionError(msg);
+        alert(msg);
+        return;
+      }
+
+      setProcessing(true);
+      try {
+        const batch = writeBatch(db);
+        const timestamp = new Date().toISOString();
+
+        for (const [matId, reqWeight] of Object.entries(requiredByMaterial)) {
+          const invRef = doc(db, 'inventory', matId);
+          batch.set(invRef, {
+            materialId: matId,
+            currentWeight: increment(-reqWeight),
+            lastUpdated: timestamp
+          }, { merge: true });
+        }
+
+        const invRef = doc(db, 'invoices', invoiceId);
+        batch.update(invRef, {
+          status: 'paid',
+          inventoryDeducted: true,
+          inventoryDeductedAt: timestamp
+        });
+
+        await batch.commit();
+
+        if (selectedInvoice && selectedInvoice.id === invoiceId) {
+          setSelectedInvoice({
+            ...selectedInvoice,
+            status: 'paid',
+            inventoryDeducted: true,
+            inventoryDeductedAt: timestamp
+          });
+        }
+
+        await logAuditEvent(
+          'invoice',
+          invoiceId,
+          'update',
+          { after: { status: 'paid', inventoryDeducted: true } },
+          `Marked invoice ${inv.invoiceNumber} as Paid and deducted line-item inventory`
+        );
+
+        setActionSuccess(`Invoice ${inv.invoiceNumber} marked as Paid and inventory deducted successfully.`);
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `invoices/${invoiceId}`);
+      } finally {
+        setProcessing(false);
+      }
+      return;
+    }
+
+    setProcessing(true);
     try {
       await updateDoc(doc(db, 'invoices', invoiceId), { status });
       if (selectedInvoice && selectedInvoice.id === invoiceId) {
@@ -564,6 +669,8 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       );
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `invoices/${invoiceId}`);
+    } finally {
+      setProcessing(false);
     }
   };
 
@@ -922,31 +1029,77 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   };
 
   const handleDeleteInvoice = async (invoiceId: string, tripTicketId?: string) => {
-    if (!window.confirm('Are you sure you want to delete this invoice? This action cannot be undone.')) return;
-    
+    setActionError(null);
+    setActionSuccess(null);
+    const targetInvoice = invoices.find(inv => inv.id === invoiceId) || (selectedInvoice?.id === invoiceId ? selectedInvoice : null);
+    if (!targetInvoice) return;
+
+    if (!window.confirm(`Are you sure you want to delete invoice ${targetInvoice.invoiceNumber}? This action cannot be undone.`)) return;
+
     setProcessing(true);
     try {
+      const batch = writeBatch(db);
+      const timestamp = new Date().toISOString();
+
+      // Requirement 6 & 7: Restore inventory if invoice was Paid (inventoryDeducted is true)
+      if (targetInvoice.inventoryDeducted) {
+        const restoreByMaterial: Record<string, number> = {};
+        targetInvoice.materials?.forEach(item => {
+          if (item.materialId) {
+            const w = Number(item.weight) || 0;
+            restoreByMaterial[item.materialId] = (restoreByMaterial[item.materialId] || 0) + w;
+          }
+        });
+
+        const missingMaterials: string[] = [];
+        for (const matId of Object.keys(restoreByMaterial)) {
+          const matExists = materials.some(m => m.id === matId);
+          if (!matExists) {
+            missingMaterials.push(matId);
+          }
+        }
+
+        if (missingMaterials.length > 0) {
+          const msg = `Deletion blocked: Material '${missingMaterials.join(', ')}' referenced on this invoice no longer exists in the system. Restoration cannot be completed cleanly.`;
+          setActionError(msg);
+          alert(msg);
+          setProcessing(false);
+          return;
+        }
+
+        for (const [matId, weightToRestore] of Object.entries(restoreByMaterial)) {
+          const invRef = doc(db, 'inventory', matId);
+          batch.set(invRef, {
+            materialId: matId,
+            currentWeight: increment(weightToRestore),
+            lastUpdated: timestamp
+          }, { merge: true });
+        }
+      }
+
+      batch.delete(doc(db, 'invoices', invoiceId));
+
+      if (tripTicketId) {
+        batch.update(doc(db, 'tripTickets', tripTicketId), {
+          invoiceId: null,
+          invoiceStatus: 'pending'
+        });
+      }
+
+      await batch.commit();
+
       await logAuditEvent(
         'invoice',
         invoiceId,
         'delete',
         undefined,
-        `Deleted invoice ${selectedInvoice?.invoiceNumber || invoiceId} linked to Trip Ticket ${tripTicketId || 'none'}`
+        `Deleted invoice ${targetInvoice.invoiceNumber}.${targetInvoice.inventoryDeducted ? ' Restored deducted inventory.' : ''}`
       );
 
-      await deleteDoc(doc(db, 'invoices', invoiceId));
-      
-      // If it was linked to a trip ticket, update the ticket status back to pending
-      if (tripTicketId) {
-        await updateDoc(doc(db, 'tripTickets', tripTicketId), {
-          invoiceId: null,
-          invoiceStatus: 'pending'
-        });
-      }
-      
       setShowInvoicePreview(false);
+      setActionSuccess(`Invoice ${targetInvoice.invoiceNumber} deleted successfully.`);
     } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, 'invoices');
+      handleFirestoreError(error, OperationType.DELETE, `invoices/${invoiceId}`);
     } finally {
       setProcessing(false);
     }
@@ -957,6 +1110,32 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   return (
     <div className="max-w-7xl mx-auto space-y-8">
       <div className={cn("space-y-8", showInvoicePreview && "print:hidden")}>
+        {actionError && (
+          <div className="bg-red-50 border border-red-200 rounded-2xl p-4 text-red-800 text-sm flex items-start gap-3 animate-in fade-in">
+            <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+            <div className="flex-1 whitespace-pre-line">
+              <p className="font-bold">Action Blocked</p>
+              <p className="mt-0.5 text-xs text-red-700 font-medium">{actionError}</p>
+            </div>
+            <button onClick={() => setActionError(null)} className="p-1 hover:bg-red-100 rounded-lg text-red-500">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {actionSuccess && (
+          <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 text-emerald-800 text-sm flex items-start gap-3 animate-in fade-in">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="font-bold">Success</p>
+              <p className="mt-0.5 text-xs text-emerald-700 font-medium">{actionSuccess}</p>
+            </div>
+            <button onClick={() => setActionSuccess(null)} className="p-1 hover:bg-emerald-100 rounded-lg text-emerald-500">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
         <div>
           <h1 className="text-4xl font-black text-slate-900 tracking-tight font-display">Invoicing</h1>
@@ -1497,72 +1676,155 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="bg-slate-50 text-slate-500 text-[10px] font-black uppercase tracking-widest border-b border-slate-100">
-                    <th className="px-8 py-5">Invoice #</th>
-                    <th className="px-8 py-5">Date</th>
-                    <th className="px-8 py-5">Buyer</th>
-                    <th className="px-8 py-5">Amount</th>
-                    <th className="px-8 py-5">Status</th>
-                    <th className="px-8 py-5 text-right">Actions</th>
+                    <th className="w-10 px-4 py-5"></th>
+                    <th className="px-6 py-5">Invoice #</th>
+                    <th className="px-6 py-5">Date</th>
+                    <th className="px-6 py-5">Buyer</th>
+                    <th className="px-6 py-5">Amount</th>
+                    <th className="px-6 py-5">Status</th>
+                    <th className="px-6 py-5 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-50">
-                  {invoices.map((invoice) => (
-                    <tr key={invoice.id} className="hover:bg-blue-50/30 transition-all group">
-                      <td className="px-8 py-6">
-                        <p className="text-sm font-black text-slate-900">{invoice.invoiceNumber}</p>
-                      </td>
-                      <td className="px-8 py-6">
-                        <p className="text-sm font-bold text-slate-700">{new Date(invoice.date).toLocaleDateString()}</p>
-                        {invoice.createdByName && (
-                          <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest mt-1">
-                            By: {invoice.createdByName}
-                          </p>
+                  {invoices.map((invoice) => {
+                    const isExpanded = !!expandedInvoiceIds[invoice.id];
+                    return (
+                      <React.Fragment key={invoice.id}>
+                        <tr className="hover:bg-blue-50/30 transition-all group">
+                          <td className="pl-6 py-6 w-10">
+                            <button
+                              onClick={() => setExpandedInvoiceIds(prev => ({ ...prev, [invoice.id]: !prev[invoice.id] }))}
+                              className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-slate-100 rounded-xl transition-all"
+                              title={isExpanded ? "Collapse materials" : "Expand material line items"}
+                            >
+                              <ChevronRight className={cn("w-5 h-5 transition-transform duration-200", isExpanded && "rotate-90 text-blue-600")} />
+                            </button>
+                          </td>
+                          <td className="px-6 py-6">
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-black text-slate-900">{invoice.invoiceNumber}</p>
+                              {invoice.inventoryDeducted && (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-black bg-emerald-50 text-emerald-700 border border-emerald-200 uppercase tracking-wider" title="Inventory deducted">
+                                  <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                  Deducted
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-6 py-6">
+                            <p className="text-sm font-bold text-slate-700">{new Date(invoice.date).toLocaleDateString()}</p>
+                            {invoice.createdByName && (
+                              <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest mt-1">
+                                By: {invoice.createdByName}
+                              </p>
+                            )}
+                          </td>
+                          <td className="px-6 py-6">
+                            <p className="text-sm font-bold text-slate-700 uppercase tracking-tight">{invoice.buyerName}</p>
+                          </td>
+                          <td className="px-6 py-6">
+                            <p className="text-sm font-black text-blue-600">${invoice.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                          </td>
+                          <td className="px-6 py-6">
+                            <span className={cn(
+                              "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border",
+                              invoice.status === 'paid' ? "bg-emerald-50 text-emerald-600 border-emerald-100" :
+                              invoice.status === 'sent' ? "bg-blue-50 text-blue-600 border-blue-100" :
+                              "bg-slate-50 text-slate-500 border-slate-100"
+                            )}>
+                              {invoice.status}
+                            </span>
+                          </td>
+                          <td className="px-6 py-6 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <button 
+                                onClick={() => {
+                                  setSelectedInvoice(invoice);
+                                  setIsEditing(false);
+                                  setShowInvoicePreview(true);
+                                }}
+                                className="p-3 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-2xl transition-all"
+                                title="View Invoice"
+                              >
+                                <ChevronRight className="w-6 h-6" />
+                              </button>
+                              <button
+                                onClick={() => handleDeleteInvoice(invoice.id, invoice.tripTicketId)}
+                                disabled={processing}
+                                className="p-3 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-2xl transition-all disabled:opacity-50"
+                                title="Delete Invoice"
+                              >
+                                <Trash2 className="w-5 h-5" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+
+                        {isExpanded && (
+                          <tr className="bg-slate-50/60">
+                            <td colSpan={7} className="px-8 py-4 border-t border-b border-slate-100">
+                              <div className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-sm space-y-3">
+                                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                                  <div className="flex items-center gap-2">
+                                    <Package className="w-4 h-4 text-blue-600" />
+                                    <h4 className="text-xs font-black uppercase tracking-wider text-slate-700">
+                                      Material Line Items ({invoice.materials?.length || 0})
+                                    </h4>
+                                  </div>
+                                  {invoice.inventoryDeducted && (
+                                    <span className="inline-flex items-center gap-1.5 text-[10px] font-black text-emerald-700 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200 uppercase tracking-wider">
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                      Inventory Deducted
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="divide-y divide-slate-100">
+                                  {invoice.materials && invoice.materials.length > 0 ? (
+                                    invoice.materials.map((item, idx) => {
+                                      const mat = materials.find(m => m.id === item.materialId);
+                                      const matName = mat ? `${mat.name} (${mat.code})` : (item.customName || item.materialId || 'Unknown Material');
+                                      const weight = Number(item.weight) || 0;
+                                      const price = Number(item.salePrice) || 0;
+                                      const lineTotal = weight * price;
+                                      return (
+                                        <div key={idx} className="py-2.5 flex items-center justify-between text-xs">
+                                          <div className="flex items-center gap-3">
+                                            <span className="w-6 h-6 rounded-lg bg-slate-100 font-black text-slate-500 text-[10px] flex items-center justify-center">
+                                              #{idx + 1}
+                                            </span>
+                                            <div>
+                                              <p className="font-bold text-slate-900">{matName}</p>
+                                              {item.boxNumber && (
+                                                <p className="text-[10px] text-slate-400 font-semibold">{item.boxNumber}</p>
+                                              )}
+                                            </div>
+                                          </div>
+                                          <div className="flex items-center gap-8 text-right">
+                                            <div>
+                                              <span className="font-black text-slate-800">{weight.toLocaleString()} lbs</span>
+                                              <span className="text-[10px] text-slate-400 ml-2">@ ${price.toFixed(2)}/lb</span>
+                                            </div>
+                                            <span className="font-black text-blue-600 min-w-[90px]">
+                                              ${lineTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                            </span>
+                                          </div>
+                                        </div>
+                                      );
+                                    })
+                                  ) : (
+                                    <p className="py-2 text-slate-400 text-xs italic">No line items on this invoice.</p>
+                                  )}
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
                         )}
-                      </td>
-                      <td className="px-8 py-6">
-                        <p className="text-sm font-bold text-slate-700 uppercase tracking-tight">{invoice.buyerName}</p>
-                      </td>
-                      <td className="px-8 py-6">
-                        <p className="text-sm font-black text-blue-600">${invoice.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
-                      </td>
-                      <td className="px-8 py-6">
-                        <span className={cn(
-                          "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border",
-                          invoice.status === 'paid' ? "bg-emerald-50 text-emerald-600 border-emerald-100" :
-                          invoice.status === 'sent' ? "bg-blue-50 text-blue-600 border-blue-100" :
-                          "bg-slate-50 text-slate-500 border-slate-100"
-                        )}>
-                          {invoice.status}
-                        </span>
-                      </td>
-                      <td className="px-8 py-6 text-right">
-                        <div className="flex items-center justify-end gap-2">
-                          <button 
-                            onClick={() => {
-                              setSelectedInvoice(invoice);
-                              setIsEditing(false);
-                              setShowInvoicePreview(true);
-                            }}
-                            className="p-3 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-2xl transition-all"
-                            title="View Invoice"
-                          >
-                            <ChevronRight className="w-6 h-6" />
-                          </button>
-                          <button
-                            onClick={() => handleDeleteInvoice(invoice.id, invoice.tripTicketId)}
-                            disabled={processing}
-                            className="p-3 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-2xl transition-all disabled:opacity-50"
-                            title="Delete Invoice"
-                          >
-                            <Trash2 className="w-5 h-5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                      </React.Fragment>
+                    );
+                  })}
                   {invoices.length === 0 && (
                     <tr>
-                      <td colSpan={6} className="px-8 py-20 text-center">
+                      <td colSpan={7} className="px-8 py-20 text-center">
                         <div className="max-w-xs mx-auto space-y-3">
                           <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto">
                             <FileText className="w-8 h-8 text-slate-200" />

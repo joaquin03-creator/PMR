@@ -2,7 +2,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { onAuthStateChanged, User, setPersistence, browserLocalPersistence } from 'firebase/auth';
 import { useEffect, useState } from 'react';
 import { auth, db } from './firebase';
-import { doc, getDoc, setDoc, updateDoc, onSnapshot, deleteDoc, collection, query, where } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, onSnapshot, deleteDoc, collection, query, where, deleteField } from 'firebase/firestore';
 import { UserProfile, UserRole, SystemConfig } from './types';
 import Layout from './components/Layout';
 import Login from './pages/Login';
@@ -39,6 +39,12 @@ export default function App() {
   const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
   const [activeSessions, setActiveSessions] = useState<UserSession[]>([]);
   const [sessionLimitExceeded, setSessionLimitExceeded] = useState(false);
+
+  // One-time security cleanup for legacy credential cache keys
+  useEffect(() => {
+    localStorage.removeItem('cachedPassword');
+    localStorage.removeItem('pm_force_manager_password');
+  }, []);
 
   // Subscribe to Global System Config
   useEffect(() => {
@@ -256,7 +262,19 @@ export default function App() {
           
           if (userDoc.exists()) {
             setLoadingStatus('Profile Found. Loading Dashboard...');
-            const data = userDoc.data() as UserProfile;
+            const rawData = userDoc.data() as any;
+            
+            // Security cleanup: strip legacy cachedPassword field if present in Firestore
+            if (rawData.cachedPassword !== undefined) {
+              try {
+                await updateDoc(doc(db, 'users', firebaseUser.uid), { cachedPassword: deleteField() });
+              } catch (cleanErr) {
+                console.warn('Failed to strip cachedPassword field from Firestore user document:', cleanErr);
+              }
+              delete rawData.cachedPassword;
+            }
+
+            const data = rawData as UserProfile;
             
             // Migration: Ensure existing managers have permissions
             const defaultPermissions = {
@@ -345,11 +363,6 @@ export default function App() {
                 canRetroactivePriceAdjustments: targetRole === 'manager',
               };
               
-              const cachedPassword = localStorage.getItem('pm_force_manager_password') || undefined;
-              if (cachedPassword) {
-                localStorage.removeItem('pm_force_manager_password');
-              }
-
               const newProfile: UserProfile = {
                 uid: firebaseUser.uid,
                 email: firebaseUser.email || `demo-${targetRole}@preferredmetalsrecycling.com`,
@@ -357,7 +370,6 @@ export default function App() {
                 displayName: firebaseUser.displayName || (isDemo ? (targetRole === 'manager' ? 'On-Duty Manager' : 'On-Duty Cashier') : isOwner ? 'Master Manager' : 'Employee'),
                 managerPin: isDemo && targetRole === 'manager' ? '1234' : isOwner ? '1234' : undefined,
                 permissions: defaultPermissions,
-                cachedPassword,
               };
               
               try {

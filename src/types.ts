@@ -34,7 +34,6 @@ export interface UserProfile {
   role: UserRole;
   displayName?: string;
   managerPin?: string; // 4-digit PIN for approvals
-  cachedPassword?: string;
   permissions?: UserPermissions;
 }
 
@@ -101,6 +100,8 @@ export interface BuyTicket {
   totalAmount: number;
   status: 'pending' | 'completed' | 'cancelled' | 'voided';
   timestamp: string;
+  businessName?: string;
+  idNumber?: string;
   vehiclePlate?: string;
   vehicleType?: string;
   vehicleYear?: string;
@@ -114,6 +115,7 @@ export interface BuyTicket {
   fingerprintUrl?: string; // Optional for high-risk items
   signatureUrl?: string; // Essential for compliance & acknowledgment
   vehiclePhotoUrl?: string; // Captured from Entrance Cam
+  loadPhotoUrl?: string; // Captured at scale for load/materials
   createdBy?: string;
   createdByName?: string;
   ohioDatabaseStatus?: 'not_checked' | 'cleared' | 'flagged';
@@ -173,6 +175,8 @@ export interface Invoice {
   createdBy?: string;
   createdByName?: string;
   loadPlanId?: string;
+  inventoryDeducted?: boolean;
+  inventoryDeductedAt?: string;
 }
 
 export interface InventoryItem {
@@ -182,6 +186,13 @@ export interface InventoryItem {
   lastUpdated: string;
 }
 
+export interface ExternalSaleItem {
+  materialId: string;
+  weight: number;
+  salePrice: number;
+  notes?: string;
+}
+
 export interface ExternalSale {
   id: string;
   materialId: string;
@@ -189,8 +200,12 @@ export interface ExternalSale {
   salePrice: number;
   date: string;
   notes?: string;
+  buyerName?: string;
   recordedAt: string;
   recordedBy: string;
+  items?: ExternalSaleItem[];
+  totalWeight?: number;
+  totalRevenue?: number;
 }
 
 export interface LoadPlanBox {
@@ -211,6 +226,34 @@ export interface LoadPlan {
   totalWeight: number;
   recordedAt: string;
   recordedBy: string;
+}
+
+export interface MaterialConversion {
+  id: string;
+  sourceMaterialId: string;
+  destinationMaterialId: string;
+  consumedWeight: number;
+  producedWeight: number;
+  yieldPercent: number;
+  timestamp: string;
+  status: 'completed' | 'voided';
+  notes?: string;
+  voidedAt?: string;
+}
+
+export interface InventoryAdjustment {
+  id: string;
+  materialId: string;
+  materialName?: string;
+  materialCode?: string;
+  adjustmentAmount: number; // positive (add) or negative (remove)
+  reason: string;
+  isEstimate: boolean;
+  previousWeight?: number;
+  resultingWeight?: number;
+  timestamp: string;
+  recordedBy: string;
+  recordedByUid?: string;
 }
 
 export interface DoNotBuyEntry {

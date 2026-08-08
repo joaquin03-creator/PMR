@@ -28,7 +28,7 @@ import {
   Truck,
   Sparkles
 } from 'lucide-react';
-import { cn } from '../lib/utils';
+import { cn, getCustomerDataGaps } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { CameraCapture } from '../components/CameraCapture';
 import { logAuditEvent } from '../lib/audit';
@@ -61,7 +61,15 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
   const [pinPurpose, setPinPurpose] = useState<'delete' | 'merge' | null>(null);
   const [addForm, setAddForm] = useState<Partial<Customer>>({});
   const [searchParams, setSearchParams] = useSearchParams();
+  const [filterMissingPhotos, setFilterMissingPhotos] = useState(false);
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+  useEffect(() => {
+    const filterParam = searchParams.get('filter');
+    if (filterParam === 'missing_photos' || filterParam === 'incomplete') {
+      setFilterMissingPhotos(true);
+    }
+  }, [searchParams]);
 
   const triggerNotification = (message: string, type: 'success' | 'error' = 'success') => {
     setNotification({ message, type });
@@ -470,12 +478,19 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
     setIsEditing(false);
   };
 
-  const filteredCustomers = customers.filter(c => 
-    c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    c.businessName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    c.phone?.includes(searchQuery) ||
-    c.email?.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const incompleteCount = customers.filter(c => getCustomerDataGaps(c).length > 0).length;
+
+  const filteredCustomers = customers.filter(c => {
+    if (filterMissingPhotos && getCustomerDataGaps(c).length === 0) {
+      return false;
+    }
+    return (
+      c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      c.businessName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      c.phone?.includes(searchQuery) ||
+      c.email?.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+  });
 
   if (loading) {
     return (
@@ -505,62 +520,85 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
         </button>
       </header>
 
-      <div className="relative group max-w-2xl">
-        <label htmlFor="customer-search" className="sr-only">Search customers by name or phone</label>
-        <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 group-focus-within:text-blue-500 transition-colors" aria-hidden="true" />
-        <input
-          id="customer-search"
-          type="text"
-          placeholder="Search by name or phone..."
-          className="w-full pl-14 pr-6 py-4 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-medium shadow-sm transition-all text-lg"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-        />
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4">
+        <div className="relative group max-w-2xl flex-1">
+          <label htmlFor="customer-search" className="sr-only">Search customers by name or phone</label>
+          <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 group-focus-within:text-blue-500 transition-colors" aria-hidden="true" />
+          <input
+            id="customer-search"
+            type="text"
+            placeholder="Search by name or phone..."
+            className="w-full pl-14 pr-6 py-4 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-medium shadow-sm transition-all text-lg"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setFilterMissingPhotos(prev => !prev)}
+          className={cn(
+            "px-4 py-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 border transition-all shrink-0 cursor-pointer",
+            filterMissingPhotos 
+              ? "bg-amber-500 text-white border-amber-600 shadow-md shadow-amber-200" 
+              : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+          )}
+        >
+          <AlertTriangle className={cn("w-4 h-4", filterMissingPhotos ? "text-white" : "text-amber-500")} />
+          <span>Missing photos ({incompleteCount})</span>
+        </button>
       </div>
 
       <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" aria-label="Customer List">
-        {filteredCustomers.map((customer) => (
-          <article 
-            key={customer.id} 
-            className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm hover:border-blue-200 transition-colors group cursor-pointer outline-none focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500"
-            onClick={() => openProfile(customer)}
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                openProfile(customer);
-              }
-            }}
-            aria-label={`View profile for ${customer.name}`}
-          >
-            <div className="flex items-center gap-4 mb-4">
-              {customer.photoUrl ? (
-                <img 
-                  src={customer.photoUrl} 
-                  alt="" 
-                  className="w-12 h-12 rounded-full object-cover border border-slate-200 shadow-sm"
-                  referrerPolicy="no-referrer"
-                  aria-hidden="true"
-                  onError={handleImageError}
-                />
-              ) : (
-                <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-400 group-hover:bg-blue-50 group-hover:text-blue-600 transition-colors">
-                  <Users className="w-6 h-6" aria-hidden="true" />
+        {filteredCustomers.map((customer) => {
+          const gaps = getCustomerDataGaps(customer);
+          return (
+            <article 
+              key={customer.id} 
+              className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm hover:border-blue-200 transition-colors group cursor-pointer outline-none focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500"
+              onClick={() => openProfile(customer)}
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  openProfile(customer);
+                }
+              }}
+              aria-label={`View profile for ${customer.name}`}
+            >
+              <div className="flex items-center gap-4 mb-4">
+                {customer.photoUrl ? (
+                  <img 
+                    src={customer.photoUrl} 
+                    alt="" 
+                    className="w-12 h-12 rounded-full object-cover border border-slate-200 shadow-sm"
+                    referrerPolicy="no-referrer"
+                    aria-hidden="true"
+                    onError={handleImageError}
+                  />
+                ) : (
+                  <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-400 group-hover:bg-blue-50 group-hover:text-blue-600 transition-colors">
+                    <Users className="w-6 h-6" aria-hidden="true" />
+                  </div>
+                )}
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="font-bold text-slate-900">{customer.name}</h3>
+                    {customer.isBuyer && (
+                      <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-[10px] font-black uppercase tracking-widest rounded-full flex items-center gap-1">
+                        <ShieldCheck className="w-3 h-3" />
+                        Buyer
+                      </span>
+                    )}
+                    {gaps.length > 0 && (
+                      <span className="px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 text-[10px] font-bold rounded-full flex items-center gap-1">
+                        Needs {gaps.join(' + ')}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-400">Customer since {new Date(customer.createdAt).toLocaleDateString()}</p>
                 </div>
-              )}
-              <div>
-                <div className="flex items-center gap-2">
-                  <h3 className="font-bold text-slate-900">{customer.name}</h3>
-                  {customer.isBuyer && (
-                    <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-[10px] font-black uppercase tracking-widest rounded-full flex items-center gap-1">
-                      <ShieldCheck className="w-3 h-3" />
-                      Buyer
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-slate-400">Customer since {new Date(customer.createdAt).toLocaleDateString()}</p>
               </div>
-            </div>
 
             <div className="space-y-3">
               {customer.businessName && (
@@ -594,7 +632,8 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
               </button>
             </div>
           </article>
-        ))}
+        );
+      })}
       </section>
 
       {showAddModal && (

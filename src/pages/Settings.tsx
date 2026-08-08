@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { collection, getDocs, deleteDoc, doc, writeBatch, addDoc, onSnapshot, updateDoc, setDoc, query, where } from 'firebase/firestore';
 import { UserProfile, Material, Customer, UserRole, UserPermissions, UserSession, UserInvite, SystemConfig, BuyTicket } from '../types';
@@ -197,6 +198,16 @@ export default function Settings({ profile }: SettingsProps) {
   const [validatingCredentials, setValidatingCredentials] = useState(false);
   const [validationResult, setValidationResult] = useState<{ success: boolean; message: string } | null>(null);
   const [showOhioPassword, setShowOhioPassword] = useState(false);
+  const [searchParams] = useSearchParams();
+
+  useEffect(() => {
+    const scrollTarget = searchParams.get('scroll');
+    if (scrollTarget === 'compliance-repair') {
+      setTimeout(() => {
+        document.getElementById('compliance-data-repair-card')?.scrollIntoView({ behavior: 'smooth' });
+      }, 300);
+    }
+  }, [searchParams]);
 
   // Fetch public key hint on component mount
   useEffect(() => {
@@ -343,7 +354,6 @@ export default function Settings({ profile }: SettingsProps) {
         role: inviteRole,
         displayName: inviteName,
         managerPin: inviteRole === 'manager' ? '1234' : undefined,
-        cachedPassword: invitePassword,
         permissions: defaultPermissions,
       };
 
@@ -1129,7 +1139,7 @@ export default function Settings({ profile }: SettingsProps) {
     }
   };
 
-  const handleResetPassword = async (uid: string, targetEmail: string, oldCachedPass?: string) => {
+  const handleResetPassword = async (uid: string, targetEmail: string) => {
     if (!newPassword || newPassword.length < 6) {
       setPasswordError('Password must be at least 6 characters long.');
       return;
@@ -1143,27 +1153,26 @@ export default function Settings({ profile }: SettingsProps) {
       // Are we resetting our own password?
       if (uid === auth.currentUser?.uid) {
         await updatePassword(auth.currentUser, newPassword);
-        await updateDoc(doc(db, 'users', uid), { cachedPassword: newPassword });
         
         await logAuditEvent(
           'settings',
           uid,
           'update',
-          { before: { cachedPassword: '***' }, after: { cachedPassword: '***' } },
+          { before: { reset: false }, after: { reset: true } },
           `User changed their own account password: ${targetEmail}`
         );
         
-        setPasswordSuccess('Password reset successfully and updated in your profile!');
+        setPasswordSuccess('Password reset successfully!');
         setNewPassword('');
         firestore(
           'Password Changed',
-          'Successfully updated your login password in Firebase Auth and profile cache.'
+          'Successfully updated your login password in Firebase Auth.'
         );
       } else {
         // Manager resetting another user's password via secure backend administrative bypass
         const idToken = await auth.currentUser?.getIdToken();
         if (!idToken) {
-          throw new Error('You must be logs-in manager to reset employee passwords.');
+          throw new Error('You must be logged in as a manager to reset employee passwords.');
         }
 
         const response = await fetch('/api/admin-reset-password', {
@@ -1175,8 +1184,7 @@ export default function Settings({ profile }: SettingsProps) {
           body: JSON.stringify({
             targetUid: uid,
             targetEmail: targetEmail,
-            newPassword: newPassword,
-            oldPassword: oldCachedPass
+            newPassword: newPassword
           })
         });
 
@@ -1185,28 +1193,20 @@ export default function Settings({ profile }: SettingsProps) {
           throw new Error(data.error || 'Failed to administratively reset password.');
         }
 
-        // Directly update the cachedPassword in Firestore from the authenticated manager's client browser
-        await setDoc(doc(db, 'users', uid), {
-          cachedPassword: newPassword,
+        await updateDoc(doc(db, 'users', uid), {
           updatedAt: new Date().toISOString()
-        }, { merge: true });
+        });
         
         await logAuditEvent(
           'settings',
           uid,
           'update',
-          { before: { cachedPassword: '***' }, after: { cachedPassword: '***' } },
+          { before: { reset: false }, after: { reset: true } },
           `Manager administratively reset account password for employee: ${targetEmail}`
         );
         
-        setPasswordSuccess(`Success! Password successfully updated directly in the database and Firebase Auth for ${targetEmail}. Bypassed standard email verification flow.`);
+        setPasswordSuccess(`Success! Password successfully updated in Firebase Auth for ${targetEmail}.`);
         setNewPassword('');
-
-        // Update local users array to match
-        setUsers(prevUsers => prevUsers.map(u => u.uid === uid ? { ...u, cachedPassword: newPassword } : u));
-        if (selectedUser && selectedUser.uid === uid) {
-          setSelectedUser(prevSelected => prevSelected ? { ...prevSelected, cachedPassword: newPassword } : null);
-        }
 
         firestore(
           'Password Reset Done',
@@ -1957,42 +1957,6 @@ export default function Settings({ profile }: SettingsProps) {
                 value={settings.ohioScrapDealerId || ''}
                 onChange={(e) => updateSettings({ ohioScrapDealerId: e.target.value })}
               />
-            </div>
-          </div>
-
-          {/* Right Column: Portal Login Credentials */}
-          <div className="space-y-4">
-            <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight font-display">Portal Login Credentials</h4>
-            
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Username / Login Email</label>
-              <input
-                type="text"
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold"
-                placeholder="e.g. compliance@scrapmetaldealer.com"
-                value={settings.ohioScrapUsername || ''}
-                onChange={(e) => updateSettings({ ohioScrapUsername: e.target.value })}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Portal Password</label>
-              <div className="relative">
-                <input
-                  type={showOhioPassword ? 'text' : 'password'}
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold font-mono pr-12"
-                  placeholder="••••••••••••••"
-                  value={settings.ohioScrapPassword || ''}
-                  onChange={(e) => updateSettings({ ohioScrapPassword: e.target.value })}
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowOhioPassword(!showOhioPassword)}
-                  className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 outline-none transition-all"
-                >
-                  {showOhioPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
             </div>
           </div>
         </div>
@@ -2925,49 +2889,20 @@ export default function Settings({ profile }: SettingsProps) {
                     </div>
                   )}
 
-                  {/* Password Retrieval & Local Reset Section */}
+                  {/* Password Reset Section */}
                   <div className="p-6 bg-slate-50/50 rounded-3xl border border-slate-100 space-y-6">
                     <div className="flex items-center gap-3">
                       <KeyRound className="w-5 h-5 text-blue-600" />
                       <div>
-                        <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Credentials & Local Recovery</h4>
-                        <p className="text-[10px] text-slate-400 font-bold uppercase">See current password and perform inside-app resets</p>
+                        <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Password Reset</h4>
+                        <p className="text-[10px] text-slate-400 font-bold uppercase">Perform administrative password reset</p>
                       </div>
                     </div>
 
                     <div className="space-y-4">
-                      {/* Password visibility check */}
-                      {selectedUser.cachedPassword ? (
-                        <div className="space-y-1.5 p-4 bg-white rounded-2xl border border-slate-200">
-                          <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block animate-pulse">Local Cached Password</label>
-                          <div className="flex items-center justify-between">
-                            <span className="font-mono text-sm font-bold text-slate-900 select-all tracking-wider">
-                              {showPassword ? selectedUser.cachedPassword : '••••••••••••'}
-                            </span>
-                            <button
-                              onClick={() => setShowPassword(!showPassword)}
-                              className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer"
-                              title={showPassword ? "Hide password" : "Reveal password"}
-                            >
-                              {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4 text-blue-500 animate-pulse" />}
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="p-4 bg-amber-50/60 rounded-2xl border border-amber-100 flex items-start gap-2.5">
-                          <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                          <div>
-                            <p className="text-[10px] font-bold text-amber-800">Password Not Locally Cached</p>
-                            <p className="text-[9px] text-amber-600 font-bold uppercase leading-relaxed mt-0.5">
-                              This user was established prior to the local caching system. Reset the password below to create a local recovery record.
-                            </p>
-                          </div>
-                        </div>
-                      )}
-
                       {/* Reset form */}
                       <div className="space-y-3">
-                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">Reset Pasword Security Key</label>
+                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">New Password</label>
                         <div className="flex gap-2">
                           <input
                             type="text"
@@ -2978,7 +2913,7 @@ export default function Settings({ profile }: SettingsProps) {
                             className="flex-1 px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-100 transition-colors placeholder:text-slate-300"
                           />
                           <button
-                            onClick={() => handleResetPassword(selectedUser.uid, selectedUser.email, selectedUser.cachedPassword)}
+                            onClick={() => handleResetPassword(selectedUser.uid, selectedUser.email)}
                             disabled={resettingPassword || !newPassword || newPassword.length < 6}
                             className="px-4 py-2 bg-slate-900 text-white hover:bg-blue-600 rounded-xl text-[10px] font-black uppercase tracking-widest transition-colors disabled:opacity-45 disabled:hover:bg-slate-900 cursor-pointer"
                           >
@@ -3488,10 +3423,13 @@ export default function Settings({ profile }: SettingsProps) {
             </div>
 
             {/* Compliance Data Repair Card */}
-            <div className={cn(
-              "bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-6 lg:col-span-2 relative overflow-hidden transition-all",
-              profile?.role !== 'manager' && "opacity-75 bg-slate-50/50"
-            )}>
+            <div 
+              id="compliance-data-repair-card"
+              className={cn(
+                "bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-6 lg:col-span-2 relative overflow-hidden transition-all",
+                profile?.role !== 'manager' && "opacity-75 bg-slate-50/50"
+              )}
+            >
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-3">
                   <div className="p-2 bg-emerald-50 rounded-xl text-emerald-600">

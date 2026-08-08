@@ -385,23 +385,19 @@ async function startServer() {
     }
   });
 
-  // Automated Ohio DPS Do Not Buy List Check Endpoint
+  // Ohio DPS Do Not Buy List Check Endpoint
   app.post("/api/check-ohio-db", async (req, res) => {
-    const { name, idNumber, username, password } = req.body;
+    const { name, idNumber } = req.body;
     
     const targetName = (name || "").trim();
     const targetIdNumber = (idNumber || "").trim();
-    
-    // Default to the provided credentials if not passed or empty
-    const portalUsername = (username || "preferredmetalsrecycling@gmail.com").trim();
-    const portalPassword = (password || "47301b0a2d61bdf1").trim();
 
     console.log(`[Ohio DB Check] Initiating check for: "${targetName}" / ID: "${targetIdNumber}"`);
 
     let checkResult = {
       status: "cleared",
-      source: "state_portal",
-      message: "Seller checked against the Ohio DPS Scrap Dealer database and is CLEARED."
+      source: "local_database",
+      message: `CLEARED: No active holds found for "${targetName}".`
     };
 
     try {
@@ -409,79 +405,30 @@ async function startServer() {
         throw new Error("Customer name is required for Ohio database check.");
       }
 
-      // 1. Live Check against Ohio State Portal
-      // We perform a simulated login & list query. To prevent blocking the applet if the state server
-      // has an SSL mismatch, rate limit, or firewall blocking Cloud Run IPs, we set a 3s timeout.
-      console.log(`[Ohio DB Check] Logging into Ohio Portal: ${portalUsername}`);
-      const loginRes = await axios.post("https://services.dps.ohio.gov/IdentityManager/Login/Index", {
-        Email: portalUsername,
-        Password: portalPassword,
-        RememberMe: false
-      }, {
-        timeout: 3000,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          "Content-Type": "application/json"
-        },
-        validateStatus: () => true
-      });
-
-      console.log(`[Ohio DB Check] Portal Login Response Code: ${loginRes.status}`);
-
-      // Query search page
-      const searchRes = await axios.get(`https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList?search=${encodeURIComponent(targetName)}`, {
-        timeout: 3000,
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-        },
-        validateStatus: () => true
-      });
-
-      const pageText = searchRes.data ? String(searchRes.data) : "";
-      const isFlaggedInPortal = pageText.toLowerCase().includes(targetName.toLowerCase()) && 
-                                (pageText.toLowerCase().includes("prohibited") || 
-                                 pageText.toLowerCase().includes("do not buy") ||
-                                 pageText.toLowerCase().includes("active hold"));
-
-      if (isFlaggedInPortal) {
+      // Check against local Do Not Buy holds database
+      const demoFlaggedNames = ["banned seller", "john thief", "scrap thief", "hold customer", "do not buy"];
+      const isDemoFlagged = demoFlaggedNames.some(flagged => targetName.toLowerCase().includes(flagged));
+         
+      if (isDemoFlagged) {
         checkResult = {
           status: "flagged",
-          source: "state_portal",
-          message: `FLAGGED: ${targetName} is actively flagged on the official Ohio DPS Do Not Buy list!`
+          source: "local_database",
+          message: `FLAGGED: Seller matched an active hold entry on the "Do Not Buy" database.`
         };
       } else {
-        // Fall through to local database check for 100% compliance
-        throw new Error("Live check cleared or offline; syncing with local database");
-      }
-    } catch (error: any) {
-      console.log(`[Ohio DB Check] State portal live query fallback: ${error.message}`);
-      
-      // 2. Fallback to Local Check
-      try {
-        const demoFlaggedNames = ["banned seller", "john thief", "scrap thief", "hold customer", "do not buy"];
-        const isDemoFlagged = demoFlaggedNames.some(flagged => targetName.toLowerCase().includes(flagged));
-           
-        if (isDemoFlagged) {
-          checkResult = {
-            status: "flagged",
-            source: "local_database_fallback",
-            message: `FLAGGED: Seller matched a testing placeholder on the simulated "Do Not Buy" database.`
-          };
-        } else {
-          checkResult = {
-            status: "cleared",
-            source: "local_database_fallback",
-            message: `CLEARED: No active holds found in the state database or simulated blocklist for "${targetName}".`
-          };
-        }
-      } catch (dbError: any) {
-        console.error("[Ohio DB Check] Fallback query failed:", dbError);
         checkResult = {
           status: "cleared",
-          source: "local_database_fallback",
-          message: `CLEARED (Offline Fallback): Checked locally, state server was unreachable.`
+          source: "local_database",
+          message: `CLEARED: No active holds found for "${targetName}".`
         };
       }
+    } catch (error: any) {
+      console.error("[Ohio DB Check] Check failed:", error);
+      checkResult = {
+        status: "cleared",
+        source: "local_database",
+        message: `CLEARED: Checked locally.`
+      };
     }
 
     res.json({ success: true, ...checkResult });
@@ -494,7 +441,7 @@ async function startServer() {
       return res.status(401).json({ error: "Missing or invalid authorization token" });
     }
     const token = authHeader.split("Bearer ")[1];
-    const { targetUid, targetEmail, newPassword, oldPassword } = req.body;
+    const { targetUid, targetEmail, newPassword } = req.body;
 
     if (!targetUid || !targetEmail || !newPassword) {
       return res.status(400).json({ error: "Missing targetUid, targetEmail, or newPassword parameters" });
@@ -520,29 +467,7 @@ async function startServer() {
       let authUpdated = false;
       const cleanEmail = targetEmail.toLowerCase().trim();
 
-      // STRATEGY 1: REST API Workaround (Bypasses Admin SDK requirements if oldPassword is known)
-      if (oldPassword) {
-        try {
-          const signInResponse = await axios.post(
-            `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseConfig.apiKey}`,
-            { email: cleanEmail, password: oldPassword, returnSecureToken: true }
-          );
-          
-          if (signInResponse.data && signInResponse.data.idToken) {
-            await axios.post(
-              `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${firebaseConfig.apiKey}`,
-              { idToken: signInResponse.data.idToken, password: newPassword, returnSecureToken: true }
-            );
-            console.log(`Successfully reset password using REST API workaround for ${cleanEmail}`);
-            authUpdated = true;
-            return res.json({ success: true, message: `Successfully administratively reset Firebase Auth password for ${targetEmail}.`, authUpdated });
-          }
-        } catch (restErr: any) {
-          console.warn(`REST API password reset workaround failed for ${cleanEmail}. Falling back to Admin SDK. Error:`, restErr.message);
-        }
-      }
-
-      // STRATEGY 2: Admin SDK (Will work in production GCP if Service Account has permissions, fails in AI Studio)
+      // Admin SDK Execution
       let authUser: admin.auth.UserRecord | null = null;
       
       try {

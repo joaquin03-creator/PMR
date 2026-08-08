@@ -76,9 +76,21 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
   
   // Calculate totals
   const totalNetWeight = ticketMaterials.reduce(
-    (sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 
+    (sum, item) => sum + ((item.netWeight || 0) - (item.deductionWeight || 0)), 
     0
   );
+
+  const calculatedTotalAmount = ticketMaterials.reduce((sum, item) => {
+    const paidWeight = Math.max(0, (item.netWeight || 0) - (item.deductionWeight || 0));
+    const itemTotal = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0)
+      ? item.totalAmount
+      : (paidWeight * (item.pricePerUnit || 0));
+    return sum + itemTotal;
+  }, 0);
+
+  const finalTotalAmount = (ticket.totalAmount !== undefined && ticket.totalAmount > 0)
+    ? ticket.totalAmount
+    : calculatedTotalAmount;
 
   // Format vehicle info nicely
   const vehicleParts = [
@@ -362,7 +374,9 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
                 
                 <div style={itemLineStyle}>
                   <span>{displayNetWeight} lb @ ${(item.pricePerUnit || 0).toFixed(2)}/lb</span>
-                  <span style={{ fontWeight: 'bold' }}>${(item.totalAmount || 0).toFixed(2)}</span>
+                  <span style={{ fontWeight: 'bold' }}>
+                    ${((item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0) ? item.totalAmount : (displayNetWeight * (item.pricePerUnit || 0))).toFixed(2)}
+                  </span>
                 </div>
                 
                 {item.notes && <div style={{ fontSize: '10px', marginTop: '2px' }}>Note: {item.notes}</div>}
@@ -378,7 +392,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
             </div>
             <div style={{ ...itemLineStyle, fontSize: '16px', fontWeight: 'bold', marginTop: '4px', paddingTop: '4px', borderTop: '2px dashed #000' }}>
               <span>TOTAL PAYOUT:</span>
-              <span>${(ticket.totalAmount || 0).toFixed(2)}</span>
+              <span>${finalTotalAmount.toFixed(2)}</span>
             </div>
           </div>
         </>
@@ -397,7 +411,10 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
           <tbody>
             {ticketMaterials.map((item, index) => {
               const material = materials.find((m) => m.id === item.materialId);
-              const displayNetWeight = item.netWeight - (item.deductionWeight || 0);
+              const displayNetWeight = (item.netWeight || 0) - (item.deductionWeight || 0);
+              const itemTotalAmount = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0) 
+                ? item.totalAmount 
+                : (displayNetWeight * (item.pricePerUnit || 0));
               return (
                 <tr key={index}>
                   <td style={tdStyle}>
@@ -408,7 +425,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
                   <td style={tdRightStyle}>{item.deductionWeight || '0'}</td>
                   <td style={tdRightStyle}><strong>{displayNetWeight} lb</strong></td>
                   <td style={tdRightStyle}>${(item.pricePerUnit || 0).toFixed(2)}</td>
-                  <td style={tdRightStyle}><strong>${(item.totalAmount || 0).toFixed(2)}</strong></td>
+                  <td style={tdRightStyle}><strong>${itemTotalAmount.toFixed(2)}</strong></td>
                 </tr>
               );
             })}
@@ -418,7 +435,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
               <td colSpan={3} style={totalTdStyle}>TOTALS</td>
               <td style={totalTdRightStyle}>{totalNetWeight} lb</td>
               <td style={totalTdStyle}></td>
-              <td style={totalTdRightStyle}>${(ticket.totalAmount || 0).toFixed(2)}</td>
+              <td style={totalTdRightStyle}>${finalTotalAmount.toFixed(2)}</td>
             </tr>
           </tbody>
         </table>

@@ -5,6 +5,14 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+export const getCustomerDataGaps = (customer: { idImageUrl?: string; photoUrl?: string } | null | undefined): string[] => {
+  if (!customer) return [];
+  const gaps: string[] = [];
+  if (!customer.idImageUrl) gaps.push('ID photo');
+  if (!customer.photoUrl) gaps.push('Seller photo');
+  return gaps;
+};
+
 /**
  * Generates a ticket ID following a date/time scheme down to the second
  * e.g., BUY-20260605-033717

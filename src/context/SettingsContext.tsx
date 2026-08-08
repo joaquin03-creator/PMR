@@ -33,15 +33,16 @@ export interface AppSettings {
     material: string;
     customer: string;
     entrance: string;
+    scale?: string;
   };
   reolinkNvrIp?: string;
   reolinkUsername?: string;
   reolinkPassword?: string;
   reolinkChannels?: NvrCamera[];
   ohioScrapPortalUrl: string;
-  ohioScrapUsername: string;
-  ohioScrapPassword?: string;
   ohioScrapDealerId?: string;
+  dailySpendTarget?: number;
+  dailyCustomerTarget?: number;
 }
 
 interface SettingsContextType {
@@ -72,6 +73,7 @@ const defaultSettings: AppSettings = {
     material: '',
     customer: '',
     entrance: '',
+    scale: '',
   },
   reolinkNvrIp: 'http://192.168.1.50:80',
   reolinkUsername: 'admin',
@@ -83,9 +85,9 @@ const defaultSettings: AppSettings = {
     { id: 'cam4', name: 'Yard Cam (Ch 4)', channel: 3, isEnabled: true },
   ],
   ohioScrapPortalUrl: 'https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList',
-  ohioScrapUsername: 'preferredmetalsrecycling@gmail.com',
-  ohioScrapPassword: '47301b0a2d61bdf1',
   ohioScrapDealerId: '',
+  dailySpendTarget: 5000,
+  dailyCustomerTarget: 30,
 };
 
 const SettingsContext = createContext<SettingsContextType | undefined>(undefined);
@@ -96,6 +98,10 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
+        // Clean up legacy username/password if present in local app_settings
+        delete parsed.ohioScrapUsername;
+        delete parsed.ohioScrapPassword;
+
         // Migrate legacy/registration URLs to the new direct DoNotBuyList address
         if (
           !parsed.ohioScrapPortalUrl || 
@@ -103,14 +109,6 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
           parsed.ohioScrapPortalUrl.includes('IdentityManager/Login/Index')
         ) {
           parsed.ohioScrapPortalUrl = 'https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList';
-        }
-
-        // Fill in default credentials if they are currently blank in saved settings
-        if (!parsed.ohioScrapUsername || parsed.ohioScrapUsername.trim() === '') {
-          parsed.ohioScrapUsername = 'preferredmetalsrecycling@gmail.com';
-        }
-        if (!parsed.ohioScrapPassword || parsed.ohioScrapPassword.trim() === '') {
-          parsed.ohioScrapPassword = '47301b0a2d61bdf1';
         }
 
         return { ...defaultSettings, ...parsed };
