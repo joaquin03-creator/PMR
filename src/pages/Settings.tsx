@@ -70,9 +70,10 @@ const getSecondaryAuth = () => {
 
 interface SettingsProps {
   profile: UserProfile | null;
+  onProfileUpdate?: (updatedProfile: UserProfile) => void;
 }
 
-export default function Settings({ profile }: SettingsProps) {
+export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
   const { firestore, local, success, error: toastError, info } = useToast();
   const { settings, updateSettings, resetToDefaults: resetUI } = useSettings();
   const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sessions' | 'system' | 'roles'>('general');
@@ -89,6 +90,39 @@ export default function Settings({ profile }: SettingsProps) {
   const [resettingPassword, setResettingPassword] = useState(false);
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [passwordSuccess, setPasswordSuccess] = useState<string | null>(null);
+
+  // Selected User Display Name state (Admin Users & Roles panel)
+  const [selectedUserDisplayNameInput, setSelectedUserDisplayNameInput] = useState('');
+  const [savingSelectedUserDisplayName, setSavingSelectedUserDisplayName] = useState(false);
+  const [selectedUserDisplayNameError, setSelectedUserDisplayNameError] = useState<string | null>(null);
+
+  // Self-Service Display Name & PIN (Logged-in user profile in General settings)
+  const [selfDisplayNameInput, setSelfDisplayNameInput] = useState(profile?.displayName || '');
+  const [savingSelfDisplayName, setSavingSelfDisplayName] = useState(false);
+  const [selfDisplayNameError, setSelfDisplayNameError] = useState<string | null>(null);
+  const [selfDisplayNameSuccess, setSelfDisplayNameSuccess] = useState<string | null>(null);
+
+  const [currentPinInput, setCurrentPinInput] = useState('');
+  const [newPinInput, setNewPinInput] = useState('');
+  const [confirmPinInput, setConfirmPinInput] = useState('');
+  const [savingSelfPin, setSavingSelfPin] = useState(false);
+  const [selfPinError, setSelfPinError] = useState<string | null>(null);
+  const [selfPinSuccess, setSelfPinSuccess] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (selectedUser) {
+      setSelectedUserDisplayNameInput(selectedUser.displayName || '');
+      setSelectedUserDisplayNameError(null);
+    }
+  }, [selectedUser]);
+
+  useEffect(() => {
+    if (profile) {
+      setSelfDisplayNameInput(profile.displayName || '');
+      setSelfDisplayNameError(null);
+      setSelfDisplayNameSuccess(null);
+    }
+  }, [profile]);
 
   useEffect(() => {
     setNewPassword('');
@@ -190,10 +224,7 @@ export default function Settings({ profile }: SettingsProps) {
   const [customDiagMsg, setCustomDiagMsg] = useState('');
   const [customDiagDetail, setCustomDiagDetail] = useState('');
 
-  // System Key Hint & Credentials Health Validator States
-  const [keyHintInput, setKeyHintInput] = useState('');
-  const [savingKeyHint, setSavingKeyHint] = useState(false);
-  const [keyHintStatus, setKeyHintStatus] = useState<string | null>(null);
+  // Credentials Health Validator States
   const [validatorPassword, setValidatorPassword] = useState('');
   const [validatingCredentials, setValidatingCredentials] = useState(false);
   const [validationResult, setValidationResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -208,52 +239,6 @@ export default function Settings({ profile }: SettingsProps) {
       }, 300);
     }
   }, [searchParams]);
-
-  // Fetch public key hint on component mount
-  useEffect(() => {
-    async function fetchHint() {
-      try {
-        const response = await fetch('/api/auth/system-hint');
-        if (response.ok) {
-          const data = await response.json();
-          if (data && data.hint) {
-            setKeyHintInput(data.hint);
-          }
-        }
-      } catch (err) {
-        console.warn('Failed to fetch system key hint:', err);
-      }
-    }
-    fetchHint();
-  }, []);
-
-  const handleSaveKeyHint = async () => {
-    setSavingKeyHint(true);
-    setKeyHintStatus(null);
-    try {
-      const idToken = await auth.currentUser?.getIdToken();
-      if (!idToken) {
-        throw new Error('Verification failed. Please log in again.');
-      }
-      const response = await fetch('/api/auth/system-hint', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${idToken}`
-        },
-        body: JSON.stringify({ hint: keyHintInput })
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to save hint');
-      }
-      setKeyHintStatus('Hint saved successfully.');
-    } catch (err: any) {
-      setKeyHintStatus(`Error: ${err.message}`);
-    } finally {
-      setSavingKeyHint(false);
-    }
-  };
 
   const handleValidateCredentials = async () => {
     setValidatingCredentials(true);
@@ -353,7 +338,6 @@ export default function Settings({ profile }: SettingsProps) {
         email: newUser.email || inviteEmail,
         role: inviteRole,
         displayName: inviteName,
-        managerPin: inviteRole === 'manager' ? '1234' : undefined,
         permissions: defaultPermissions,
       };
 
@@ -427,6 +411,175 @@ export default function Settings({ profile }: SettingsProps) {
       setStatus({ type: 'error', message: 'Failed to delete user profile.' });
     } finally {
       setProcessing(false);
+    }
+  };
+
+  const handleSaveSelectedUserDisplayName = async () => {
+    if (!selectedUser) return;
+    const trimmed = selectedUserDisplayNameInput.trim();
+
+    if (!trimmed) {
+      setSelectedUserDisplayNameError('Display name cannot be empty.');
+      return;
+    }
+    if (trimmed.length > 50) {
+      setSelectedUserDisplayNameError('Display name cannot exceed 50 characters.');
+      return;
+    }
+
+    try {
+      setSavingSelectedUserDisplayName(true);
+      setSelectedUserDisplayNameError(null);
+
+      await updateDoc(doc(db, 'users', selectedUser.uid), {
+        displayName: trimmed
+      });
+
+      const updatedUser = { ...selectedUser, displayName: trimmed };
+      setSelectedUser(updatedUser);
+      setUsers(prev => prev.map(u => u.uid === selectedUser.uid ? updatedUser : u));
+
+      if (selectedUser.uid === profile?.uid && onProfileUpdate) {
+        onProfileUpdate({ ...profile, displayName: trimmed });
+      }
+
+      await logAuditEvent(
+        'settings',
+        selectedUser.uid,
+        'update',
+        { before: { displayName: selectedUser.displayName }, after: { displayName: trimmed } },
+        `Updated display name for ${selectedUser.email} to "${trimmed}"`
+      );
+
+      firestore('Display Name Updated', `Updated display name for ${selectedUser.email}.`);
+    } catch (err: any) {
+      console.error('Failed to update display name:', err);
+      setSelectedUserDisplayNameError(err.message || 'Failed to update display name.');
+    } finally {
+      setSavingSelectedUserDisplayName(false);
+    }
+  };
+
+  const handleSaveSelfDisplayName = async () => {
+    if (!profile?.uid) return;
+    const trimmed = selfDisplayNameInput.trim();
+
+    if (!trimmed) {
+      setSelfDisplayNameError('Display name cannot be empty.');
+      setSelfDisplayNameSuccess(null);
+      return;
+    }
+    if (trimmed.length > 50) {
+      setSelfDisplayNameError('Display name cannot exceed 50 characters.');
+      setSelfDisplayNameSuccess(null);
+      return;
+    }
+
+    try {
+      setSavingSelfDisplayName(true);
+      setSelfDisplayNameError(null);
+      setSelfDisplayNameSuccess(null);
+
+      await updateDoc(doc(db, 'users', profile.uid), {
+        displayName: trimmed
+      });
+
+      const updatedProfile = { ...profile, displayName: trimmed };
+      if (onProfileUpdate) {
+        onProfileUpdate(updatedProfile);
+      }
+
+      setUsers(prev => prev.map(u => u.uid === profile.uid ? { ...u, displayName: trimmed } : u));
+      if (selectedUser?.uid === profile.uid) {
+        setSelectedUser(prev => prev ? { ...prev, displayName: trimmed } : null);
+      }
+
+      await logAuditEvent(
+        'settings',
+        profile.uid,
+        'update',
+        { before: { displayName: profile.displayName }, after: { displayName: trimmed } },
+        `User updated their own display name to "${trimmed}"`
+      );
+
+      setSelfDisplayNameSuccess('Display name updated successfully.');
+      firestore('Display Name Saved', 'Your display name has been updated.');
+    } catch (err: any) {
+      console.error('Failed to save self display name:', err);
+      setSelfDisplayNameError(err.message || 'Failed to update display name.');
+    } finally {
+      setSavingSelfDisplayName(false);
+    }
+  };
+
+  const handleSaveSelfPin = async () => {
+    if (!profile?.uid) return;
+    const isPinCurrentlySet = Boolean(profile.managerPin && profile.managerPin.trim());
+
+    setSelfPinError(null);
+    setSelfPinSuccess(null);
+
+    if (isPinCurrentlySet) {
+      if (!currentPinInput) {
+        setSelfPinError('Please enter your current Security PIN.');
+        return;
+      }
+      if (currentPinInput !== profile.managerPin) {
+        setSelfPinError('Current Security PIN is incorrect.');
+        return;
+      }
+    }
+
+    if (!newPinInput) {
+      setSelfPinError('Please enter a new 4-digit Security PIN.');
+      return;
+    }
+
+    if (!/^\d{4}$/.test(newPinInput)) {
+      setSelfPinError('Security PIN must be exactly 4 numeric digits.');
+      return;
+    }
+
+    if (newPinInput !== confirmPinInput) {
+      setSelfPinError('New PIN and confirmation PIN do not match.');
+      return;
+    }
+
+    try {
+      setSavingSelfPin(true);
+
+      await updateDoc(doc(db, 'users', profile.uid), {
+        managerPin: newPinInput
+      });
+
+      const updatedProfile = { ...profile, managerPin: newPinInput };
+      if (onProfileUpdate) {
+        onProfileUpdate(updatedProfile);
+      }
+
+      setUsers(prev => prev.map(u => u.uid === profile.uid ? { ...u, managerPin: newPinInput } : u));
+      if (selectedUser?.uid === profile.uid) {
+        setSelectedUser(prev => prev ? { ...prev, managerPin: newPinInput } : null);
+      }
+
+      await logAuditEvent(
+        'settings',
+        profile.uid,
+        'update',
+        { before: { managerPin: '****' }, after: { managerPin: '****' } },
+        `User ${isPinCurrentlySet ? 'changed' : 'created'} their Security PIN.`
+      );
+
+      setCurrentPinInput('');
+      setNewPinInput('');
+      setConfirmPinInput('');
+      setSelfPinSuccess(isPinCurrentlySet ? 'Security PIN updated successfully.' : 'Security PIN created successfully.');
+      firestore('Security PIN Saved', isPinCurrentlySet ? 'Your Security PIN has been updated.' : 'Your Security PIN has been created.');
+    } catch (err: any) {
+      console.error('Failed to save self PIN:', err);
+      setSelfPinError(err.message || 'Failed to save Security PIN.');
+    } finally {
+      setSavingSelfPin(false);
     }
   };
 
@@ -1188,9 +1341,25 @@ export default function Settings({ profile }: SettingsProps) {
           })
         });
 
-        const data = await response.json();
+        const contentType = response.headers.get('content-type') || '';
+        let data: any = null;
+
+        if (contentType.includes('application/json')) {
+          try {
+            data = await response.json();
+          } catch (jsonErr) {
+            console.error('Failed to parse JSON response:', jsonErr);
+          }
+        }
+
         if (!response.ok) {
-          throw new Error(data.error || 'Failed to administratively reset password.');
+          const fallbackMsg = `Request failed with status ${response.status} (${response.statusText || 'Error'})`;
+          const serverError = data && data.error ? data.error : null;
+          throw new Error(serverError || fallbackMsg || 'Failed to administratively reset password.');
+        }
+
+        if (!data) {
+          throw new Error('Server returned an unexpected non-JSON response. Please try again.');
         }
 
         await updateDoc(doc(db, 'users', uid), {
@@ -1457,6 +1626,161 @@ export default function Settings({ profile }: SettingsProps) {
 
       {activeTab === 'general' ? (
         <>
+          {/* Account Profile & Security Section (Self-Service) */}
+          <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-8">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-blue-50 rounded-xl text-blue-600">
+                <User className="w-5 h-5 text-blue-600" />
+              </div>
+              <div>
+                <h3 className="font-black text-slate-900 uppercase tracking-tight">My Profile & Security</h3>
+                <p className="text-[10px] text-slate-400 font-bold uppercase">Update your personal display name and manage your Security PIN</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+              {/* Display Name Card */}
+              <div className="space-y-4 p-6 bg-slate-50/50 rounded-3xl border border-slate-100 flex flex-col justify-between">
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <UserCheck className="w-4 h-4 text-blue-600" />
+                      <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Display Name</h4>
+                    </div>
+                    <span className="text-[10px] text-slate-400 font-bold">{selfDisplayNameInput.length}/50</span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 font-bold uppercase leading-relaxed">
+                    Your display name is shown on tickets, invoices, audit logs, and team lists.
+                  </p>
+
+                  <div className="space-y-2">
+                    <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block">Display Name</label>
+                    <input
+                      type="text"
+                      placeholder="Type your display name..."
+                      value={selfDisplayNameInput}
+                      onChange={(e) => {
+                        setSelfDisplayNameInput(e.target.value);
+                        setSelfDisplayNameError(null);
+                        setSelfDisplayNameSuccess(null);
+                      }}
+                      disabled={savingSelfDisplayName}
+                      maxLength={50}
+                      className="w-full px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-100 transition-colors placeholder:text-slate-300"
+                    />
+                  </div>
+
+                  {selfDisplayNameError && (
+                    <p className="text-[10px] text-red-600 font-bold">{selfDisplayNameError}</p>
+                  )}
+                  {selfDisplayNameSuccess && (
+                    <p className="text-[10px] text-emerald-600 font-bold">{selfDisplayNameSuccess}</p>
+                  )}
+                </div>
+
+                <button
+                  onClick={handleSaveSelfDisplayName}
+                  disabled={savingSelfDisplayName || !selfDisplayNameInput.trim() || selfDisplayNameInput.trim() === profile?.displayName}
+                  className="w-full mt-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all disabled:opacity-50 disabled:grayscale cursor-pointer flex items-center justify-center gap-2"
+                >
+                  {savingSelfDisplayName ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Save Display Name'}
+                </button>
+              </div>
+
+              {/* Security PIN Self-Service Card */}
+              <div className="space-y-4 p-6 bg-slate-50/50 rounded-3xl border border-slate-100 flex flex-col justify-between">
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <KeyRound className="w-4 h-4 text-blue-600" />
+                      <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">
+                        {profile?.managerPin ? 'Change Security PIN' : 'Set Security PIN'}
+                      </h4>
+                    </div>
+                    <span className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase ${
+                      profile?.managerPin ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+                    }`}>
+                      {profile?.managerPin ? 'PIN Active' : 'No PIN Set'}
+                    </span>
+                  </div>
+
+                  <p className="text-[10px] text-slate-500 font-bold uppercase leading-relaxed">
+                    {profile?.managerPin 
+                      ? 'Enter your current PIN to set a new 4-digit Security PIN for sensitive authorizations.'
+                      : 'Create a 4-digit Security PIN used to authorize manager overrides, ticket voids, and cash drawer actions.'}
+                  </p>
+
+                  <div className="space-y-3">
+                    {Boolean(profile?.managerPin) && (
+                      <div>
+                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">Current PIN</label>
+                        <input
+                          type="password"
+                          placeholder="4-digit current PIN..."
+                          maxLength={4}
+                          value={currentPinInput}
+                          onChange={(e) => {
+                            setCurrentPinInput(e.target.value.replace(/\D/g, ''));
+                            setSelfPinError(null);
+                          }}
+                          disabled={savingSelfPin}
+                          className="w-full px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-mono font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-100 transition-colors tracking-widest placeholder:text-slate-300"
+                        />
+                      </div>
+                    )}
+
+                    <div>
+                      <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">New 4-Digit PIN</label>
+                      <input
+                        type="password"
+                        placeholder="Enter new 4-digit PIN..."
+                        maxLength={4}
+                        value={newPinInput}
+                        onChange={(e) => {
+                          setNewPinInput(e.target.value.replace(/\D/g, ''));
+                          setSelfPinError(null);
+                        }}
+                        disabled={savingSelfPin}
+                        className="w-full px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-mono font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-100 transition-colors tracking-widest placeholder:text-slate-300"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">Confirm New PIN</label>
+                      <input
+                        type="password"
+                        placeholder="Confirm new 4-digit PIN..."
+                        maxLength={4}
+                        value={confirmPinInput}
+                        onChange={(e) => {
+                          setConfirmPinInput(e.target.value.replace(/\D/g, ''));
+                          setSelfPinError(null);
+                        }}
+                        disabled={savingSelfPin}
+                        className="w-full px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-mono font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-100 transition-colors tracking-widest placeholder:text-slate-300"
+                      />
+                    </div>
+                  </div>
+
+                  {selfPinError && (
+                    <p className="text-[10px] text-red-600 font-bold">{selfPinError}</p>
+                  )}
+                  {selfPinSuccess && (
+                    <p className="text-[10px] text-emerald-600 font-bold">{selfPinSuccess}</p>
+                  )}
+                </div>
+
+                <button
+                  onClick={handleSaveSelfPin}
+                  disabled={savingSelfPin || !newPinInput || !confirmPinInput || (Boolean(profile?.managerPin) && !currentPinInput)}
+                  className="w-full mt-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all disabled:opacity-50 disabled:grayscale cursor-pointer flex items-center justify-center gap-2"
+                >
+                  {savingSelfPin ? <Loader2 className="w-4 h-4 animate-spin" /> : (profile?.managerPin ? 'Update Security PIN' : 'Create Security PIN')}
+                </button>
+              </div>
+            </div>
+          </div>
+
           {/* Branding & Logo Section */}
           <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-8">
             <div className="flex items-center gap-3">
@@ -1814,40 +2138,8 @@ export default function Settings({ profile }: SettingsProps) {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-          {/* Left Column: Password/Key Hint Configuration */}
-          <div className="space-y-4">
-            <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Access Recovery Hint</h4>
-            <p className="text-xs text-slate-500 font-medium leading-relaxed">
-              Provide a subtle hint for staff or cashiers to remember the System Key/Password. This hint will be displayed on the public login page to prevent locked out situations.
-            </p>
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Current Password Hint</label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold"
-                  placeholder="e.g. Office safe key followed by '03'..."
-                  value={keyHintInput}
-                  onChange={(e) => setKeyHintInput(e.target.value)}
-                />
-                <button
-                  onClick={handleSaveKeyHint}
-                  disabled={savingKeyHint}
-                  className="px-5 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-600 transition-all disabled:opacity-50 cursor-pointer"
-                >
-                  {savingKeyHint ? 'Saving...' : 'Save Hint'}
-                </button>
-              </div>
-              {keyHintStatus && (
-                <p className={`text-[10px] font-bold uppercase tracking-wider ${keyHintStatus.includes('successfully') ? 'text-green-600' : 'text-red-500'}`}>
-                  {keyHintStatus}
-                </p>
-              )}
-            </div>
-          </div>
-
-          {/* Right Column: Password/System Key Health Validator */}
+        <div className="grid grid-cols-1 gap-8">
+          {/* Credentials Health Validator */}
           <div className="space-y-4 p-5 bg-slate-50/50 rounded-3xl border border-slate-100">
             <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Credentials Health Validator</h4>
             <p className="text-[10px] text-slate-500 font-bold uppercase leading-relaxed">
@@ -2792,6 +3084,46 @@ export default function Settings({ profile }: SettingsProps) {
                     </div>
                   </div>
 
+                  {/* Display Name Edit Card */}
+                  <div className="p-6 bg-slate-50/50 rounded-3xl border border-slate-100 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <UserCheck className="w-4 h-4 text-blue-600" />
+                        <h4 className="text-xs font-black text-slate-900 uppercase tracking-tight">Display Name</h4>
+                      </div>
+                      <span className="text-[10px] text-slate-400 font-bold">{selectedUserDisplayNameInput.length}/50</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="Type display name (max 50 chars)..."
+                        value={selectedUserDisplayNameInput}
+                        onChange={(e) => {
+                          setSelectedUserDisplayNameInput(e.target.value);
+                          setSelectedUserDisplayNameError(null);
+                        }}
+                        disabled={savingSelectedUserDisplayName || !profile?.permissions?.canManageUsers}
+                        maxLength={50}
+                        className="flex-1 px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-100 transition-colors placeholder:text-slate-300"
+                      />
+                      <button
+                        onClick={handleSaveSelectedUserDisplayName}
+                        disabled={
+                          savingSelectedUserDisplayName || 
+                          !profile?.permissions?.canManageUsers || 
+                          !selectedUserDisplayNameInput.trim() || 
+                          selectedUserDisplayNameInput.trim() === selectedUser.displayName
+                        }
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all disabled:opacity-50 disabled:grayscale cursor-pointer flex items-center gap-1.5"
+                      >
+                        {savingSelectedUserDisplayName ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Save'}
+                      </button>
+                    </div>
+                    {selectedUserDisplayNameError && (
+                      <p className="text-[10px] text-red-600 font-bold">{selectedUserDisplayNameError}</p>
+                    )}
+                  </div>
+
                   <div className="space-y-6 pt-6 border-t border-slate-100">
                     <div className="flex items-center gap-3">
                       <Lock className="w-5 h-5 text-blue-600" />
@@ -3087,8 +3419,8 @@ export default function Settings({ profile }: SettingsProps) {
                   </div>
                   {justCreatedUser.role === 'manager' && (
                     <div className="pt-2 border-t border-slate-200">
-                      <span className="text-[10px] uppercase font-black text-slate-400 block tracking-widest">Default Manager PIN</span>
-                      <span className="text-sm font-bold text-slate-900">1234</span>
+                      <span className="text-[10px] uppercase font-black text-slate-400 block tracking-widest">Manager PIN</span>
+                      <span className="text-sm font-bold text-slate-600">Not set (User can set PIN in Settings)</span>
                     </div>
                   )}
                 </div>
@@ -3096,7 +3428,7 @@ export default function Settings({ profile }: SettingsProps) {
                 <div className="flex gap-3 pt-2">
                   <button
                     onClick={() => {
-                      const text = `--- PREFERRED METALS ACCESS ---\nName: ${justCreatedUser.name}\nRole: ${justCreatedUser.role}\nEmail: ${justCreatedUser.email}\nPassword: ${justCreatedUser.password}\n${justCreatedUser.role === 'manager' ? 'Default PIN: 1234' : ''}`;
+                      const text = `--- PREFERRED METALS ACCESS ---\nName: ${justCreatedUser.name}\nRole: ${justCreatedUser.role}\nEmail: ${justCreatedUser.email}\nPassword: ${justCreatedUser.password}\n${justCreatedUser.role === 'manager' ? 'PIN: Not set (Set in Settings)' : ''}`;
                       navigator.clipboard.writeText(text);
                       setIsCopied(true);
                       setTimeout(() => setIsCopied(false), 2000);

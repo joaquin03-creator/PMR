@@ -674,6 +674,93 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
     }
   };
 
+  const handleRunBackfill = async (inv: Invoice) => {
+    if (inv.inventoryDeducted) {
+      alert(`Inventory was already deducted for invoice ${inv.invoiceNumber}.`);
+      return;
+    }
+    if (!confirm(`Run inventory backfill correction for ${inv.invoiceNumber}? This will calculate aggregated line-item weights and deduct live inventory.`)) {
+      return;
+    }
+
+    setProcessing(true);
+    setActionError(null);
+    setActionSuccess(null);
+
+    try {
+      const requiredByMaterial: Record<string, number> = {};
+      inv.materials?.forEach(item => {
+        if (item.materialId) {
+          const w = Number(item.weight) || 0;
+          requiredByMaterial[item.materialId] = (requiredByMaterial[item.materialId] || 0) + w;
+        }
+      });
+
+      const insufficientLines: string[] = [];
+      for (const matId of Object.keys(requiredByMaterial)) {
+        const invSnap = await getDoc(doc(db, 'inventory', matId));
+        const currentWeight = invSnap.exists() ? (Number(invSnap.data().currentWeight) || 0) : 0;
+        const reqWeight = requiredByMaterial[matId];
+
+        if (currentWeight < reqWeight) {
+          const mat = materials.find(m => m.id === matId);
+          const matName = mat ? `${mat.name} (${mat.code})` : matId;
+          const shortfall = reqWeight - currentWeight;
+          insufficientLines.push(`${matName}: required ${reqWeight.toLocaleString()} lbs, available ${currentWeight.toLocaleString()} lbs (short by ${shortfall.toLocaleString()} lbs)`);
+        }
+      }
+
+      if (insufficientLines.length > 0) {
+        const msg = `Backfill blocked due to insufficient live inventory:\n• ${insufficientLines.join('\n• ')}`;
+        setActionError(msg);
+        alert(msg);
+        return;
+      }
+
+      const batch = writeBatch(db);
+      const timestamp = inv.date || '2026-08-07T16:06:50.117Z';
+
+      for (const [matId, reqWeight] of Object.entries(requiredByMaterial)) {
+        const invRef = doc(db, 'inventory', matId);
+        batch.set(invRef, {
+          materialId: matId,
+          currentWeight: increment(-reqWeight),
+          lastUpdated: new Date().toISOString()
+        }, { merge: true });
+      }
+
+      const invRef = doc(db, 'invoices', inv.id);
+      batch.update(invRef, {
+        inventoryDeducted: true,
+        inventoryDeductedAt: timestamp
+      });
+
+      await batch.commit();
+
+      if (selectedInvoice && selectedInvoice.id === inv.id) {
+        setSelectedInvoice({
+          ...selectedInvoice,
+          inventoryDeducted: true,
+          inventoryDeductedAt: timestamp
+        });
+      }
+
+      await logAuditEvent(
+        'invoice',
+        inv.id,
+        'update',
+        { after: { inventoryDeducted: true, inventoryDeductedAt: timestamp } },
+        `Executed inventory backfill correction for invoice ${inv.invoiceNumber}`
+      );
+
+      setActionSuccess(`Inventory backfill for invoice ${inv.invoiceNumber} successfully applied!`);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `invoices/${inv.id}`);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
   const handleSaveEditedInvoice = async () => {
     if (!selectedInvoice) return;
     setProcessing(true);
@@ -1703,11 +1790,23 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                           <td className="px-6 py-6">
                             <div className="flex items-center gap-2">
                               <p className="text-sm font-black text-slate-900">{invoice.invoiceNumber}</p>
-                              {invoice.inventoryDeducted && (
+                              {invoice.inventoryDeducted ? (
                                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-black bg-emerald-50 text-emerald-700 border border-emerald-200 uppercase tracking-wider" title="Inventory deducted">
                                   <CheckCircle2 className="w-3 h-3 text-emerald-600" />
                                   Deducted
                                 </span>
+                              ) : (
+                                invoice.status === 'paid' && invoice.invoiceNumber === 'INV-810117' && (
+                                  <button
+                                    onClick={() => handleRunBackfill(invoice)}
+                                    disabled={processing}
+                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[10px] font-black bg-amber-50 text-amber-800 border border-amber-300 hover:bg-amber-100 uppercase tracking-wider transition-all shadow-sm"
+                                    title="Run Inventory Backfill — INV-810117"
+                                  >
+                                    <Package className="w-3 h-3 text-amber-600" />
+                                    Run Inventory Backfill — INV-810117
+                                  </button>
+                                )
                               )}
                             </div>
                           </td>
@@ -1771,11 +1870,23 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                                       Material Line Items ({invoice.materials?.length || 0})
                                     </h4>
                                   </div>
-                                  {invoice.inventoryDeducted && (
+                                  {invoice.inventoryDeducted ? (
                                     <span className="inline-flex items-center gap-1.5 text-[10px] font-black text-emerald-700 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200 uppercase tracking-wider">
                                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                                       Inventory Deducted
                                     </span>
+                                  ) : (
+                                    invoice.status === 'paid' && invoice.invoiceNumber === 'INV-810117' && (
+                                      <button
+                                        onClick={() => handleRunBackfill(invoice)}
+                                        disabled={processing}
+                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-black bg-amber-50 text-amber-800 border border-amber-300 hover:bg-amber-100 uppercase tracking-wider transition-all shadow-sm"
+                                        title="Run Inventory Backfill — INV-810117"
+                                      >
+                                        <Package className="w-4 h-4 text-amber-600" />
+                                        Run Inventory Backfill — INV-810117
+                                      </button>
+                                    )
                                   )}
                                 </div>
                                 <div className="divide-y divide-slate-100">

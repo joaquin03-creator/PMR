@@ -68,13 +68,17 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
+    function isApprovedAdmin() {
+      return 'email' in request.auth.token && (
+        request.auth.token.email == "tiffany@preferredmetalsrecycling.com" ||
+        request.auth.token.email == "info@preferredmetalsrecycling.com" ||
+        request.auth.token.email == "joaquinrodriguez3333@gmail.com"
+      );
+    }
+
     function isManager() {
       return isAuthenticated() && (
-        ('email' in request.auth.token && (
-          request.auth.token.email == "joaquinrodriguez3333@gmail.com" ||
-          request.auth.token.email == "joaquin03@icloud.com" ||
-          request.auth.token.email == "info@preferredmetalsrecycling.com"
-        )) ||
+        isApprovedAdmin() ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'manager')
       );
@@ -82,11 +86,7 @@ service cloud.firestore {
 
     function hasPermission(perm) {
       return isAuthenticated() && (
-        ('email' in request.auth.token && (
-          request.auth.token.email == "joaquinrodriguez3333@gmail.com" ||
-          request.auth.token.email == "joaquin03@icloud.com" ||
-          request.auth.token.email == "info@preferredmetalsrecycling.com"
-        )) ||
+        isApprovedAdmin() ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().permissions.get(perm, false) == true)
       );
     }
@@ -238,15 +238,30 @@ service cloud.firestore {
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
     }
 
+    function isValidMaterialConversionLine(line) {
+      return line.keys().hasAll(['destinationMaterialId', 'producedWeight', 'yieldPercent']) &&
+             line.destinationMaterialId is string &&
+             line.producedWeight is number && line.producedWeight >= 0 &&
+             line.yieldPercent is number;
+    }
+
     function isValidMaterialConversion(data) {
-      return data.keys().hasAll(['sourceMaterialId', 'destinationMaterialId', 'consumedWeight', 'producedWeight', 'yieldPercent', 'timestamp', 'status']) &&
+      return data.keys().hasAll(['sourceMaterialId', 'consumedWeight', 'timestamp', 'status']) &&
              data.sourceMaterialId is string &&
-             data.destinationMaterialId is string &&
              data.consumedWeight is number && data.consumedWeight > 0 &&
-             data.producedWeight is number && data.producedWeight >= 0 &&
-             data.yieldPercent is number &&
              (data.timestamp is string || data.timestamp is timestamp) &&
              data.status in ['completed', 'voided'] &&
+             // Multi-destination support (new format) or single destination (legacy format)
+             (
+               ('destinations' in data && data.destinations is list && data.destinations.size() > 0)
+               ||
+               ('destinationMaterialId' in data && data.destinationMaterialId is string &&
+                'producedWeight' in data && data.producedWeight is number && data.producedWeight >= 0 &&
+                'yieldPercent' in data && data.yieldPercent is number)
+             ) &&
+             (!('destinationMaterialId' in data) || (data.destinationMaterialId is string)) &&
+             (!('producedWeight' in data) || (data.producedWeight is number && data.producedWeight >= 0)) &&
+             (!('yieldPercent' in data) || (data.yieldPercent is number)) &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
              (!('recordedBy' in data) || (data.recordedBy is string && data.recordedBy.size() <= 200)) &&
              (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 200)) &&

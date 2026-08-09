@@ -9,7 +9,16 @@ const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
 async function run() {
   console.log('Authenticating as Manager...');
-  await signInWithEmailAndPassword(auth, 'joaquinrodriguez3333@gmail.com', '123456');
+  // NOTE: Credentials must be supplied via local .env file (SCRIPT_AUTH_EMAIL and SCRIPT_AUTH_PASSWORD)
+  const email = process.env.SCRIPT_AUTH_EMAIL;
+  const password = process.env.SCRIPT_AUTH_PASSWORD;
+
+  if (!email || !password) {
+    console.error('Error: SCRIPT_AUTH_EMAIL and SCRIPT_AUTH_PASSWORD environment variables must be defined in local .env');
+    process.exit(1);
+  }
+
+  await signInWithEmailAndPassword(auth, email, password);
 
   console.log('Reading database state...');
   const invoicesSnap = await getDocs(collection(db, 'invoices'));

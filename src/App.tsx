@@ -30,6 +30,12 @@ import { cn } from './lib/utils';
 import { SettingsProvider } from './context/SettingsContext';
 import { ToastProvider } from './context/ToastContext';
 
+const ALLOWED_ADMIN_EMAILS = [
+  'tiffany@preferredmetalsrecycling.com',
+  'info@preferredmetalsrecycling.com',
+  'joaquinrodriguez3333@gmail.com'
+];
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
@@ -53,14 +59,17 @@ export default function App() {
         const data = snap.data() as SystemConfig;
         setSystemConfig(data);
         
+        const userEmailClean = user?.email?.toLowerCase().trim();
+        const isApprovedAdmin = !!userEmailClean && ALLOWED_ADMIN_EMAILS.includes(userEmailClean);
+
         // Auto-sync version if manager is logged in and version mismatch exists
-        if (data.currentVersion !== APP_VERSION && (profile?.role === 'manager' || user?.email === 'joaquinrodriguez3333@gmail.com')) {
+        if (data.currentVersion !== APP_VERSION && (profile?.role === 'manager' || isApprovedAdmin)) {
           updateDoc(doc(db, 'system', 'config'), { 
             currentVersion: APP_VERSION,
             lastUpdated: new Date().toISOString()
           }).catch(err => console.error('Failed to auto-sync version:', err));
         }
-      } else if (profile?.role === 'manager' || user?.email === 'joaquinrodriguez3333@gmail.com') {
+      } else if (profile?.role === 'manager' || (user?.email && ALLOWED_ADMIN_EMAILS.includes(user.email.toLowerCase().trim()))) {
         // Only managers should try to initialize it to avoid permission errors for cashiers
         const initialConfig: SystemConfig = {
           maintenanceMode: false,
@@ -306,14 +315,7 @@ export default function App() {
             const urlParams = new URLSearchParams(window.location.search);
             const inviteId = urlParams.get('invite') || localStorage.getItem('pm_invite_token');
             const userEmail = firebaseUser.email?.toLowerCase().trim();
-            const forcedManagerEmail = localStorage.getItem('pm_force_manager_registration');
-            const isForcedManager = forcedManagerEmail && userEmail === forcedManagerEmail;
-            const isOwner = userEmail === 'joaquinrodriguez3333@gmail.com' || 
-                            userEmail === 'joaquin03@icloud.com' || 
-                            userEmail?.startsWith('dev_') || 
-                            userEmail === 'info@preferredmetalsrecycling.com' ||
-                            userEmail?.endsWith('@preferredmetalsrecycling.com') ||
-                            isForcedManager;
+            const isOwner = !!userEmail && ALLOWED_ADMIN_EMAILS.includes(userEmail);
             
             let allowedToRegister = false;
             let targetRole: UserRole = 'cashier';
@@ -368,7 +370,7 @@ export default function App() {
                 email: firebaseUser.email || `demo-${targetRole}@preferredmetalsrecycling.com`,
                 role: targetRole,
                 displayName: firebaseUser.displayName || (isDemo ? (targetRole === 'manager' ? 'On-Duty Manager' : 'On-Duty Cashier') : isOwner ? 'Master Manager' : 'Employee'),
-                managerPin: isDemo && targetRole === 'manager' ? '1234' : isOwner ? '1234' : undefined,
+                ...(isDemo && targetRole === 'manager' ? { managerPin: '1234' } : {}),
                 permissions: defaultPermissions,
               };
               
@@ -830,7 +832,7 @@ export default function App() {
                     <Route path="cash-drawer" element={<CashDrawer profile={profile} />} />
                   </Route>
                   <Route element={<ProtectedRoute profile={profile} allowedRoles={['manager']} permission="canManageUsers" />}>
-                    <Route path="settings" element={<Settings profile={profile} />} />
+                    <Route path="settings" element={<Settings profile={profile} onProfileUpdate={(updated) => setProfile(updated)} />} />
                   </Route>
                 </Route>
               </Route>

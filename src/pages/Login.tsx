@@ -20,29 +20,10 @@ export default function Login() {
   
   // Management Login State
   const [isManagementMode, setIsManagementMode] = useState(false);
-  const [adminEmail, setAdminEmail] = useState('info@preferredmetalsrecycling.com');
-  const [adminPassword, setAdminPassword] = useState('Admin123!');
+  const [adminEmail, setAdminEmail] = useState('');
+  const [adminPassword, setAdminPassword] = useState('');
   const [godClicks, setGodClicks] = useState(0);
   const [showGodButton, setShowGodButton] = useState(false);
-  const [systemKeyHint, setSystemKeyHint] = useState('');
-
-  // Fetch Public key hint on component mount
-  useEffect(() => {
-    async function fetchHint() {
-      try {
-        const response = await fetch('/api/auth/system-hint');
-        if (response.ok) {
-          const data = await response.json();
-          if (data && data.hint) {
-            setSystemKeyHint(data.hint);
-          }
-        }
-      } catch (err) {
-        console.warn('Failed to load system key hint:', err);
-      }
-    }
-    fetchHint();
-  }, []);
 
   const handleDemoLogin = async (role: 'manager' | 'cashier') => {
     setErrorMsg(null);
@@ -172,44 +153,10 @@ If this is your administrator account, please check the "Create Account" option 
         return;
       }
     } catch (err: any) {
-      console.warn('Secure proxy failed or bypassed. Executing standard Google dynamic client login fallback...', err);
-      // Fallback pathway
+      console.warn('Secure proxy failed or bypassed. Executing standard client login fallback...', err);
+      // Fallback pathway - ONLY attempt sign-in against existing Firebase Auth account
       try {
-        if (isManagementMode) {
-          localStorage.setItem('pm_force_manager_registration', cleanedEmail);
-          try {
-            await createUserWithEmailAndPassword(auth, cleanedEmail, adminPassword);
-          } catch (createErr: any) {
-            if (createErr.code === 'auth/email-already-in-use') {
-              await signInWithEmailAndPassword(auth, cleanedEmail, adminPassword);
-            } else {
-              throw createErr;
-            }
-          }
-        } else {
-          try {
-            await signInWithEmailAndPassword(auth, cleanedEmail, adminPassword);
-          } catch (loginErr: any) {
-            const isEligibleForAutoRegister = cleanedEmail === 'joaquinrodriguez3333@gmail.com' ||
-                                             cleanedEmail === 'joaquin03@icloud.com' ||
-                                             cleanedEmail === 'info@preferredmetalsrecycling.com' ||
-                                             cleanedEmail.startsWith('dev_') ||
-                                             cleanedEmail.endsWith('@preferredmetalsrecycling.com');
-
-            if (isEligibleForAutoRegister && (
-              loginErr.code === 'auth/user-not-found' || 
-              loginErr.code === 'auth/invalid-credential' || 
-              loginErr.code === 'auth/wrong-password' ||
-              loginErr.code === 'auth/user-disabled'
-            )) {
-              console.log('Master account not yet present. Cooperating on the fly...');
-              localStorage.setItem('pm_force_manager_registration', cleanedEmail);
-              await createUserWithEmailAndPassword(auth, cleanedEmail, adminPassword);
-            } else {
-              throw loginErr;
-            }
-          }
-        }
+        await signInWithEmailAndPassword(auth, cleanedEmail, adminPassword);
         setStatus('success');
         setTimeout(() => {
           window.location.href = '/';
@@ -439,15 +386,6 @@ If this is your administrator account, please check the "Create Account" option 
                   />
                 </div>
 
-                {systemKeyHint && (
-                  <div className="p-4 bg-blue-50/70 rounded-2xl border border-blue-100 flex items-start gap-3 mt-2 animate-in fade-in slide-in-from-top-1 duration-300">
-                    <HelpCircle className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-                    <div className="space-y-0.5">
-                      <span className="text-[9px] font-black text-blue-900 uppercase tracking-widest block">Security Key Hint</span>
-                      <p className="text-[11px] text-blue-700 font-bold leading-relaxed">{systemKeyHint}</p>
-                    </div>
-                  </div>
-                )}
                 <div className="flex justify-between items-center">
                   <button
                     type="button"
@@ -455,22 +393,6 @@ If this is your administrator account, please check the "Create Account" option 
                     className="text-[10px] font-bold text-slate-400 hover:text-blue-600 transition-colors uppercase tracking-widest"
                   >
                     {isManagementMode ? 'Back to Login' : 'Create Account'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      setStatus('signing_in');
-                      try {
-                        const randomEmail = `dev_${Math.floor(Math.random() * 100000)}@example.com`;
-                        await createUserWithEmailAndPassword(auth, randomEmail, '123456');
-                      } catch (err: any) {
-                        setStatus('idle');
-                        setErrorMsg(`Dev Login Failed: ${err.message}`);
-                      }
-                    }}
-                    className="text-[10px] font-black text-emerald-500 hover:text-emerald-600 transition-colors uppercase tracking-widest"
-                  >
-                    Quick Dev Login
                   </button>
                   <button
                     type="button"

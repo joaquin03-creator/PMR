@@ -228,13 +228,21 @@ export interface LoadPlan {
   recordedBy: string;
 }
 
+export interface MaterialConversionDestinationLine {
+  destinationMaterialId: string;
+  producedWeight: number;
+  yieldPercent: number;
+}
+
 export interface MaterialConversion {
   id: string;
   sourceMaterialId: string;
-  destinationMaterialId: string;
   consumedWeight: number;
-  producedWeight: number;
-  yieldPercent: number;
+  destinations?: MaterialConversionDestinationLine[];
+  // Legacy single-destination fields for backward compatibility
+  destinationMaterialId?: string;
+  producedWeight?: number;
+  yieldPercent?: number;
   timestamp: string;
   status: 'completed' | 'voided';
   notes?: string;

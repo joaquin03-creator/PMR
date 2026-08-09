@@ -52,6 +52,26 @@ interface SaleFormItem {
   notes?: string;
 }
 
+export interface ConversionDestinationFormLine {
+  id: string;
+  destinationMaterialId: string;
+  producedWeight: string;
+}
+
+export function getConversionDestinations(c: MaterialConversion) {
+  if (c.destinations && Array.isArray(c.destinations) && c.destinations.length > 0) {
+    return c.destinations;
+  }
+  if (c.destinationMaterialId && c.producedWeight !== undefined) {
+    return [{
+      destinationMaterialId: c.destinationMaterialId,
+      producedWeight: c.producedWeight,
+      yieldPercent: c.yieldPercent ?? (c.consumedWeight > 0 ? (c.producedWeight / c.consumedWeight) * 100 : 0)
+    }];
+  }
+  return [];
+}
+
 export default function Inventory({ profile }: { profile: UserProfile | null }) {
   const [activeTab, setActiveTab] = useState<'inventory' | 'sales' | 'planner' | 'conversions' | 'adjustments'>('inventory');
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
@@ -84,9 +104,10 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   // Material Conversions State
   const [showConversionModal, setShowConversionModal] = useState(false);
   const [conversionSourceMatId, setConversionSourceMatId] = useState('');
-  const [conversionDestMatId, setConversionDestMatId] = useState('');
   const [conversionConsumedWeight, setConversionConsumedWeight] = useState('');
-  const [conversionProducedWeight, setConversionProducedWeight] = useState('');
+  const [conversionDestLines, setConversionDestLines] = useState<ConversionDestinationFormLine[]>([
+    { id: '1', destinationMaterialId: '', producedWeight: '' }
+  ]);
   const [conversionNotes, setConversionNotes] = useState('');
   const [conversionError, setConversionError] = useState<string | null>(null);
   const [conversionSuccessMsg, setConversionSuccessMsg] = useState<string | null>(null);
@@ -749,13 +770,36 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   // Material Conversions Handlers
   const handleOpenConversionModal = (sourceMatId?: string) => {
     setConversionSourceMatId(sourceMatId || '');
-    setConversionDestMatId('');
     setConversionConsumedWeight('');
-    setConversionProducedWeight('');
+    setConversionDestLines([
+      { id: '1', destinationMaterialId: '', producedWeight: '' }
+    ]);
     setConversionNotes('');
     setConversionError(null);
     setConversionSuccessMsg(null);
     setShowConversionModal(true);
+  };
+
+  const handleAddConversionDestLine = () => {
+    setConversionDestLines(prev => [
+      ...prev,
+      { id: Date.now().toString() + Math.random().toString(36).substring(2, 5), destinationMaterialId: '', producedWeight: '' }
+    ]);
+    setConversionError(null);
+  };
+
+  const handleRemoveConversionDestLine = (id: string) => {
+    if (conversionDestLines.length <= 1) return;
+    setConversionDestLines(prev => prev.filter(line => line.id !== id));
+    setConversionError(null);
+  };
+
+  const handleUpdateConversionDestLine = (id: string, field: 'destinationMaterialId' | 'producedWeight', value: string) => {
+    setConversionDestLines(prev => prev.map(line => {
+      if (line.id !== id) return line;
+      return { ...line, [field]: value };
+    }));
+    setConversionError(null);
   };
 
   const handleSubmitConversion = async (e: React.FormEvent, logAnother = false) => {
@@ -763,29 +807,53 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     setConversionError(null);
     setConversionSuccessMsg(null);
 
-    if (!conversionSourceMatId || !conversionDestMatId || !conversionConsumedWeight || !conversionProducedWeight) {
-      setConversionError('Please fill out all required conversion fields.');
-      modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-      return;
-    }
-
-    if (conversionSourceMatId === conversionDestMatId) {
-      setConversionError('Source material and destination material must be different.');
+    if (!conversionSourceMatId || !conversionConsumedWeight) {
+      setConversionError('Please select a source material and enter the quantity consumed.');
       modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
 
     const consumedNum = Number(conversionConsumedWeight);
-    const producedNum = Number(conversionProducedWeight);
-
     if (isNaN(consumedNum) || consumedNum <= 0) {
       setConversionError('Consumed quantity must be a positive number greater than 0.');
       modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
 
-    if (isNaN(producedNum) || producedNum < 0) {
-      setConversionError('Produced quantity cannot be negative.');
+    // Validate destination lines
+    if (!conversionDestLines || conversionDestLines.length === 0) {
+      setConversionError('Please add at least one destination material line.');
+      modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
+    for (let i = 0; i < conversionDestLines.length; i++) {
+      const line = conversionDestLines[i];
+      if (!line.destinationMaterialId) {
+        setConversionError(`Please select a destination material for line #${i + 1}.`);
+        modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+
+      if (line.destinationMaterialId === conversionSourceMatId) {
+        setConversionError(`Line #${i + 1}: Destination material cannot be the same as the source material.`);
+        modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+
+      const pNum = Number(line.producedWeight);
+      if (isNaN(pNum) || pNum < 0 || line.producedWeight === '') {
+        setConversionError(`Line #${i + 1}: Produced quantity must be a valid non-negative number.`);
+        modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+    }
+
+    // Check for duplicate destination materials
+    const destMatIds = conversionDestLines.map(l => l.destinationMaterialId);
+    const uniqueDestMatIds = new Set(destMatIds);
+    if (uniqueDestMatIds.size < destMatIds.length) {
+      setConversionError('Duplicate destination materials selected. Each destination line must be a unique material.');
       modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
@@ -807,18 +875,33 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     setProcessing(true);
 
     try {
-      const yieldPercent = Number(((producedNum / consumedNum) * 100).toFixed(2));
       const timestamp = new Date().toISOString();
+
+      const destinationsData = conversionDestLines.map(line => {
+        const producedWeight = Number(line.producedWeight);
+        const yieldPercent = Number(((producedWeight / consumedNum) * 100).toFixed(2));
+        return {
+          destinationMaterialId: line.destinationMaterialId,
+          producedWeight,
+          yieldPercent
+        };
+      });
+
+      const totalProducedWeight = destinationsData.reduce((sum, d) => sum + d.producedWeight, 0);
 
       const batch = writeBatch(db);
       const convRef = doc(collection(db, 'materialConversions'));
 
+      const primaryDest = destinationsData[0];
+
       const conversionData = {
         sourceMaterialId: conversionSourceMatId,
-        destinationMaterialId: conversionDestMatId,
         consumedWeight: consumedNum,
-        producedWeight: producedNum,
-        yieldPercent,
+        destinations: destinationsData,
+        // Legacy single-destination fields for backward compatibility
+        destinationMaterialId: primaryDest.destinationMaterialId,
+        producedWeight: primaryDest.producedWeight,
+        yieldPercent: primaryDest.yieldPercent,
         timestamp,
         status: 'completed' as const,
         ...(conversionNotes.trim() ? { notes: conversionNotes.trim() } : {})
@@ -834,31 +917,38 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         lastUpdated: timestamp
       }, { merge: true });
 
-      // Increment destination material inventory
-      const destInvRef = doc(db, 'inventory', conversionDestMatId);
-      batch.set(destInvRef, {
-        materialId: conversionDestMatId,
-        currentWeight: increment(producedNum),
-        lastUpdated: timestamp
-      }, { merge: true });
+      // Increment EVERY destination material inventory
+      destinationsData.forEach(d => {
+        const destInvRef = doc(db, 'inventory', d.destinationMaterialId);
+        batch.set(destInvRef, {
+          materialId: d.destinationMaterialId,
+          currentWeight: increment(d.producedWeight),
+          lastUpdated: timestamp
+        }, { merge: true });
+      });
 
       await batch.commit();
 
-      const destMat = materials.find(m => m.id === conversionDestMatId);
+      const destSummary = destinationsData.map(d => {
+        const m = materials.find(mat => mat.id === d.destinationMaterialId);
+        return `${d.producedWeight.toLocaleString()} lbs of ${m?.name || d.destinationMaterialId} (${d.yieldPercent}% yield)`;
+      }).join(', ');
 
       await logAuditEvent(
         'inventory',
         convRef.id,
         'update',
         { after: conversionData },
-        `Converted ${consumedNum.toLocaleString()} lbs of ${sourceMat?.name || conversionSourceMatId} to ${producedNum.toLocaleString()} lbs of ${destMat?.name || conversionDestMatId} (Yield: ${yieldPercent}%)`
+        `Converted ${consumedNum.toLocaleString()} lbs of ${sourceMat?.name || conversionSourceMatId} into ${destSummary}`
       );
 
-      const successMsgText = `Successfully logged conversion of ${consumedNum.toLocaleString()} lbs of ${sourceMat?.name || 'source'} into ${producedNum.toLocaleString()} lbs of ${destMat?.name || 'destination'} (${yieldPercent}% yield)! Inventory updated.`;
+      const successMsgText = `Successfully logged conversion of ${consumedNum.toLocaleString()} lbs of ${sourceMat?.name || 'source'} into ${destSummary}! Inventory updated.`;
 
       if (logAnother) {
         setConversionConsumedWeight('');
-        setConversionProducedWeight('');
+        setConversionDestLines([
+          { id: '1', destinationMaterialId: '', producedWeight: '' }
+        ]);
         setConversionNotes('');
         setConversionSuccessMsg(successMsgText);
         modalContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
@@ -886,25 +976,44 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   const handleVoidConversion = async (conversion: MaterialConversion) => {
     setConversionVoidError(null);
     const sourceMat = materials.find(m => m.id === conversion.sourceMaterialId);
-    const destMat = materials.find(m => m.id === conversion.destinationMaterialId);
-
     const sourceLabel = sourceMat ? `${sourceMat.code} - ${sourceMat.name}` : 'Source Material';
-    const destLabel = destMat ? `${destMat.code} - ${destMat.name}` : 'Destination Material';
 
-    // CHECK 2 (DESTINATION INVENTORY BLOCK): Verify destination material live inventory before voiding
-    const destInv = inventory.find(i => i.materialId === conversion.destinationMaterialId);
-    const destLiveWeight = destInv?.currentWeight || 0;
+    const destLines = getConversionDestinations(conversion);
 
-    if (destLiveWeight < conversion.producedWeight) {
-      const deficit = conversion.producedWeight - destLiveWeight;
-      const errorMsg = `Cannot void conversion: Reversing this conversion requires removing ${conversion.producedWeight.toLocaleString()} lbs from destination material "${destLabel}", but only ${destLiveWeight.toLocaleString()} lbs is currently available in live stock. (Deficit: ${deficit.toLocaleString()} lbs). Void blocked until sufficient stock is available.`;
+    // Group required deductions per destination material
+    const requiredDeductions: Record<string, number> = {};
+    destLines.forEach(d => {
+      requiredDeductions[d.destinationMaterialId] = (requiredDeductions[d.destinationMaterialId] || 0) + d.producedWeight;
+    });
+
+    // CHECK 2 (DESTINATION INVENTORY BLOCK): Verify EVERY destination material live inventory before voiding
+    const failingMaterials: string[] = [];
+
+    Object.entries(requiredDeductions).forEach(([destId, reqDeduction]) => {
+      const destInv = inventory.find(i => i.materialId === destId);
+      const destLiveWeight = destInv?.currentWeight || 0;
+      if (destLiveWeight < reqDeduction) {
+        const dMat = materials.find(m => m.id === destId);
+        const dLabel = dMat ? `${dMat.code} - ${dMat.name}` : destId;
+        const deficit = reqDeduction - destLiveWeight;
+        failingMaterials.push(`• "${dLabel}": Reversing requires removing ${reqDeduction.toLocaleString()} lbs, but only ${destLiveWeight.toLocaleString()} lbs is currently available in stock (Deficit: ${deficit.toLocaleString()} lbs).`);
+      }
+    });
+
+    if (failingMaterials.length > 0) {
+      const errorMsg = `Cannot void conversion: Reversing this conversion would cause ${failingMaterials.length} destination material(s) to drop below zero stock:\n\n${failingMaterials.join('\n')}\n\nVoid blocked until sufficient stock is available.`;
       setConversionVoidError(errorMsg);
       alert(errorMsg);
       return; // BLOCK VOID ENTIRELY
     }
 
+    const destSummaryList = destLines.map(d => {
+      const m = materials.find(mat => mat.id === d.destinationMaterialId);
+      return `• Remove ${d.producedWeight.toLocaleString()} lbs from ${m?.code || ''} ${m?.name || d.destinationMaterialId}`;
+    }).join('\n');
+
     if (!window.confirm(
-      `Are you sure you want to VOID this material conversion?\n\nThis will ATOMICALLY:\n• Restore ${conversion.consumedWeight.toLocaleString()} lbs back to ${sourceLabel}\n• Remove ${conversion.producedWeight.toLocaleString()} lbs from ${destLabel}\n\nVoided conversions remain permanently visible in history marked VOIDED.`
+      `Are you sure you want to VOID this material conversion?\n\nThis will ATOMICALLY:\n• Restore ${conversion.consumedWeight.toLocaleString()} lbs back to ${sourceLabel}\n${destSummaryList}\n\nVoided conversions remain permanently visible in history marked VOIDED.`
     )) {
       return;
     }
@@ -929,13 +1038,15 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         lastUpdated: voidTime
       }, { merge: true });
 
-      // Deduct producedWeight from destination material
-      const destInvRef = doc(db, 'inventory', conversion.destinationMaterialId);
-      batch.set(destInvRef, {
-        materialId: conversion.destinationMaterialId,
-        currentWeight: increment(-conversion.producedWeight),
-        lastUpdated: voidTime
-      }, { merge: true });
+      // Deduct producedWeight from EVERY destination material
+      Object.entries(requiredDeductions).forEach(([destId, reqDeduction]) => {
+        const destInvRef = doc(db, 'inventory', destId);
+        batch.set(destInvRef, {
+          materialId: destId,
+          currentWeight: increment(-reqDeduction),
+          lastUpdated: voidTime
+        }, { merge: true });
+      });
 
       await batch.commit();
 
@@ -944,7 +1055,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         conversion.id,
         'update',
         { before: conversion, after: { ...conversion, status: 'voided', voidedAt: voidTime } },
-        `Voided material conversion (ID: ${conversion.id}): restored ${conversion.consumedWeight} lbs to ${sourceLabel} and removed ${conversion.producedWeight} lbs from ${destLabel}`
+        `Voided material conversion (ID: ${conversion.id}): restored ${conversion.consumedWeight} lbs to ${sourceLabel} and reversed destination inventory increments.`
       );
 
     } catch (err: any) {
@@ -963,9 +1074,19 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
 
   const handleRelogConversion = (conversion: MaterialConversion) => {
     setConversionSourceMatId(conversion.sourceMaterialId);
-    setConversionDestMatId(conversion.destinationMaterialId);
     setConversionConsumedWeight(conversion.consumedWeight.toString());
-    setConversionProducedWeight(conversion.producedWeight.toString());
+
+    const dests = getConversionDestinations(conversion);
+    if (dests.length > 0) {
+      setConversionDestLines(dests.map((d, idx) => ({
+        id: (idx + 1).toString(),
+        destinationMaterialId: d.destinationMaterialId,
+        producedWeight: d.producedWeight.toString()
+      })));
+    } else {
+      setConversionDestLines([{ id: '1', destinationMaterialId: '', producedWeight: '' }]);
+    }
+
     setConversionNotes(conversion.notes ? `Correction for voided entry (${conversion.id.slice(0, 6)}): ${conversion.notes}` : '');
     setConversionError(null);
     setConversionSuccessMsg(null);
@@ -1208,7 +1329,10 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   }, [completedConversions]);
 
   const totalProducedWeight = useMemo(() => {
-    return completedConversions.reduce((sum, c) => sum + c.producedWeight, 0);
+    return completedConversions.reduce((sum, c) => {
+      const dests = getConversionDestinations(c);
+      return sum + dests.reduce((pSum, d) => pSum + d.producedWeight, 0);
+    }, 0);
   }, [completedConversions]);
 
   const overallAvgYield = useMemo(() => {
@@ -1219,13 +1343,16 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   const topProcessingPairs = useMemo(() => {
     const map: Record<string, { sourceId: string; destId: string; consumed: number; produced: number; count: number }> = {};
     completedConversions.forEach(c => {
-      const key = `${c.sourceMaterialId}_${c.destinationMaterialId}`;
-      if (!map[key]) {
-        map[key] = { sourceId: c.sourceMaterialId, destId: c.destinationMaterialId, consumed: 0, produced: 0, count: 0 };
-      }
-      map[key].consumed += c.consumedWeight;
-      map[key].produced += c.producedWeight;
-      map[key].count += 1;
+      const dests = getConversionDestinations(c);
+      dests.forEach(d => {
+        const key = `${c.sourceMaterialId}_${d.destinationMaterialId}`;
+        if (!map[key]) {
+          map[key] = { sourceId: c.sourceMaterialId, destId: d.destinationMaterialId, consumed: 0, produced: 0, count: 0 };
+        }
+        map[key].consumed += c.consumedWeight;
+        map[key].produced += d.producedWeight;
+        map[key].count += 1;
+      });
     });
 
     return Object.values(map)
@@ -1240,25 +1367,29 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     return conversions.filter(c => {
       const search = conversionSearch.toLowerCase();
       const sourceMat = materials.find(m => m.id === c.sourceMaterialId);
-      const destMat = materials.find(m => m.id === c.destinationMaterialId);
+      const dests = getConversionDestinations(c);
 
       const sourceCode = (sourceMat?.code || '').toLowerCase();
       const sourceName = (sourceMat?.name || '').toLowerCase();
-      const destCode = (destMat?.code || '').toLowerCase();
-      const destName = (destMat?.name || '').toLowerCase();
       const notesStr = (c.notes || '').toLowerCase();
       const statusStr = c.status.toLowerCase();
+
+      const destsMatchSearch = dests.some(d => {
+        const destMat = materials.find(m => m.id === d.destinationMaterialId);
+        const destCode = (destMat?.code || '').toLowerCase();
+        const destName = (destMat?.name || '').toLowerCase();
+        return destCode.includes(search) || destName.includes(search);
+      });
 
       const matchesSearch = !search ||
         sourceCode.includes(search) ||
         sourceName.includes(search) ||
-        destCode.includes(search) ||
-        destName.includes(search) ||
+        destsMatchSearch ||
         notesStr.includes(search) ||
         statusStr.includes(search);
 
       const matchesSource = conversionSourceFilter === 'all' || c.sourceMaterialId === conversionSourceFilter;
-      const matchesDest = conversionDestFilter === 'all' || c.destinationMaterialId === conversionDestFilter;
+      const matchesDest = conversionDestFilter === 'all' || dests.some(d => d.destinationMaterialId === conversionDestFilter);
       const matchesStatus = conversionStatusFilter === 'all' || c.status === conversionStatusFilter;
 
       return matchesSearch && matchesSource && matchesDest && matchesStatus;
@@ -2476,10 +2607,8 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
                   <tr className="bg-slate-50/50 text-slate-500 text-[10px] font-black uppercase tracking-widest border-b border-slate-100">
                     <th className="px-6 py-5">Date & Time</th>
                     <th className="px-6 py-5">Source Material</th>
-                    <th className="px-6 py-5">Destination Material</th>
                     <th className="px-6 py-5 text-right">Qty Consumed</th>
-                    <th className="px-6 py-5 text-right">Qty Produced</th>
-                    <th className="px-6 py-5 text-right">Yield %</th>
+                    <th className="px-6 py-5">Destination Material(s) & Yields</th>
                     <th className="px-6 py-5">Status</th>
                     <th className="px-6 py-5">Notes</th>
                     <th className="px-6 py-5 text-right">Actions</th>
@@ -2488,11 +2617,9 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
                 <tbody className="divide-y divide-slate-100">
                   {filteredConversions.map((conv) => {
                     const srcMat = materials.find(m => m.id === conv.sourceMaterialId);
-                    const dstMat = materials.find(m => m.id === conv.destinationMaterialId);
                     const isVoided = conv.status === 'voided';
-
                     const srcStock = inventory.find(i => i.materialId === conv.sourceMaterialId)?.currentWeight || 0;
-                    const dstStock = inventory.find(i => i.materialId === conv.destinationMaterialId)?.currentWeight || 0;
+                    const dests = getConversionDestinations(conv);
 
                     return (
                       <tr key={conv.id} className={cn("transition-colors group", isVoided ? "bg-slate-50/60 text-slate-400" : "hover:bg-blue-50/20 text-slate-900")}>
@@ -2513,36 +2640,44 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
                           <p className="text-[10px] text-slate-400 mt-0.5">Live Stock: {srcStock.toLocaleString()} lbs</p>
                         </td>
 
-                        <td className="px-6 py-5">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono font-black text-slate-600 px-2 py-0.5 bg-slate-100 rounded text-[10px]">
-                              {dstMat?.code || '-'}
-                            </span>
-                            <span className={cn("font-bold text-xs", isVoided && "line-through text-slate-400")}>
-                              {dstMat?.name || conv.destinationMaterialId}
-                            </span>
-                          </div>
-                          <p className="text-[10px] text-slate-400 mt-0.5">Live Stock: {dstStock.toLocaleString()} lbs</p>
-                        </td>
-
                         <td className="px-6 py-5 text-right font-mono text-xs font-bold text-amber-700">
                           -{conv.consumedWeight.toLocaleString()} lbs
                         </td>
 
-                        <td className="px-6 py-5 text-right font-mono text-xs font-bold text-emerald-700">
-                          +{conv.producedWeight.toLocaleString()} lbs
-                        </td>
+                        <td className="px-6 py-5 min-w-[320px]">
+                          <div className="space-y-1.5">
+                            {dests.map((d, dIdx) => {
+                              const dstMat = materials.find(m => m.id === d.destinationMaterialId);
+                              const dstStock = inventory.find(i => i.materialId === d.destinationMaterialId)?.currentWeight || 0;
 
-                        <td className="px-6 py-5 text-right font-mono text-xs font-black">
-                          <span className={cn(
-                            "px-2.5 py-1 rounded-full text-[11px]",
-                            isVoided ? "bg-slate-200 text-slate-500 line-through" :
-                            conv.yieldPercent >= 75 ? "bg-emerald-50 text-emerald-700 border border-emerald-200/60" :
-                            conv.yieldPercent >= 50 ? "bg-amber-50 text-amber-700 border border-amber-200/60" :
-                            "bg-slate-100 text-slate-700 border border-slate-200"
-                          )}>
-                            {conv.yieldPercent.toFixed(1)}%
-                          </span>
+                              return (
+                                <div key={dIdx} className="flex items-center justify-between gap-3 bg-slate-50 p-2 rounded-xl border border-slate-100 text-xs">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <span className="font-mono font-black text-slate-600 px-1.5 py-0.5 bg-white border border-slate-200 rounded text-[10px] shrink-0">
+                                      {dstMat?.code || '-'}
+                                    </span>
+                                    <span className={cn("font-bold text-xs text-slate-800 truncate", isVoided && "line-through text-slate-400")}>
+                                      {dstMat?.name || d.destinationMaterialId}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-2 font-mono text-xs shrink-0">
+                                    <span className={cn("font-bold text-emerald-700", isVoided && "line-through text-slate-400")}>
+                                      +{d.producedWeight.toLocaleString()} lbs
+                                    </span>
+                                    <span className={cn(
+                                      "px-2 py-0.5 rounded-full text-[10px] font-black",
+                                      isVoided ? "bg-slate-200 text-slate-500 line-through" :
+                                      d.yieldPercent >= 75 ? "bg-emerald-100 text-emerald-800" :
+                                      d.yieldPercent >= 50 ? "bg-amber-100 text-amber-800" :
+                                      "bg-slate-200 text-slate-700"
+                                    )}>
+                                      {d.yieldPercent.toFixed(1)}%
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
                         </td>
 
                         <td className="px-6 py-5">
@@ -2592,7 +2727,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
 
                   {filteredConversions.length === 0 && (
                     <tr>
-                      <td colSpan={9} className="px-6 py-12 text-center text-slate-400">
+                      <td colSpan={7} className="px-6 py-12 text-center text-slate-400">
                         <Repeat className="w-10 h-10 text-slate-300 mx-auto mb-3" />
                         <p className="text-slate-700 font-bold text-sm">No material conversions logged yet</p>
                         <p className="text-xs text-slate-400 mt-1">Use the "New Material Conversion" button to log internal processing.</p>
@@ -3199,79 +3334,142 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
                 )}
               </div>
 
-              {/* Destination Material & Quantity Produced */}
+              {/* Destination Materials & Quantities Produced */}
               <div className="p-6 bg-slate-50 rounded-3xl border border-slate-200/80 space-y-4">
-                <div className="flex items-center gap-2">
-                  <ArrowUpRight className="w-4 h-4 text-emerald-600" />
-                  <h4 className="text-xs font-black uppercase tracking-widest text-slate-900">2. Destination Material (Produced)</h4>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <ArrowUpRight className="w-4 h-4 text-emerald-600" />
+                    <h4 className="text-xs font-black uppercase tracking-widest text-slate-900">
+                      2. Destination Material(s) Produced
+                    </h4>
+                  </div>
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                    {conversionDestLines.length} Destination {conversionDestLines.length === 1 ? 'Line' : 'Lines'}
+                  </span>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">
-                      Destination Material <span className="text-red-500">*</span>
-                    </label>
-                    <select
-                      value={conversionDestMatId}
-                      onChange={(e) => {
-                        setConversionDestMatId(e.target.value);
-                        setConversionError(null);
-                      }}
-                      className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all cursor-pointer"
-                      required
-                    >
-                      <option value="">-- Select Destination Material --</option>
-                      {materials.map(m => {
-                        const invWeight = inventory.find(i => i.materialId === m.id)?.currentWeight || 0;
-                        return (
-                          <option key={m.id} value={m.id}>
-                            {m.code} - {m.name} ({invWeight.toLocaleString()} {m.unit} in stock)
-                          </option>
-                        );
-                      })}
-                    </select>
-                  </div>
+                <div className="space-y-3">
+                  {conversionDestLines.map((line, idx) => {
+                    const lineProducedNum = Number(line.producedWeight) || 0;
+                    const consumedNum = Number(conversionConsumedWeight) || 0;
+                    const lineYieldPercent = consumedNum > 0 ? (lineProducedNum / consumedNum) * 100 : 0;
 
-                  <div>
-                    <label className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">
-                      Quantity Produced (Weight) <span className="text-red-500">*</span>
-                    </label>
-                    <div className="relative">
-                      <input
-                        type="number"
-                        step="any"
-                        min="0"
-                        placeholder="e.g. 85"
-                        value={conversionProducedWeight}
-                        onChange={(e) => {
-                          setConversionProducedWeight(e.target.value);
-                          setConversionError(null);
-                        }}
-                        className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-mono font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                        required
-                      />
-                      <span className="absolute right-4 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">lbs</span>
-                    </div>
-                  </div>
+                    return (
+                      <div key={line.id} className="p-4 bg-white rounded-2xl border border-slate-200 shadow-sm space-y-3">
+                        <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                          <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">
+                            Destination Line #{idx + 1}
+                          </span>
+                          {conversionDestLines.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveConversionDestLine(line.id)}
+                              className="text-slate-400 hover:text-red-600 p-1 rounded-lg hover:bg-red-50 transition-colors cursor-pointer"
+                              title="Remove destination line"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">
+                              Destination Material <span className="text-red-500">*</span>
+                            </label>
+                            <select
+                              value={line.destinationMaterialId}
+                              onChange={(e) => handleUpdateConversionDestLine(line.id, 'destinationMaterialId', e.target.value)}
+                              className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all cursor-pointer"
+                              required
+                            >
+                              <option value="">-- Select Material --</option>
+                              {materials.map(m => {
+                                const invWeight = inventory.find(i => i.materialId === m.id)?.currentWeight || 0;
+                                return (
+                                  <option key={m.id} value={m.id} disabled={m.id === conversionSourceMatId}>
+                                    {m.code} - {m.name} ({invWeight.toLocaleString()} {m.unit} in stock)
+                                  </option>
+                                );
+                              })}
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">
+                              Produced Weight (lbs) <span className="text-red-500">*</span>
+                            </label>
+                            <div className="relative">
+                              <input
+                                type="number"
+                                step="any"
+                                min="0"
+                                placeholder="e.g. 85"
+                                value={line.producedWeight}
+                                onChange={(e) => handleUpdateConversionDestLine(line.id, 'producedWeight', e.target.value)}
+                                className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                                required
+                              />
+                              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">lbs</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Individual Line Yield Calculation */}
+                        {consumedNum > 0 && line.destinationMaterialId && (
+                          <div className="flex items-center justify-between text-[11px] font-medium pt-1 text-slate-500">
+                            <span>Individual Line Yield:</span>
+                            <span className={cn(
+                              "font-mono font-black px-2 py-0.5 rounded-full text-[10px]",
+                              lineYieldPercent >= 75 ? "bg-emerald-100 text-emerald-800" :
+                              lineYieldPercent >= 50 ? "bg-amber-100 text-amber-800" :
+                              "bg-slate-100 text-slate-700"
+                            )}>
+                              {lineYieldPercent.toFixed(1)}% yield ({lineProducedNum.toLocaleString()} lbs)
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
 
-                {/* Calculated Yield Live Preview */}
-                {Number(conversionConsumedWeight) > 0 && Number(conversionProducedWeight) >= 0 && (
-                  <div className="p-3 bg-white rounded-2xl border border-slate-200 flex items-center justify-between text-xs font-bold">
-                    <span className="text-slate-500">Estimated Yield Loss / Yield %:</span>
-                    <div className="flex items-center gap-3 font-mono">
-                      <span className="text-amber-700">
-                        Loss: {(Number(conversionConsumedWeight) - Number(conversionProducedWeight)).toLocaleString()} lbs
-                      </span>
-                      <span className={cn(
-                        "px-2.5 py-1 rounded-full text-xs font-black",
-                        (Number(conversionProducedWeight) / Number(conversionConsumedWeight)) >= 0.75 ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"
-                      )}>
-                        {((Number(conversionProducedWeight) / Number(conversionConsumedWeight)) * 100).toFixed(1)}% Yield
-                      </span>
+                <button
+                  type="button"
+                  onClick={handleAddConversionDestLine}
+                  className="w-full py-3 bg-white hover:bg-slate-100 border border-dashed border-slate-300 text-slate-700 rounded-2xl text-xs font-black uppercase tracking-wider flex items-center justify-center gap-2 transition-all cursor-pointer shadow-sm"
+                >
+                  <Plus className="w-4 h-4 text-blue-600" />
+                  + Add Another Destination Material Line
+                </button>
+
+                {/* Total Combined Yield & Weight Summary Card */}
+                {Number(conversionConsumedWeight) > 0 && conversionDestLines.some(l => Number(l.producedWeight) > 0) && (() => {
+                  const consumedNum = Number(conversionConsumedWeight);
+                  const totalProd = conversionDestLines.reduce((sum, l) => sum + (Number(l.producedWeight) || 0), 0);
+                  const totalYield = (totalProd / consumedNum) * 100;
+                  const diff = totalProd - consumedNum;
+
+                  return (
+                    <div className="p-4 bg-slate-900 text-white rounded-2xl space-y-2 shadow-lg">
+                      <div className="flex items-center justify-between text-xs font-bold border-b border-slate-800 pb-2">
+                        <span className="text-slate-400 uppercase tracking-wider text-[10px]">Total Production Summary</span>
+                        <span className={cn(
+                          "px-2.5 py-0.5 rounded-full text-xs font-black font-mono",
+                          totalYield >= 75 ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40" : "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                        )}>
+                          {totalYield.toFixed(1)}% Combined Yield
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs font-mono">
+                        <span className="text-slate-300">Total Produced: <span className="text-white font-bold">{totalProd.toLocaleString()} lbs</span></span>
+                        <span className={diff >= 0 ? "text-emerald-400" : "text-amber-400"}>
+                          {diff >= 0 ? `+${diff.toLocaleString()} lbs gain` : `${diff.toLocaleString()} lbs loss/scrap`}
+                        </span>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
               </div>
 
               {/* Notes */}

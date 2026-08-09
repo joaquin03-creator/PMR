@@ -436,12 +436,13 @@ async function startServer() {
 
   // Secure Admin Password Reset Bypass Endpoint
   app.post("/api/admin-reset-password", async (req, res) => {
+    res.setHeader("Content-Type", "application/json");
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({ error: "Missing or invalid authorization token" });
     }
     const token = authHeader.split("Bearer ")[1];
-    const { targetUid, targetEmail, newPassword } = req.body;
+    const { targetUid, targetEmail, newPassword } = req.body || {};
 
     if (!targetUid || !targetEmail || !newPassword) {
       return res.status(400).json({ error: "Missing targetUid, targetEmail, or newPassword parameters" });
@@ -454,11 +455,15 @@ async function startServer() {
       // 1. Verify Manager ID Token in Firebase Auth
       const decodedToken = await admin.auth().verifyIdToken(token);
       
-      const isMasterAdmin = decodedToken.email === "joaquinrodriguez3333@gmail.com" || 
-                            decodedToken.email === "joaquin03@icloud.com" || 
-                            decodedToken.email === "info@preferredmetalsrecycling.com" ||
-                            (decodedToken.email && decodedToken.email.startsWith("demo-manager")) ||
-                            (decodedToken.email && decodedToken.email.endsWith("@preferredmetalsrecycling.com"));
+      const decodedEmail = (decodedToken.email || "").toLowerCase().trim();
+      const ALLOWED_PASSWORD_RESET_EMAILS = [
+        'tiffany@preferredmetalsrecycling.com',
+        'info@preferredmetalsrecycling.com',
+        'joaquinrodriguez3333@gmail.com',
+        // TEMPORARY: Allow demo-manager account access for administrative password reset action testing. Remove once real named accounts are fully in use (2026-08-08).
+        'demo-manager@preferredmetalsrecycling.com'
+      ];
+      const isMasterAdmin = ALLOWED_PASSWORD_RESET_EMAILS.includes(decodedEmail);
 
       if (!isMasterAdmin) {
         return res.status(403).json({ error: "Access Denied: Only authorized managers can perform administrative password resets." });
@@ -542,47 +547,30 @@ async function startServer() {
 
     const cleanedEmail = email.toLowerCase().trim();
 
+    const ALLOWED_ADMIN_EMAILS = [
+      'tiffany@preferredmetalsrecycling.com',
+      'info@preferredmetalsrecycling.com',
+      'joaquinrodriguez3333@gmail.com'
+    ];
+
+    if (!ALLOWED_ADMIN_EMAILS.includes(cleanedEmail)) {
+      return res.status(401).json({
+        error: "Invalid credentials. Check your System Key.",
+        code: "auth/invalid-credential"
+      });
+    }
+
     try {
       // 1. Authenticate with Firebase Auth REST API using the project's Web API Key
-      let localId: string;
-      try {
-        const response = await axios.post(
-          `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseConfig.apiKey}`,
-          {
-            email: cleanedEmail,
-            password: password,
-            returnSecureToken: true
-          }
-        );
-        localId = response.data.localId;
-      } catch (authError: any) {
-        const message = authError.response?.data?.error?.message;
-        console.warn(`Server-side sign-in credential check message: ${message}`);
-
-        // Handle auto-registration fallback for owners/admins if account doesn't exist yet
-        const isEligibleForAutoRegister = cleanedEmail === 'joaquinrodriguez3333@gmail.com' ||
-                                         cleanedEmail === 'joaquin03@icloud.com' ||
-                                         cleanedEmail === 'info@preferredmetalsrecycling.com' ||
-                                         cleanedEmail.startsWith('dev_') ||
-                                         cleanedEmail.endsWith('@preferredmetalsrecycling.com');
-
-        if (isEligibleForAutoRegister && (message === "EMAIL_NOT_FOUND" || message === "USER_NOT_FOUND")) {
-          console.log(`Auto-creating credentials for eligible master user on backend: ${cleanedEmail}`);
-          try {
-             const signUpResponse = await axios.post(
-               `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${firebaseConfig.apiKey}`,
-               { email: cleanedEmail, password: password, returnSecureToken: true }
-             );
-             localId = signUpResponse.data.localId;
-          } catch (signUpErr: any) {
-             console.error("Auto-registration failed:", signUpErr.response?.data || signUpErr.message);
-             throw signUpErr;
-          }
-        } else {
-          // If password was wrong or some other error, throw it so we return 401
-          throw authError;
+      const response = await axios.post(
+        `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseConfig.apiKey}`,
+        {
+          email: cleanedEmail,
+          password: password,
+          returnSecureToken: true
         }
-      }
+      );
+      const localId = response.data.localId;
 
       // 2. Since credentials are valid on verified backend, generate a Custom Auth Token from Firebase Admin
       const customToken = await admin.auth().createCustomToken(localId);
@@ -614,118 +602,6 @@ async function startServer() {
         error: clientMsg,
         code: clientCode
       });
-    }
-  });
-
-  let memorySystemHint = "Hint: Contact Joaqui's manager for current System Key.";
-
-  // Get public system key hint from Firestore
-  app.get("/api/auth/system-hint", async (req, res) => {
-    // Strategy 1: Attempt reading via Firestore REST API with the Web API Key
-    // This bypasses the default service account's IAM role restrictions on custom named database IDs.
-    try {
-      const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/systemSettings/global?key=${firebaseConfig.apiKey}`;
-      const response = await axios.get(url, {
-        headers: { "Accept": "application/json" },
-        timeout: 4000
-      });
-      if (response.data && response.data.fields) {
-        const hint = response.data.fields.keyHint?.stringValue || "";
-        if (hint) {
-          memorySystemHint = hint;
-        }
-        return res.json({ hint: memorySystemHint });
-      }
-    } catch (restErr: any) {
-      // Gracefully bypass
-    }
-
-    // Strategy 2: Fallback to Firebase Admin SDK
-    try {
-      const db = getFirestore(admin.apps[0], firebaseConfig.firestoreDatabaseId);
-      const doc = await db.collection("systemSettings").doc("global").get();
-      if (doc.exists) {
-        const hint = doc.data()?.keyHint || "";
-        if (hint) {
-          memorySystemHint = hint;
-        }
-        return res.json({ hint: memorySystemHint });
-      }
-    } catch (err: any) {
-      // Gracefully bypass
-    }
-
-    return res.json({ hint: memorySystemHint });
-  });
-
-  // Update system key hint in Firestore (Requires manager auth)
-  app.post("/api/auth/system-hint", async (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "Unauthorized: Missing token header" });
-    }
-
-    const token = authHeader.split("Bearer ")[1];
-    const { hint } = req.body;
-
-    if (typeof hint === "string") {
-      memorySystemHint = hint;
-    }
-
-    try {
-      const decodedToken = await admin.auth().verifyIdToken(token);
-      const isMasterAdmin = decodedToken.email === "joaquinrodriguez3333@gmail.com" || 
-                            decodedToken.email === "joaquin03@icloud.com" || 
-                            decodedToken.email === "info@preferredmetalsrecycling.com" ||
-                            (decodedToken.email && decodedToken.email.startsWith("demo-manager")) ||
-                            (decodedToken.email && decodedToken.email.endsWith("@preferredmetalsrecycling.com"));
-
-      if (!isMasterAdmin) {
-        return res.status(403).json({ error: "Access Denied: Only managers can update the login system hint." });
-      }
-
-      // Strategy 1: Attempt write via Firestore REST API using the user's Auth token (Bearer token)
-      // This writes under the authorized user's security rules instead of using the service account.
-      let restSuccess = false;
-      try {
-        const patchUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/systemSettings/global?updateMask.fieldPaths=keyHint&updateMask.fieldPaths=updatedAt&updateMask.fieldPaths=updatedBy&key=${firebaseConfig.apiKey}`;
-        await axios.patch(patchUrl, {
-          fields: {
-            keyHint: { stringValue: hint || "" },
-            updatedAt: { stringValue: new Date().toISOString() },
-            updatedBy: { stringValue: decodedToken.email || "" }
-          }
-        }, {
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "Content-Type": "application/json"
-          },
-          timeout: 4000
-        });
-        restSuccess = true;
-      } catch (restErr: any) {
-        // Gracefully bypass
-      }
-
-      if (restSuccess) {
-        return res.json({ success: true, hint: hint || "" });
-      }
-
-      // Strategy 2: Fallback to Firebase Admin SDK
-      try {
-        const db = getFirestore(admin.apps[0], firebaseConfig.firestoreDatabaseId);
-        await db.collection("systemSettings").doc("global").set({
-          keyHint: hint || "",
-          updatedAt: new Date().toISOString(),
-          updatedBy: decodedToken.email
-        }, { merge: true });
-      } catch (err: any) {
-        // Gracefully bypass
-      }
-
-      return res.json({ success: true, hint: hint || "" });
-    } catch (err: any) {
-      return res.json({ success: true, hint: hint || "" });
     }
   });
 
@@ -778,6 +654,22 @@ async function startServer() {
         details: error.response?.data || "No external error details"
       });
     }
+  });
+
+  // API 404 handler - ensure any unmatched /api/* request returns JSON, never HTML
+  app.use("/api/*", (req, res) => {
+    res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
+  });
+
+  // API Express error handler
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path.startsWith("/api") || req.originalUrl.startsWith("/api")) {
+      console.error("API Express error:", err);
+      return res.status(err.status || err.statusCode || 500).json({
+        error: err.message || "Internal server error"
+      });
+    }
+    next(err);
   });
 
   // Vite middleware for development
