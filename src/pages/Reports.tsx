@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useLocation } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { useSettings } from '../context/SettingsContext';
 import { collection, onSnapshot, query, where, addDoc, getDocs, serverTimestamp, orderBy, limit, doc, updateDoc } from 'firebase/firestore';
@@ -93,15 +93,39 @@ export default function Reports({ profile }: { profile: any }) {
   const [searchParams] = useSearchParams();
   const [activeTab, setActiveTab] = useState<'overview' | 'materials' | 'sales' | 'compliance' | 'backups' | 'history' | 'cash_flow'>('overview');
 
+  const location = useLocation();
+
   useEffect(() => {
-    const tab = searchParams.get('tab');
-    if (tab === 'compliance' || tab === 'xml_portal') {
-      setActiveTab('compliance');
-      if (tab === 'xml_portal') {
-        setComplianceSubTab('xml_portal');
+    const tabParam = searchParams.get('tab') || location.state?.tab || location.state?.activeTab;
+    if (tabParam) {
+      if (tabParam === 'compliance' || tabParam === 'xml_portal') {
+        setActiveTab('compliance');
+      } else if (tabParam === 'sales' || tabParam === 'margin' || tabParam === 'profit') {
+        setActiveTab('sales');
+      } else if (tabParam === 'overview' || tabParam === 'financial' || tabParam === 'spend') {
+        setActiveTab('overview');
+      } else if (tabParam === 'materials') {
+        setActiveTab('materials');
+      } else if (tabParam === 'cash_flow' || tabParam === 'daily_closing') {
+        setActiveTab('cash_flow');
+      } else if (tabParam === 'backups') {
+        setActiveTab('backups');
+      } else if (tabParam === 'history') {
+        setActiveTab('history');
       }
     }
-  }, [searchParams]);
+
+    const rangeParam = searchParams.get('range') || searchParams.get('timeRange') || location.state?.range || location.state?.timeRange;
+    if (rangeParam) {
+      if (rangeParam === 'daily' || rangeParam === 'today') {
+        setTimeRange('daily');
+      } else if (rangeParam === 'weekly') {
+        setTimeRange('weekly');
+      } else if (rangeParam === 'monthly') {
+        setTimeRange('monthly');
+      }
+    }
+  }, [searchParams, location.state]);
 
   const [salesSubTab, setSalesSubTab] = useState<'overview' | 'tickets' | 'categories' | 'coppers'>('overview');
   const [salesSearch, setSalesSearch] = useState('');
@@ -115,7 +139,6 @@ export default function Reports({ profile }: { profile: any }) {
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'warning', message: string, onConfirm?: () => void } | null>(null);
 
   // --- OHIO DEPT OF STATE XML PORTAL COMPLIANCE ENGINE STATE ---
-  const [complianceSubTab, setComplianceSubTab] = useState<'leads' | 'xml_portal'>('xml_portal');
   const [complianceDate, setComplianceDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [complianceTickets, setComplianceTickets] = useState<BuyTicket[]>([]);
   const [selectedXmlTickets, setSelectedXmlTickets] = useState<string[]>([]);
@@ -1264,69 +1287,6 @@ export default function Reports({ profile }: { profile: any }) {
     tripTickets.filter(t => t.status !== 'cancelled' && t.status !== 'voided'),
   [tripTickets]);
 
-  // Granular Material Purchase Data
-  const exportLeadsCsv = () => {
-    const headers = [
-      'Transaction ID',
-      'Date',
-      'Time',
-      'Seller Name',
-      'Seller ID Type',
-      'Seller ID Num',
-      'Seller Address',
-      'Seller Phone',
-      'Vehicle Plate',
-      'Vehicle Make',
-      'Vehicle Model',
-      'Material',
-      'Weight',
-      'Price Paid',
-      'Payment Method',
-      'Affirmed'
-    ];
-
-    const rows = validBuyTickets.flatMap(ticket => {
-      const customer = customers.find(c => c.id === ticket.customerId);
-      return (ticket.materials || []).map(m => {
-        const material = materials.find(mat => mat.id === m.materialId);
-        const timestamp = new Date(ticket.timestamp);
-        return [
-          ticket.id,
-          timestamp.toLocaleDateString(),
-          timestamp.toLocaleTimeString(),
-          customer?.name || 'Unknown',
-          customer?.idType || '',
-          customer?.idNumber || '',
-          `"${customer?.address || ''}"`,
-          customer?.phone || '',
-          ticket.vehiclePlate || '',
-          ticket.vehicleMake || '',
-          ticket.vehicleModel || '',
-          material?.name || 'Unknown',
-          m.netWeight,
-          m.totalAmount,
-          ticket.paymentMethod || 'cash',
-          ticket.sellerAffirmed ? 'YES' : 'NO'
-        ];
-      });
-    });
-
-    const csvContent = [
-      headers.join(','),
-      ...rows.map(r => r.join(','))
-    ].join('\n');
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `ohio_leads_report_${new Date().toISOString().split('T')[0]}.csv`;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
-  };
   // Helper to determine the historical sell price of a material on a specific day / timestamp
   const getSellPriceForDay = (materialId: string, timestamp: string): number => {
     if (!timestamp) return materials.find(m => m.id === materialId)?.salePrice || 0;
@@ -2186,79 +2146,6 @@ export default function Reports({ profile }: { profile: any }) {
     }
   };
 
-  const handleSubmitToWorkCenter = async () => {
-    if (!profile) return;
-    
-    // Prepare report data (matching exportLeadsCsv logic)
-    const today = new Date().toISOString().split('T')[0];
-    const todayTickets = validBuyTickets.filter(t => new Date(t.timestamp).toDateString() === new Date().toDateString());
-
-    if (todayTickets.length === 0) {
-      setNotification({ type: 'warning', message: 'No transactions found for today to submit.' });
-      return;
-    }
-
-    setSubmittingReporting(true);
-    try {
-      const reportRows = todayTickets.flatMap(ticket => {
-        const customer = customers.find(c => c.id === ticket.customerId);
-        return (ticket.materials || []).map(m => {
-          const material = materials.find(mat => mat.id === m.materialId);
-          return {
-            transactionId: ticket.id,
-            timestamp: ticket.timestamp,
-            seller: customer?.name || 'Unknown',
-            idInfo: `${customer?.idType || ''} ${customer?.idNumber || ''}`,
-            vehicle: `${ticket.vehicleYear || ''} ${ticket.vehicleMake || ''} ${ticket.vehicleModel || ''}`,
-            material: material?.name || 'Unknown',
-            weight: m.netWeight,
-            amount: m.totalAmount
-          };
-        });
-      });
-
-      const response = await fetch('/api/submit-leads', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          reportData: reportRows,
-          date: today,
-          submittedBy: profile.email
-        })
-      });
-
-      const result = await response.json();
-
-      const submissionLog: Omit<ComplianceSubmission, 'id'> = {
-        date: today,
-        timestamp: new Date().toISOString(),
-        submittedBy: profile.displayName || profile.email,
-        status: result.status === 'success' || result.status === 'mock_success' ? 'success' : 'failed',
-        ticketCount: todayTickets.length,
-        responseMessage: result.message || result.error,
-        payloadText: JSON.stringify(reportRows)
-      };
-
-      await addDoc(collection(db, 'complianceSubmissions'), submissionLog);
-
-      if (submissionLog.status === 'success') {
-        setNotification({ 
-          type: 'success', 
-          message: result.message || 'Report submitted successfully to WorkCenter.' 
-        });
-      } else {
-        setNotification({ 
-          type: 'error', 
-          message: `Submission failed: ${result.error || 'Unknown server error'}` 
-        });
-      }
-    } catch (error: any) {
-      console.error('Submission error:', error);
-      setNotification({ type: 'error', message: `Submission failed: ${error.message}` });
-    } finally {
-      setSubmittingReporting(false);
-    }
-  };
 
   if (loading) {
     return (
@@ -3306,37 +3193,8 @@ export default function Reports({ profile }: { profile: any }) {
 
       {activeTab === 'compliance' && (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4">
-          {/* Sub-tab Selection */}
-          <div className="flex bg-slate-100 p-1.5 rounded-2xl max-w-lg print:hidden">
-            <button
-              onClick={() => setComplianceSubTab('xml_portal')}
-              className={cn(
-                "flex-1 py-3 text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-2",
-                complianceSubTab === 'xml_portal'
-                  ? "bg-white text-slate-900 shadow-sm"
-                  : "text-slate-500 hover:text-slate-800"
-              )}
-            >
-              <FileCode className="w-4 h-4 text-blue-600" />
-              State XML Upload Portal Workflow
-            </button>
-            <button
-              onClick={() => setComplianceSubTab('leads')}
-              className={cn(
-                "flex-1 py-3 text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-2",
-                complianceSubTab === 'leads'
-                  ? "bg-white text-slate-900 shadow-sm"
-                  : "text-slate-500 hover:text-slate-800"
-              )}
-            >
-              <Send className="w-4 h-4 text-slate-500" />
-              WorkCenter API (LEADS)
-            </button>
-          </div>
-
-          {complianceSubTab === 'xml_portal' ? (
-            <div className="space-y-8">
-              {/* Header Guidance Card */}
+          <div className="space-y-8">
+            {/* Header Guidance Card */}
               <section className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm space-y-6">
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
                   <div className="flex items-center gap-4">
@@ -3903,260 +3761,8 @@ export default function Reports({ profile }: { profile: any }) {
                 </section>
               )}
             </div>
-          ) : (
-            <>
-              {/* Automated WorkCenter API section */}
-              <section className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm space-y-6">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    <div className="p-3 bg-blue-50 rounded-2xl">
-                      <ShieldCheck className="w-6 h-6 text-blue-600" />
-                    </div>
-                    <div>
-                      <h3 className="text-xl font-black text-slate-900 uppercase tracking-tight">Ohio LEADS Reporting</h3>
-                      <p className="text-sm text-slate-500 font-medium">Generate daily transaction reports for the Department of Public Safety.</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <button 
-                      onClick={handleSubmitToWorkCenter}
-                      disabled={submittingReporting}
-                      className="px-6 py-3 bg-slate-900 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-slate-800 transition-all shadow-xl shadow-slate-200 flex items-center gap-2 disabled:opacity-50"
-                    >
-                      {submittingReporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                      Submit to WorkCenter
-                    </button>
-                    <button 
-                      onClick={exportLeadsCsv}
-                      className="px-6 py-3 border border-slate-200 bg-white text-slate-700 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-slate-50 transition-all flex items-center gap-2"
-                    >
-                      <Download className="w-4 h-4" /> Export LEADS CSV
-                    </button>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 pt-6 border-t border-slate-100">
-                  <div className="p-4 bg-slate-50 rounded-2xl space-y-2">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Compliance Status</p>
-                    <div className="flex items-center gap-2 text-green-600 font-bold">
-                      <ShieldCheck className="w-5 h-5" />
-                      <span>ORC 4737.04 Compliant</span>
-                    </div>
-                  </div>
-                  <div className="p-4 bg-slate-50 rounded-2xl space-y-2">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Pending Reports</p>
-                    <p className="text-xl font-black text-slate-900">0</p>
-                  </div>
-                  <div className="p-4 bg-slate-50 rounded-2xl space-y-2">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Last Export</p>
-                    <p className="text-sm font-bold text-slate-600">{new Date().toLocaleDateString()}</p>
-                  </div>
-                </div>
-              </section>
-
-              <section className="bg-amber-50 border border-amber-100 p-6 rounded-3xl flex gap-4 items-start">
-                <AlertTriangle className="w-6 h-6 text-amber-600 shrink-0 mt-1" />
-                <div className="space-y-2">
-                  <h4 className="font-black text-amber-900 uppercase tracking-tight">Regulatory Reminder</h4>
-                  <p className="text-sm text-amber-800 leading-relaxed font-medium">
-                    Ohio law requires all scrap metal dealers to submit an electronic report of all purchase transactions to the Department of Public Safety by the end of each business day. Ensure all ID photos and material photos are captured before completing tickets.
-                  </p>
-                </div>
-              </section>
-
-              <section className="bg-white rounded-[2.5rem] border border-slate-200 shadow-xl shadow-slate-200/50 overflow-hidden">
-                <div className="px-8 py-6 border-b border-slate-100 flex justify-between items-center">
-                  <div>
-                    <h4 className="text-lg font-black text-slate-900 uppercase tracking-tight">Submission History</h4>
-                    <p className="text-xs text-slate-500 font-medium">Record of all automated DHS/LEADS transmissions.</p>
-                  </div>
-                  <History className="w-5 h-5 text-slate-300" />
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="bg-slate-50/50 text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">
-                        <th className="px-6 py-4">Status</th>
-                        <th className="px-6 py-4">Submission Date</th>
-                        <th className="px-6 py-4">Tickets</th>
-                        <th className="px-6 py-4">Submitted By</th>
-                        <th className="px-6 py-4 text-right">Action</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {complianceSubmissions.map((sub) => (
-                        <tr key={sub.id} className="hover:bg-slate-50/50 transition-colors">
-                          <td className="px-6 py-4">
-                            <div className="flex items-center gap-2">
-                              {sub.status === 'verified' || sub.status === 'success' ? (
-                                <div className="flex items-center gap-1.5 text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
-                                  <CheckCircle2 className="w-3 h-3" />
-                                  <span className="text-[10px] font-black uppercase tracking-widest">Verified</span>
-                                </div>
-                              ) : sub.status === 'submitted' ? (
-                                <div className="flex items-center gap-1.5 text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full">
-                                  <Clock className="w-3 h-3" />
-                                  <span className="text-[10px] font-black uppercase tracking-widest">Pending Verification</span>
-                                </div>
-                              ) : sub.status === 'rejected' ? (
-                                <div className="flex items-center gap-1.5 text-rose-600 bg-rose-50 px-2 py-0.5 rounded-full">
-                                  <XCircle className="w-3 h-3" />
-                                  <span className="text-[10px] font-black uppercase tracking-widest">Rejected</span>
-                                </div>
-                              ) : (
-                                <div className="flex items-center gap-1.5 text-red-600 bg-red-50 px-2 py-0.5 rounded-full">
-                                  <XCircle className="w-3 h-3" />
-                                  <span className="text-[10px] font-black uppercase tracking-widest">Failed</span>
-                                </div>
-                              )}
-                            </div>
-                          </td>
-                          <td className="px-6 py-4">
-                            <p className="text-sm font-black text-slate-900">{new Date(sub.timestamp).toLocaleDateString()}</p>
-                            <p className="text-[10px] text-slate-400 font-bold">{new Date(sub.timestamp).toLocaleTimeString()}</p>
-                          </td>
-                          <td className="px-6 py-4">
-                            <span className="text-xs font-bold text-slate-700">{sub.ticketCount} Transactions</span>
-                          </td>
-                          <td className="px-6 py-4">
-                            <span className="text-xs font-medium text-slate-500">{sub.submittedBy}</span>
-                          </td>
-                          <td className="px-6 py-4 text-right">
-                            <button 
-                              onClick={() => setNotification({ type: 'success', message: `Submission Response: ${sub.responseMessage}\n\nPayload:\n${sub.payloadText}` })}
-                              className="text-xs font-black text-blue-600 uppercase tracking-widest"
-                            >
-                              View Logs
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                      {complianceSubmissions.length === 0 && (
-                        <tr>
-                          <td colSpan={5} className="px-6 py-12 text-center text-slate-400 italic">No automated submissions recorded yet.</td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-
-                {/* Pending Verification Card */}
-                {complianceSubmissions.filter(s => s.status === 'submitted').length > 0 && (
-                  <div className="p-6 bg-amber-50/60 border-t border-amber-200/60 space-y-4">
-                    {complianceSubmissions.filter(s => s.status === 'submitted').map(sub => {
-                      const txCount = sub.transactionCount || sub.ticketCount;
-                      return (
-                        <div key={sub.id} className="p-5 bg-white border border-amber-200 rounded-2xl shadow-sm space-y-4">
-                          <div className="flex items-start gap-3">
-                            <div className="p-2 rounded-xl bg-amber-100 text-amber-700">
-                              <AlertTriangle className="w-5 h-5" />
-                            </div>
-                            <div>
-                              <h5 className="font-bold text-amber-950 text-sm">
-                                Waiting for portal confirmation — log into the Ohio portal and confirm all {txCount} transactions appear, then confirm here.
-                              </h5>
-                              <p className="text-xs text-amber-800/80 mt-1">
-                                Submitted on {new Date(sub.timestamp).toLocaleString()} by {sub.submittedBy} ({txCount} tickets included).
-                              </p>
-                            </div>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-amber-100">
-                            <a 
-                              href="https://services.dps.ohio.gov/ScrapDealer/" 
-                              target="_blank" 
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-xl transition-all"
-                            >
-                              Open Ohio Portal
-                              <ExternalLink className="w-3.5 h-3.5" />
-                            </a>
-                            <button
-                              onClick={() => setVerifyingSub(sub)}
-                              className="inline-flex items-center gap-1.5 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl transition-all shadow-sm"
-                            >
-                              Confirm Verified
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
-
-              <section className="bg-white rounded-[2.5rem] border border-slate-200 shadow-xl shadow-slate-200/50 overflow-hidden">
-                <div className="px-8 py-6 border-b border-slate-100">
-                  <h4 className="text-lg font-black text-slate-900 uppercase tracking-tight">Daily Transaction Review</h4>
-                  <p className="text-xs text-slate-500 font-medium">Verify data completeness before nightly DHS submission.</p>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="bg-slate-50/50">
-                        <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">Ticket</th>
-                        <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">Customer</th>
-                        <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">Items</th>
-                        <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">Docs</th>
-                        <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">Affirmed</th>
-                        <th className="px-6 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">Total</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {validBuyTickets
-                        .filter(t => new Date(t.timestamp).toDateString() === new Date().toDateString())
-                        .map((ticket) => {
-                          const customer = customers.find(c => c.id === ticket.customerId);
-                          const hasID = !!(customer?.idImageUrl || ticket.idImageUrl);
-                          const hasPhoto = !!ticket.customerPhotoUrl;
-                          const hasPlate = !!ticket.vehiclePlate;
-                          
-                          return (
-                            <tr key={ticket.id} className="hover:bg-slate-50/50 transition-colors">
-                              <td className="px-6 py-4">
-                                <p className="font-black text-slate-900 text-sm">#{ticket.id.slice(-6).toUpperCase()}</p>
-                                <p className="text-[10px] text-slate-400 font-medium">{new Date(ticket.timestamp).toLocaleTimeString()}</p>
-                              </td>
-                              <td className="px-6 py-4 text-sm font-bold text-slate-700">
-                                {customer?.name || 'Unknown'}
-                              </td>
-                              <td className="px-6 py-4 text-xs font-medium text-slate-500">
-                                {ticket.materials.length} Materials
-                              </td>
-                              <td className="px-6 py-4">
-                                <div className="flex gap-1">
-                                  <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter", hasID ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700")}>ID</span>
-                                  <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter", hasPhoto ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700")}>Photo</span>
-                                  <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter", hasPlate ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700")}>Plate</span>
-                                </div>
-                              </td>
-                              <td className="px-6 py-4">
-                                {ticket.sellerAffirmed ? (
-                                  <ShieldCheck className="w-5 h-5 text-green-500" />
-                                ) : (
-                                  <X className="w-5 h-5 text-red-400" />
-                                )}
-                              </td>
-                              <td className="px-6 py-4 font-black text-slate-900 text-sm">
-                                ${ticket.totalAmount.toFixed(2)}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      {buyTickets.filter(t => new Date(t.timestamp).toDateString() === new Date().toDateString()).length === 0 && (
-                        <tr>
-                          <td colSpan={6} className="px-6 py-12 text-center">
-                            <p className="text-slate-400 font-medium italic">No transactions recorded today.</p>
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-            </>
-          )}
-        </div>
-      )}
+          </div>
+        )}
 
       {activeTab === 'cash_flow' && (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-300">

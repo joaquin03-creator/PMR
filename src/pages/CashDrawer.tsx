@@ -34,7 +34,17 @@ import {
   Search,
   Filter,
   AlertTriangle,
-  ShieldAlert
+  ShieldAlert,
+  Truck,
+  Wrench,
+  ShoppingCart,
+  Users,
+  Zap,
+  Tag,
+  Check,
+  ChevronRight,
+  Sparkles,
+  ArrowRight
 } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, Cell, XAxis, YAxis, Tooltip as RechartsTooltip, ReferenceLine, CartesianGrid } from 'recharts';
 import { cn } from '../lib/utils';
@@ -134,13 +144,23 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
     const denom = denominationsList.find(d => d.key === key)!;
     const currentVal = values[key] || 0;
     const val = Math.max(0, currentVal + (change * denom.value));
-    onChange({ ...values, [key]: val });
+    onChange({ ...values, [key]: Math.round(val * 100) / 100 });
   };
 
   const handleInputChange = (key: keyof DenominationCount, valStr: string) => {
     const parsed = parseFloat(valStr);
-    const val = isNaN(parsed) || parsed < 0 ? 0 : parsed;
+    const val = isNaN(parsed) || parsed < 0 ? 0 : Math.round(parsed * 100) / 100;
     onChange({ ...values, [key]: val });
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, key: keyof DenominationCount) => {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      updateCount(key, 1);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      updateCount(key, -1);
+    }
   };
 
   const bills = denominationsList.filter(d => !d.isCoin);
@@ -155,7 +175,7 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
           <h4 className="text-xs font-black text-amber-900 uppercase tracking-wide">Enter Money Totals in Dollars</h4>
           <p className="text-[11px] text-amber-700 font-medium leading-relaxed">
             Please enter the <strong>total dollar value</strong> for each denomination, not the individual bill or coin counts. 
-            For example, if you have thirty-six $100 bills, enter <strong>3600</strong>. The system will automatically display the corresponding total values and update the reconciliation sums.
+            Use the <strong>+ / -</strong> buttons or up/down arrows to quickly increment or decrement by each bill ($100, $50, $20, $10, $5, $1) and coin (50¢, 25¢, 10¢, 5¢) value.
           </p>
         </div>
       </div>
@@ -176,6 +196,7 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
                       onClick={() => updateCount(denom.key, -1)}
                       disabled={totalVal <= 0}
                       className="w-8 h-8 flex items-center justify-center bg-white border border-slate-200 rounded-lg font-bold hover:bg-slate-50 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-slate-600 shadow-sm"
+                      title={`Subtract $${denom.value}`}
                     >
                       -
                     </button>
@@ -190,9 +211,10 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
                       <input
                         type="number"
                         min="0"
-                        step="any"
+                        step={denom.value}
                         value={totalVal || ''}
                         onChange={(e) => handleInputChange(denom.key, e.target.value)}
+                        onKeyDown={(e) => handleKeyDown(e, denom.key)}
                         placeholder="0"
                         className="w-16 text-left font-mono font-black text-xs outline-none bg-transparent"
                       />
@@ -201,6 +223,7 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
                       type="button"
                       onClick={() => updateCount(denom.key, 1)}
                       className="w-8 h-8 flex items-center justify-center bg-white border border-slate-200 rounded-lg font-bold hover:bg-slate-50 active:scale-95 transition-all text-slate-600 shadow-sm"
+                      title={`Add $${denom.value}`}
                     >
                       +
                     </button>
@@ -229,6 +252,7 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
                       onClick={() => updateCount(denom.key, -1)}
                       disabled={totalVal <= 0}
                       className="w-8 h-8 flex items-center justify-center bg-white border border-slate-200 rounded-lg font-bold hover:bg-slate-50 active:scale-95 disabled:opacity-30 disabled:pointer-events-none transition-all text-slate-600 shadow-sm"
+                      title={`Subtract $${denom.value < 1 ? `${Math.round(denom.value * 100)}¢` : `$${denom.value}`}`}
                     >
                       -
                     </button>
@@ -243,9 +267,10 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
                       <input
                         type="number"
                         min="0"
-                        step="any"
+                        step={denom.value}
                         value={totalVal || ''}
                         onChange={(e) => handleInputChange(denom.key, e.target.value)}
+                        onKeyDown={(e) => handleKeyDown(e, denom.key)}
                         placeholder="0.00"
                         className="w-16 text-left font-mono font-black text-xs outline-none bg-transparent"
                       />
@@ -254,6 +279,7 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
                       type="button"
                       onClick={() => updateCount(denom.key, 1)}
                       className="w-8 h-8 flex items-center justify-center bg-white border border-slate-200 rounded-lg font-bold hover:bg-slate-50 active:scale-95 transition-all text-slate-600 shadow-sm"
+                      title={`Add $${denom.value < 1 ? `${Math.round(denom.value * 100)}¢` : `$${denom.value}`}`}
                     >
                       +
                     </button>
@@ -340,6 +366,47 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [showCloseModal, setShowCloseModal] = useState(false);
   const [showStartModal, setShowStartModal] = useState(false);
   const [showEditOpeningModal, setShowEditOpeningModal] = useState(false);
+  
+  // Expense submittal and confirmation sequence states
+  const [expenseStep, setExpenseStep] = useState<'form' | 'confirm' | 'submitting' | 'success'>('form');
+  const [expenseCategory, setExpenseCategory] = useState<string>('Fuel');
+  const [customCategory, setCustomCategory] = useState<string>('');
+  const [expenseAmount, setExpenseAmount] = useState<string>('');
+  const [expensePayee, setExpensePayee] = useState<string>('');
+  const [expenseNotes, setExpenseNotes] = useState<string>('');
+  const [expenseSubmittalMsg, setExpenseSubmittalMsg] = useState<string>('');
+  const [confirmedExpenseTx, setConfirmedExpenseTx] = useState<{
+    id: string;
+    category: string;
+    amount: number;
+    notes: string;
+    timestamp: string;
+    sessionDate: string;
+    previousBalance: number;
+    newBalance: number;
+  } | null>(null);
+
+  // Inflow / Bank Run submittal and confirmation sequence states
+  const [inflowStep, setInflowStep] = useState<'form' | 'confirm' | 'submitting' | 'success'>('form');
+  const [inflowCategory, setInflowCategory] = useState<string>('Bank Run');
+  const [customInflowCategory, setCustomInflowCategory] = useState<string>('');
+  const [inflowAmount, setInflowAmount] = useState<string>('');
+  const [inflowSource, setInflowSource] = useState<string>('');
+  const [inflowNotes, setInflowNotes] = useState<string>('');
+  const [inflowSubmittalMsg, setInflowSubmittalMsg] = useState<string>('');
+  const [confirmedInflowTx, setConfirmedInflowTx] = useState<{
+    id: string;
+    category: string;
+    amount: number;
+    notes: string;
+    timestamp: string;
+    sessionDate: string;
+    previousBalance: number;
+    newBalance: number;
+  } | null>(null);
+
+  // Ledger item highlight tracking
+  const [highlightedTxId, setHighlightedTxId] = useState<string | null>(null);
   
   const [history, setHistory] = useState<CashSession[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -751,6 +818,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
   const sheetLedgerItems = useMemo(() => {
     const items: {
+      id?: string;
       cashIn: number | null;
       cashOut: number | null;
       description: string;
@@ -761,6 +829,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     // Add manual inflows
     transactions.filter(t => t.type === 'inflow').forEach(t => {
       items.push({
+        id: t.id,
         cashIn: t.amount,
         cashOut: null,
         description: t.notes || t.category || 'Cash Inflow',
@@ -772,6 +841,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     // Add manual expenses
     transactions.filter(t => t.type === 'expense').forEach(t => {
       items.push({
+        id: t.id,
         cashIn: null,
         cashOut: t.amount,
         description: t.notes || t.category || 'Expense Outlay',
@@ -1641,18 +1711,83 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
   };
 
-  const handleAddTransaction = async (e: React.FormEvent<HTMLFormElement>, type: 'inflow' | 'expense') => {
+  // Modal Opener & Reset Helpers
+  const handleOpenExpenseModal = () => {
+    setExpenseStep('form');
+    setExpenseCategory('Fuel');
+    setCustomCategory('');
+    setExpenseAmount('');
+    setExpensePayee('');
+    setExpenseNotes('');
+    setConfirmedExpenseTx(null);
+    setShowExpenseModal(true);
+  };
+
+  const handleOpenInflowModal = () => {
+    setInflowStep('form');
+    setInflowCategory('Bank Run');
+    setCustomInflowCategory('');
+    setInflowAmount('');
+    setInflowSource('');
+    setInflowNotes('');
+    setConfirmedInflowTx(null);
+    setShowInflowModal(true);
+  };
+
+  // Expense Workflow Step Transitions
+  const handleProceedToExpenseConfirm = (e: React.FormEvent) => {
     e.preventDefault();
     const targetSession = selectedSession || activeSession;
-    if (!targetSession || !profile) return;
-    setProcessing(true);
+    if (!targetSession) {
+      toastError('No Active Session', 'Please open today\'s cash drawer session or select an active session before recording expenses.');
+      return;
+    }
+    if (!profile) {
+      toastError('Authentication Required', 'Please ensure you are signed in.');
+      return;
+    }
+
+    const rawAmount = parseFloat(expenseAmount);
+    if (isNaN(rawAmount) || rawAmount <= 0) {
+      toastError('Invalid Amount', 'Please enter a valid expense amount greater than $0.00');
+      return;
+    }
+
+    const finalCategory = expenseCategory === 'Other' && customCategory.trim() ? customCategory.trim() : expenseCategory;
+    if (!finalCategory) {
+      toastError('Category Required', 'Please select or enter an expense category.');
+      return;
+    }
+
+    setExpenseStep('confirm');
+  };
+
+  const handleExecuteExpenseSubmit = async () => {
+    const targetSession = selectedSession || activeSession;
+    if (!targetSession || !profile) {
+      toastError('Error', 'No active session or user profile found.');
+      return;
+    }
+
+    const rawAmount = parseFloat(expenseAmount);
+    if (isNaN(rawAmount) || rawAmount <= 0) {
+      toastError('Invalid Amount', 'Please enter a valid expense amount.');
+      return;
+    }
+    const amount = Math.round(rawAmount * 100) / 100;
+    const finalCategory = expenseCategory === 'Other' && customCategory.trim() ? customCategory.trim() : expenseCategory;
     
-    const formData = new FormData(e.currentTarget);
-    const rawAmount = parseFloat(formData.get('amount') as string);
-    const amount = isNaN(rawAmount) ? 0 : Math.round(rawAmount * 100) / 100;
-    const category = formData.get('category') as string;
-    const notes = formData.get('notes') as string;
-    
+    let combinedNotes = expenseNotes.trim();
+    if (expensePayee.trim()) {
+      combinedNotes = `Payee: ${expensePayee.trim()}${combinedNotes ? ` | ${combinedNotes}` : ''}`;
+    }
+
+    const previousBalance = expectedCash;
+    const newBalance = Math.max(0, previousBalance - amount);
+
+    setExpenseStep('submitting');
+    setExpenseSubmittalMsg('Posting expense to ledger in Firestore...');
+
     try {
       const sessionDateStr = targetSession.date || todayStr;
       const timePart = new Date().toISOString().split('T')[1] || '12:00:00.000Z';
@@ -1660,36 +1795,192 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
       const docRef = await addDoc(collection(db, 'cashTransactions'), {
         sessionId: targetSession.id,
-        type,
-        category,
+        type: 'expense',
+        category: finalCategory,
         amount,
-        notes,
+        notes: combinedNotes,
         timestamp: txTimestamp,
         performedBy: profile.email
       } as Omit<CashTransaction, 'id'>);
+
+      setExpenseSubmittalMsg('Recording audit log entry...');
 
       // Track in Audit Log
       await logAuditEvent(
         'cashTransaction',
         docRef.id,
         'adjustment',
-        { after: { type, category, amount, notes, sessionId: targetSession.id } },
-        `Cash drawer transaction for session ${targetSession.date}: Added ${type === 'inflow' ? 'Bank Run/Inflow' : 'Expense'} of $${amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} (${category}). Notes: ${notes || 'None'}`
+        { after: { type: 'expense', category: finalCategory, amount, notes: combinedNotes, sessionId: targetSession.id } },
+        `Cash drawer expense for session ${targetSession.date}: Logged expense payout of $${amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} (${finalCategory}). Payee/Notes: ${combinedNotes || 'None'}`
       );
-      
-      if (type === 'inflow') setShowInflowModal(false);
-      else setShowExpenseModal(false);
+
+      setExpenseSubmittalMsg('Finalizing ledger confirmation...');
+
+      setConfirmedExpenseTx({
+        id: docRef.id,
+        category: finalCategory,
+        amount,
+        notes: combinedNotes,
+        timestamp: txTimestamp,
+        sessionDate: targetSession.date,
+        previousBalance,
+        newBalance
+      });
+
+      setExpenseStep('success');
 
       firestore(
-        'Transaction Recorded',
-        `Successfully logged ${type === 'inflow' ? 'Bank Run' : 'Payout/Expense'} of $${amount.toFixed(2)} (${category}) for session on ${targetSession.date}.`
+        'Expense Recorded',
+        `Successfully logged expense of $${amount.toFixed(2)} (${finalCategory}) for session on ${targetSession.date}.`
       );
     } catch (error: any) {
-      toastError('Transaction Failed', `Failed to log cash transaction: ${error.message || error}`);
+      setExpenseStep('confirm');
+      toastError('Expense Failed', `Failed to log cash expense: ${error.message || error}`);
       handleFirestoreError(error, OperationType.CREATE, 'cashTransactions');
-    } finally {
-      setProcessing(false);
     }
+  };
+
+  const handleFinishExpense = (txId?: string) => {
+    if (txId) {
+      setHighlightedTxId(txId);
+      setTimeout(() => {
+        setHighlightedTxId(null);
+      }, 4500);
+    }
+    setShowExpenseModal(false);
+    setExpenseStep('form');
+  };
+
+  const handleResetForAnotherExpense = () => {
+    setExpenseStep('form');
+    setExpenseAmount('');
+    setExpensePayee('');
+    setExpenseNotes('');
+    setConfirmedExpenseTx(null);
+  };
+
+  // Inflow / Bank Run Workflow Step Transitions
+  const handleProceedToInflowConfirm = (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetSession = selectedSession || activeSession;
+    if (!targetSession) {
+      toastError('No Active Session', 'Please open today\'s cash drawer session or select an active session before recording bank runs.');
+      return;
+    }
+    if (!profile) {
+      toastError('Authentication Required', 'Please ensure you are signed in.');
+      return;
+    }
+
+    const rawAmount = parseFloat(inflowAmount);
+    if (isNaN(rawAmount) || rawAmount <= 0) {
+      toastError('Invalid Amount', 'Please enter a valid deposit amount greater than $0.00');
+      return;
+    }
+
+    const finalCategory = inflowCategory === 'Other' && customInflowCategory.trim() ? customInflowCategory.trim() : inflowCategory;
+    if (!finalCategory) {
+      toastError('Category Required', 'Please select or enter a category.');
+      return;
+    }
+
+    setInflowStep('confirm');
+  };
+
+  const handleExecuteInflowSubmit = async () => {
+    const targetSession = selectedSession || activeSession;
+    if (!targetSession || !profile) {
+      toastError('Error', 'No active session or user profile found.');
+      return;
+    }
+
+    const rawAmount = parseFloat(inflowAmount);
+    if (isNaN(rawAmount) || rawAmount <= 0) {
+      toastError('Invalid Amount', 'Please enter a valid deposit amount.');
+      return;
+    }
+    const amount = Math.round(rawAmount * 100) / 100;
+    const finalCategory = inflowCategory === 'Other' && customInflowCategory.trim() ? customInflowCategory.trim() : inflowCategory;
+    
+    let combinedNotes = inflowNotes.trim();
+    if (inflowSource.trim()) {
+      combinedNotes = `Source: ${inflowSource.trim()}${combinedNotes ? ` | ${combinedNotes}` : ''}`;
+    }
+
+    const previousBalance = expectedCash;
+    const newBalance = previousBalance + amount;
+
+    setInflowStep('submitting');
+    setInflowSubmittalMsg('Posting deposit to ledger in Firestore...');
+
+    try {
+      const sessionDateStr = targetSession.date || todayStr;
+      const timePart = new Date().toISOString().split('T')[1] || '12:00:00.000Z';
+      const txTimestamp = `${sessionDateStr}T${timePart}`;
+
+      const docRef = await addDoc(collection(db, 'cashTransactions'), {
+        sessionId: targetSession.id,
+        type: 'inflow',
+        category: finalCategory,
+        amount,
+        notes: combinedNotes,
+        timestamp: txTimestamp,
+        performedBy: profile.email
+      } as Omit<CashTransaction, 'id'>);
+
+      setInflowSubmittalMsg('Recording audit log entry...');
+
+      await logAuditEvent(
+        'cashTransaction',
+        docRef.id,
+        'adjustment',
+        { after: { type: 'inflow', category: finalCategory, amount, notes: combinedNotes, sessionId: targetSession.id } },
+        `Cash drawer deposit/bank run for session ${targetSession.date}: Logged inflow of $${amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} (${finalCategory}). Source/Notes: ${combinedNotes || 'None'}`
+      );
+
+      setInflowSubmittalMsg('Finalizing ledger confirmation...');
+
+      setConfirmedInflowTx({
+        id: docRef.id,
+        category: finalCategory,
+        amount,
+        notes: combinedNotes,
+        timestamp: txTimestamp,
+        sessionDate: targetSession.date,
+        previousBalance,
+        newBalance
+      });
+
+      setInflowStep('success');
+
+      firestore(
+        'Bank Run Recorded',
+        `Successfully logged cash deposit of $${amount.toFixed(2)} (${finalCategory}) for session on ${targetSession.date}.`
+      );
+    } catch (error: any) {
+      setInflowStep('confirm');
+      toastError('Deposit Failed', `Failed to log cash deposit: ${error.message || error}`);
+      handleFirestoreError(error, OperationType.CREATE, 'cashTransactions');
+    }
+  };
+
+  const handleFinishInflow = (txId?: string) => {
+    if (txId) {
+      setHighlightedTxId(txId);
+      setTimeout(() => {
+        setHighlightedTxId(null);
+      }, 4500);
+    }
+    setShowInflowModal(false);
+    setInflowStep('form');
+  };
+
+  const handleResetForAnotherInflow = () => {
+    setInflowStep('form');
+    setInflowAmount('');
+    setInflowSource('');
+    setInflowNotes('');
+    setConfirmedInflowTx(null);
   };
 
   const handleCloseDay = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -2376,7 +2667,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
               <div className="flex items-center gap-2 shrink-0 flex-wrap">
                 <button
                   type="button"
-                  onClick={() => setShowInflowModal(true)}
+                  onClick={handleOpenInflowModal}
                   className="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
                 >
                   <ArrowUpCircle className="w-4 h-4" />
@@ -2384,7 +2675,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setShowExpenseModal(true)}
+                  onClick={handleOpenExpenseModal}
                   className="px-4 py-2.5 bg-rose-500 hover:bg-rose-400 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
                 >
                   <ArrowDownCircle className="w-4 h-4" />
@@ -2486,7 +2777,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setShowInflowModal(true)}
+                    onClick={handleOpenInflowModal}
                     className="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
                   >
                     <ArrowUpCircle className="w-4 h-4" />
@@ -2494,7 +2785,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setShowExpenseModal(true)}
+                    onClick={handleOpenExpenseModal}
                     className="px-4 py-2.5 bg-rose-500 hover:bg-rose-400 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
                   >
                     <ArrowDownCircle className="w-4 h-4" />
@@ -2750,15 +3041,15 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     </div>
                     <div className="flex gap-2">
                       <button 
-                        onClick={() => setShowInflowModal(true)}
-                        className="px-4 py-2 bg-emerald-50 text-emerald-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-emerald-100 hover:bg-emerald-100 transition-all flex items-center gap-2 cursor-pointer"
+                        onClick={handleOpenInflowModal}
+                        className="px-4 py-2 bg-emerald-50 text-emerald-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-emerald-100 hover:bg-emerald-100 transition-all flex items-center gap-2 cursor-pointer active:scale-95"
                       >
                         <ArrowUpCircle className="w-4 h-4" />
                         Bank Run
                       </button>
                       <button 
-                        onClick={() => setShowExpenseModal(true)}
-                        className="px-4 py-2 bg-red-50 text-red-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-red-100 hover:bg-red-100 transition-all flex items-center gap-2 cursor-pointer"
+                        onClick={handleOpenExpenseModal}
+                        className="px-4 py-2 bg-red-50 text-red-700 rounded-xl font-black text-[10px] uppercase tracking-widest border border-red-100 hover:bg-red-100 transition-all flex items-center gap-2 cursor-pointer active:scale-95"
                       >
                         <ArrowDownCircle className="w-4 h-4" />
                         Expense
@@ -2776,56 +3067,72 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                       </div>
                     ) : (
                       <div className="divide-y divide-slate-50">
-                        {transactions.map(tx => (
-                          <div key={tx.id} className="p-6 flex items-center justify-between hover:bg-slate-50/50 transition-all">
-                            <div className="flex items-center gap-4">
-                              <div className={cn(
-                                "p-3 rounded-2xl",
-                                tx.type === 'inflow' ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-600"
-                              )}>
-                                {tx.category === 'Fuel' ? <Fuel className="w-5 h-5" /> : tx.type === 'inflow' ? <Banknote className="w-5 h-5" /> : <Receipt className="w-5 h-5" />}
-                              </div>
-                              <div>
-                                <div className="flex items-center gap-2">
-                                  <p className="font-black text-slate-900 uppercase tracking-tight">{tx.category}</p>
-                                  <span className="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[8px] font-black uppercase tracking-widest">{new Date(tx.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit'})}</span>
-                                </div>
-                                <p className="text-slate-500 text-xs font-medium">{tx.notes || 'No description'}</p>
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-6">
-                              <div className="text-right">
-                                <p className={cn(
-                                  "font-mono font-black text-lg",
-                                  tx.type === 'inflow' ? "text-emerald-600" : "text-red-600"
-                                )}>
-                                  {tx.type === 'inflow' ? '+' : '-'}${tx.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                                </p>
-                                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{tx.performedBy.split('@')[0]}</p>
-                              </div>
-
-                              {(profile?.role === 'manager' || selectedSession) && (
-                                <div className="flex items-center gap-1">
-                                  <button 
-                                    onClick={() => setEditingTransaction(tx)}
-                                    className="p-2 text-slate-300 hover:text-blue-500 hover:bg-blue-50 rounded-xl transition-all"
-                                    title="Edit Transaction"
-                                  >
-                                    <Edit2 className="w-4 h-4" />
-                                  </button>
-                                  <button 
-                                    onClick={() => handleDeleteTransaction(tx.id)}
-                                    className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
-                                    title="Delete Transaction"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                  </button>
-                                </div>
+                        {transactions.map(tx => {
+                          const isHighlighted = highlightedTxId === tx.id;
+                          return (
+                            <div 
+                              key={tx.id} 
+                              className={cn(
+                                "p-6 flex items-center justify-between transition-all duration-500",
+                                isHighlighted 
+                                  ? "bg-amber-50/90 ring-2 ring-amber-500 rounded-2xl shadow-lg" 
+                                  : "hover:bg-slate-50/50"
                               )}
+                            >
+                              <div className="flex items-center gap-4">
+                                <div className={cn(
+                                  "p-3 rounded-2xl",
+                                  tx.type === 'inflow' ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-600"
+                                )}>
+                                  {tx.category === 'Fuel' ? <Fuel className="w-5 h-5" /> : tx.type === 'inflow' ? <Banknote className="w-5 h-5" /> : <Receipt className="w-5 h-5" />}
+                                </div>
+                                <div>
+                                  <div className="flex items-center gap-2">
+                                    <p className="font-black text-slate-900 uppercase tracking-tight">{tx.category}</p>
+                                    <span className="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[8px] font-black uppercase tracking-widest">{new Date(tx.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit'})}</span>
+                                    {isHighlighted && (
+                                      <span className="px-2 py-0.5 bg-emerald-600 text-white rounded text-[8px] font-black uppercase tracking-widest animate-pulse flex items-center gap-1">
+                                        <Check className="w-2.5 h-2.5" /> Just Logged
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-slate-500 text-xs font-medium">{tx.notes || 'No description'}</p>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-6">
+                                <div className="text-right">
+                                  <p className={cn(
+                                    "font-mono font-black text-lg",
+                                    tx.type === 'inflow' ? "text-emerald-600" : "text-red-600"
+                                  )}>
+                                    {tx.type === 'inflow' ? '+' : '-'}${tx.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                  </p>
+                                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{tx.performedBy.split('@')[0]}</p>
+                                </div>
 
+                                {(profile?.role === 'manager' || selectedSession) && (
+                                  <div className="flex items-center gap-1">
+                                    <button 
+                                      onClick={() => setEditingTransaction(tx)}
+                                      className="p-2 text-slate-300 hover:text-blue-500 hover:bg-blue-50 rounded-xl transition-all"
+                                      title="Edit Transaction"
+                                    >
+                                      <Edit2 className="w-4 h-4" />
+                                    </button>
+                                    <button 
+                                      onClick={() => handleDeleteTransaction(tx.id)}
+                                      className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
+                                      title="Delete Transaction"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                )}
+
+                              </div>
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>
@@ -2963,6 +3270,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           { key: 'ones', label: "1's ($1)", value: 1 }
                         ].map(denom => {
                           const totalVal = sheetDenoms[denom.key as keyof DenominationCount] || 0;
+                          const updateSheetCount = (change: number) => {
+                            const val = Math.max(0, Math.round((totalVal + (change * denom.value)) * 100) / 100);
+                            handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                          };
+
                           return (
                             <div key={denom.key} className="flex items-center justify-between bg-slate-50 p-2 rounded-xl border border-slate-200/60">
                               <div className="flex flex-col">
@@ -2973,18 +3285,46 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   </span>
                                 )}
                               </div>
-                              <div className="relative">
-                                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
-                                <input
-                                  type="number"
-                                  step="0.01"
-                                  min="0"
-                                  disabled={false}
-                                  value={totalVal || ''}
-                                  onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, parseFloat(e.target.value) || 0)}
-                                  className="w-24 pl-6 pr-2 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
-                                  placeholder="0.00"
-                                />
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => updateSheetCount(-1)}
+                                  disabled={totalVal <= 0}
+                                  className="w-6 h-6 flex items-center justify-center bg-white border border-slate-200 rounded text-slate-600 font-bold text-xs hover:bg-slate-100 disabled:opacity-30 disabled:pointer-events-none active:scale-95 transition-all shadow-xs"
+                                  title={`Subtract $${denom.value}`}
+                                >
+                                  -
+                                </button>
+                                <div className="relative">
+                                  <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
+                                  <input
+                                    type="number"
+                                    step={denom.value}
+                                    min="0"
+                                    disabled={false}
+                                    value={totalVal || ''}
+                                    onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, Math.round((parseFloat(e.target.value) || 0) * 100) / 100)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'ArrowUp') {
+                                        e.preventDefault();
+                                        updateSheetCount(1);
+                                      } else if (e.key === 'ArrowDown') {
+                                        e.preventDefault();
+                                        updateSheetCount(-1);
+                                      }
+                                    }}
+                                    className="w-20 pl-5 pr-1 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
+                                    placeholder="0"
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => updateSheetCount(1)}
+                                  className="w-6 h-6 flex items-center justify-center bg-white border border-slate-200 rounded text-slate-600 font-bold text-xs hover:bg-slate-100 active:scale-95 transition-all shadow-xs"
+                                  title={`Add $${denom.value}`}
+                                >
+                                  +
+                                </button>
                               </div>
                             </div>
                           );
@@ -3001,6 +3341,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           { key: 'nickels', label: "Nickels (5¢)", value: 0.05 }
                         ].map(denom => {
                           const totalVal = sheetDenoms[denom.key as keyof DenominationCount] || 0;
+                          const updateSheetCount = (change: number) => {
+                            const val = Math.max(0, Math.round((totalVal + (change * denom.value)) * 100) / 100);
+                            handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                          };
+
                           return (
                             <div key={denom.key} className="flex items-center justify-between bg-slate-50 p-2 rounded-xl border border-slate-200/60">
                               <div className="flex flex-col">
@@ -3011,18 +3356,46 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   </span>
                                 )}
                               </div>
-                              <div className="relative">
-                                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
-                                <input
-                                  type="number"
-                                  step="0.01"
-                                  min="0"
-                                  disabled={false}
-                                  value={totalVal || ''}
-                                  onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, parseFloat(e.target.value) || 0)}
-                                  className="w-24 pl-6 pr-2 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
-                                  placeholder="0.00"
-                                />
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => updateSheetCount(-1)}
+                                  disabled={totalVal <= 0}
+                                  className="w-6 h-6 flex items-center justify-center bg-white border border-slate-200 rounded text-slate-600 font-bold text-xs hover:bg-slate-100 disabled:opacity-30 disabled:pointer-events-none active:scale-95 transition-all shadow-xs"
+                                  title={`Subtract $${denom.value < 1 ? `${Math.round(denom.value * 100)}¢` : `$${denom.value}`}`}
+                                >
+                                  -
+                                </button>
+                                <div className="relative">
+                                  <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
+                                  <input
+                                    type="number"
+                                    step={denom.value}
+                                    min="0"
+                                    disabled={false}
+                                    value={totalVal || ''}
+                                    onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, Math.round((parseFloat(e.target.value) || 0) * 100) / 100)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'ArrowUp') {
+                                        e.preventDefault();
+                                        updateSheetCount(1);
+                                      } else if (e.key === 'ArrowDown') {
+                                        e.preventDefault();
+                                        updateSheetCount(-1);
+                                      }
+                                    }}
+                                    className="w-20 pl-5 pr-1 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
+                                    placeholder="0.00"
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => updateSheetCount(1)}
+                                  className="w-6 h-6 flex items-center justify-center bg-white border border-slate-200 rounded text-slate-600 font-bold text-xs hover:bg-slate-100 active:scale-95 transition-all shadow-xs"
+                                  title={`Add $${denom.value < 1 ? `${Math.round(denom.value * 100)}¢` : `$${denom.value}`}`}
+                                >
+                                  +
+                                </button>
                               </div>
                             </div>
                           );
@@ -3096,7 +3469,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
                   <button
                     type="button"
-                    onClick={() => setShowInflowModal(true)}
+                    onClick={handleOpenInflowModal}
                     className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-black text-[10px] uppercase tracking-widest transition-all shadow-md cursor-pointer active:scale-95"
                   >
                     <ArrowUpCircle className="w-4 h-4" />
@@ -3104,7 +3477,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setShowExpenseModal(true)}
+                    onClick={handleOpenExpenseModal}
                     className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-3 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-black text-[10px] uppercase tracking-widest transition-all shadow-md cursor-pointer active:scale-95"
                   >
                     <ArrowDownCircle className="w-4 h-4" />
@@ -3175,22 +3548,38 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   timestamp: ''
                                 });
                               }
-                              return rows.map((item, idx) => (
-                                <tr key={idx} className="h-10 hover:bg-slate-50/40 transition-all">
-                                  <td className="px-4 py-2 text-right font-mono font-black text-xs text-emerald-600 bg-emerald-50/10 border-r border-slate-200">
-                                    {item.cashIn !== null ? `$${item.cashIn.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ''}
-                                  </td>
-                                  <td className="px-4 py-2 text-right font-mono font-black text-xs text-red-600 bg-red-50/10 border-r border-slate-200">
-                                    {item.cashOut !== null ? `$${item.cashOut.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ''}
-                                  </td>
-                                  <td className="px-4 py-2 text-slate-700 text-[11px] font-medium truncate max-w-[200px] border-r border-slate-200">
-                                    {item.description || <span className="text-slate-200">----------------------------</span>}
-                                  </td>
-                                  <td className="px-2 py-2 text-center font-mono text-[11px] font-black text-slate-400">
-                                    {item.initials || '-'}
-                                  </td>
-                                </tr>
-                              ));
+                              return rows.map((item, idx) => {
+                                const isRowHighlighted = Boolean(item.id && item.id === highlightedTxId);
+                                return (
+                                  <tr 
+                                    key={idx} 
+                                    className={cn(
+                                      "h-10 transition-all duration-500",
+                                      isRowHighlighted ? "bg-amber-100/90 ring-2 ring-amber-500 font-bold" : "hover:bg-slate-50/40"
+                                    )}
+                                  >
+                                    <td className="px-4 py-2 text-right font-mono font-black text-xs text-emerald-600 bg-emerald-50/10 border-r border-slate-200">
+                                      {item.cashIn !== null ? `$${item.cashIn.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ''}
+                                    </td>
+                                    <td className="px-4 py-2 text-right font-mono font-black text-xs text-red-600 bg-red-50/10 border-r border-slate-200">
+                                      {item.cashOut !== null ? `$${item.cashOut.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ''}
+                                    </td>
+                                    <td className="px-4 py-2 text-slate-700 text-[11px] font-medium truncate max-w-[200px] border-r border-slate-200">
+                                      <div className="flex items-center gap-1.5">
+                                        <span>{item.description || <span className="text-slate-200">----------------------------</span>}</span>
+                                        {isRowHighlighted && (
+                                          <span className="px-1.5 py-0.5 bg-amber-500 text-white rounded text-[8px] font-black uppercase tracking-wider animate-pulse">
+                                            NEW
+                                          </span>
+                                        )}
+                                      </div>
+                                    </td>
+                                    <td className="px-2 py-2 text-center font-mono text-[11px] font-black text-slate-400">
+                                      {item.initials || '-'}
+                                    </td>
+                                  </tr>
+                                );
+                              });
                             })()}
                           </tbody>
                         </table>
@@ -3492,6 +3881,19 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             ].map(denom => {
                               const currentDenoms = denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms;
                               const totalVal = currentDenoms[denom.key as keyof DenominationCount] || 0;
+
+                              const updateModalCount = (change: number) => {
+                                const val = Math.max(0, Math.round((totalVal + (change * denom.value)) * 100) / 100);
+                                if (denomEditTab === 'opening') {
+                                  const updatedOpening = { ...editedOpeningDenoms, [denom.key]: val };
+                                  setEditedOpeningDenoms(updatedOpening);
+                                  const newTotal = calculateDenomTotal(updatedOpening);
+                                  setEditedOpeningCash(Math.round(newTotal * 100) / 100);
+                                } else {
+                                  handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                                }
+                              };
+
                               return (
                                 <div key={denom.key} className="flex items-center justify-between bg-slate-50 p-2 rounded-xl border border-slate-200">
                                   <div className="flex flex-col">
@@ -3500,17 +3902,26 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                       {totalVal > 0 ? `Total: $${Math.round(totalVal).toLocaleString()}` : 'Total Value'}
                                     </span>
                                   </div>
-                                  <div className="flex items-center gap-3">
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => updateModalCount(-1)}
+                                      disabled={totalVal <= 0}
+                                      className="w-7 h-7 flex items-center justify-center bg-white border border-slate-200 rounded-lg text-slate-600 font-bold text-xs hover:bg-slate-100 disabled:opacity-30 disabled:pointer-events-none active:scale-95 transition-all shadow-xs"
+                                      title={`Subtract $${denom.value}`}
+                                    >
+                                      -
+                                    </button>
                                     <div className="relative">
                                       <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
                                       <input
                                         type="number"
-                                        step="0.01"
+                                        step={denom.value}
                                         min="0"
                                         disabled={false}
                                         value={totalVal || ''}
                                         onChange={(e) => {
-                                          const val = parseFloat(e.target.value) || 0;
+                                          const val = Math.round((parseFloat(e.target.value) || 0) * 100) / 100;
                                           if (denomEditTab === 'opening') {
                                             const updatedOpening = { ...editedOpeningDenoms, [denom.key]: Math.max(0, val) };
                                             setEditedOpeningDenoms(updatedOpening);
@@ -3520,10 +3931,27 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                             handleSheetDenomChange(denom.key as keyof DenominationCount, val);
                                           }
                                         }}
-                                        className="w-28 pl-6 pr-2 py-1.5 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
-                                        placeholder="0.00"
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'ArrowUp') {
+                                            e.preventDefault();
+                                            updateModalCount(1);
+                                          } else if (e.key === 'ArrowDown') {
+                                            e.preventDefault();
+                                            updateModalCount(-1);
+                                          }
+                                        }}
+                                        className="w-24 pl-6 pr-2 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
+                                        placeholder="0"
                                       />
                                     </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => updateModalCount(1)}
+                                      className="w-7 h-7 flex items-center justify-center bg-white border border-slate-200 rounded-lg text-slate-600 font-bold text-xs hover:bg-slate-100 active:scale-95 transition-all shadow-xs"
+                                      title={`Add $${denom.value}`}
+                                    >
+                                      +
+                                    </button>
                                   </div>
                                 </div>
                               );
@@ -3544,6 +3972,19 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             ].map(denom => {
                               const currentDenoms = denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms;
                               const totalVal = currentDenoms[denom.key as keyof DenominationCount] || 0;
+
+                              const updateModalCount = (change: number) => {
+                                const val = Math.max(0, Math.round((totalVal + (change * denom.value)) * 100) / 100);
+                                if (denomEditTab === 'opening') {
+                                  const updatedOpening = { ...editedOpeningDenoms, [denom.key]: val };
+                                  setEditedOpeningDenoms(updatedOpening);
+                                  const newTotal = calculateDenomTotal(updatedOpening);
+                                  setEditedOpeningCash(Math.round(newTotal * 100) / 100);
+                                } else {
+                                  handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                                }
+                              };
+
                               return (
                                 <div key={denom.key} className="flex items-center justify-between bg-slate-50 p-2 rounded-xl border border-slate-200">
                                   <div className="flex flex-col">
@@ -3552,17 +3993,26 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                       {totalVal > 0 ? `Total: $${totalVal.toFixed(2)}` : 'Total Value'}
                                     </span>
                                   </div>
-                                  <div className="flex items-center gap-3">
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => updateModalCount(-1)}
+                                      disabled={totalVal <= 0}
+                                      className="w-7 h-7 flex items-center justify-center bg-white border border-slate-200 rounded-lg text-slate-600 font-bold text-xs hover:bg-slate-100 disabled:opacity-30 disabled:pointer-events-none active:scale-95 transition-all shadow-xs"
+                                      title={`Subtract $${denom.value < 1 ? `${Math.round(denom.value * 100)}¢` : `$${denom.value}`}`}
+                                    >
+                                      -
+                                    </button>
                                     <div className="relative">
                                       <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
                                       <input
                                         type="number"
-                                        step="0.01"
+                                        step={denom.value}
                                         min="0"
                                         disabled={false}
                                         value={totalVal || ''}
                                         onChange={(e) => {
-                                          const val = parseFloat(e.target.value) || 0;
+                                          const val = Math.round((parseFloat(e.target.value) || 0) * 100) / 100;
                                           if (denomEditTab === 'opening') {
                                             const updatedOpening = { ...editedOpeningDenoms, [denom.key]: Math.max(0, val) };
                                             setEditedOpeningDenoms(updatedOpening);
@@ -3572,10 +4022,27 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                             handleSheetDenomChange(denom.key as keyof DenominationCount, val);
                                           }
                                         }}
-                                        className="w-28 pl-6 pr-2 py-1.5 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'ArrowUp') {
+                                            e.preventDefault();
+                                            updateModalCount(1);
+                                          } else if (e.key === 'ArrowDown') {
+                                            e.preventDefault();
+                                            updateModalCount(-1);
+                                          }
+                                        }}
+                                        className="w-24 pl-6 pr-2 py-1 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono font-bold text-xs focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-70 disabled:bg-slate-100"
                                         placeholder="0.00"
                                       />
                                     </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => updateModalCount(1)}
+                                      className="w-7 h-7 flex items-center justify-center bg-white border border-slate-200 rounded-lg text-slate-600 font-bold text-xs hover:bg-slate-100 active:scale-95 transition-all shadow-xs"
+                                      title={`Add $${denom.value < 1 ? `${Math.round(denom.value * 100)}¢` : `$${denom.value}`}`}
+                                    >
+                                      +
+                                    </button>
                                   </div>
                                 </div>
                               );
@@ -4037,108 +4504,699 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         </div>
       )}
 
-      {/* Replenish (Inflow) Modal */}
+      {/* Replenish (Inflow) Modal with 4-Step Submittal & Confirmation Sequence */}
       {showInflowModal && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
-          <div className="bg-white rounded-[2.5rem] p-10 max-w-md w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
-            <div className="flex items-center gap-4 mb-8">
-              <div className="p-4 bg-emerald-50 rounded-3xl text-emerald-600">
-                <ArrowUpCircle className="w-8 h-8" />
-              </div>
-              <div className="space-y-1">
-                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Bank Run</h3>
-                <p className="text-slate-500 text-xs font-black uppercase tracking-widest">Added to Total Cash on Hand</p>
-              </div>
-            </div>
-            <form onSubmit={(e) => handleAddTransaction(e, 'inflow')} className="space-y-6">
-              <div className="space-y-4">
+          <div className="bg-white rounded-[2.5rem] p-6 sm:p-10 max-w-lg w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
+            
+            {/* Step 1: Input Details */}
+            {inflowStep === 'form' && (
+              <form onSubmit={handleProceedToInflowConfirm} className="space-y-6">
+                <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-emerald-50 rounded-2xl text-emerald-600">
+                      <ArrowUpCircle className="w-7 h-7" />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-black text-slate-900 uppercase tracking-tight">Record Bank Run</h3>
+                      <p className="text-slate-500 text-[10px] font-black uppercase tracking-widest">Deposit / Cash Inflow to Drawer</p>
+                    </div>
+                  </div>
+                  <button 
+                    type="button" 
+                    onClick={() => setShowInflowModal(false)}
+                    className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                {/* Session Target Indicator */}
+                <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-200/80 flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-2">
+                    <Calendar className="w-4 h-4 text-slate-400" />
+                    <span className="font-bold text-slate-600">Session: <strong className="text-slate-900">{selectedSession?.date || activeSession?.date || todayStr}</strong></span>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest block">Current Cash</span>
+                    <span className="font-mono font-black text-emerald-600">${expectedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                  </div>
+                </div>
+
+                {/* Category Preset Selector */}
                 <div className="space-y-2">
                   <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Inflow Category</label>
-                  <select 
-                    name="category" 
-                    required 
-                    className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl font-black text-xs uppercase tracking-widest outline-none focus:ring-2 focus:ring-slate-200"
-                  >
-                    <option value="Bank Withdrawal">Bank Withdrawal</option>
-                    <option value="Bank Run">Bank Run</option>
-                    <option value="Cash In">Cash In</option>
-                    <option value="Other Inflow">Other Inflow</option>
-                  </select>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { label: 'Bank Run', icon: Banknote },
+                      { label: 'Bank Withdrawal', icon: DollarSign },
+                      { label: 'Cash In', icon: ArrowUpCircle },
+                      { label: 'Owner Inflow', icon: Users },
+                      { label: 'Other', icon: Tag }
+                    ].map(cat => {
+                      const isSelected = inflowCategory === cat.label;
+                      const Icon = cat.icon;
+                      return (
+                        <button
+                          key={cat.label}
+                          type="button"
+                          onClick={() => setInflowCategory(cat.label)}
+                          className={cn(
+                            "flex items-center gap-2.5 px-3.5 py-3 rounded-xl border text-xs font-black uppercase tracking-wider transition-all text-left",
+                            isSelected 
+                              ? "bg-emerald-600 text-white border-emerald-600 shadow-md shadow-emerald-200" 
+                              : "bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200"
+                          )}
+                        >
+                          <Icon className={cn("w-4 h-4", isSelected ? "text-white" : "text-emerald-600")} />
+                          <span className="truncate">{cat.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {inflowCategory === 'Other' && (
+                    <div className="pt-2 animate-in fade-in-50 duration-200">
+                      <input
+                        type="text"
+                        value={customInflowCategory}
+                        onChange={(e) => setCustomInflowCategory(e.target.value)}
+                        placeholder="Enter custom inflow category..."
+                        required
+                        className="w-full px-4 py-3 bg-slate-50 border border-emerald-300 rounded-xl text-xs font-bold text-slate-900 outline-none focus:ring-2 focus:ring-emerald-500/20"
+                      />
+                    </div>
+                  )}
                 </div>
+
+                {/* Amount Input with Shortcuts */}
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Replenishment Amount</label>
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Deposit Amount</label>
+                    {inflowAmount && parseFloat(inflowAmount) > 0 && (
+                      <span className="text-[10px] font-black text-emerald-600 uppercase tracking-widest">
+                        +${(parseFloat(inflowAmount) || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      </span>
+                    )}
+                  </div>
                   <div className="relative">
-                    <DollarSign className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5" />
+                    <DollarSign className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-400 w-6 h-6" />
                     <input 
-                      name="amount" 
                       type="number" 
                       step="0.01" 
+                      min="0.01"
                       required 
-                      className="w-full pl-14 pr-6 py-5 bg-slate-50 border border-slate-200 rounded-3xl text-xl font-mono font-black focus:ring-4 focus:ring-emerald-500/10 focus:border-emerald-500 outline-none transition-all"
+                      autoFocus
+                      value={inflowAmount}
+                      onChange={(e) => setInflowAmount(e.target.value)}
+                      className="w-full pl-14 pr-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-2xl font-mono font-black focus:ring-4 focus:ring-emerald-500/10 focus:border-emerald-500 outline-none transition-all"
                       placeholder="0.00"
                     />
                   </div>
+
+                  {/* Quick Preset Buttons */}
+                  <div className="flex items-center gap-1.5 pt-1 overflow-x-auto pb-1">
+                    {[500, 1000, 2000, 5000, 10000].map(val => (
+                      <button
+                        key={val}
+                        type="button"
+                        onClick={() => {
+                          const curr = parseFloat(inflowAmount) || 0;
+                          setInflowAmount((curr + val).toFixed(2));
+                        }}
+                        className="px-2.5 py-1 bg-slate-100 hover:bg-emerald-50 hover:text-emerald-700 border border-slate-200 rounded-lg text-[10px] font-mono font-bold text-slate-600 transition-all shrink-0"
+                      >
+                        +${val.toLocaleString()}
+                      </button>
+                    ))}
+                    {inflowAmount && (
+                      <button
+                        type="button"
+                        onClick={() => setInflowAmount('')}
+                        className="px-2 py-1 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all shrink-0"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
                 </div>
+
+                {/* Source Bank / Origin */}
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Notes</label>
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Source / Bank Institution</label>
                   <input 
-                    name="notes" 
-                    className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl font-medium focus:ring-2 focus:ring-slate-200 outline-none" 
-                    placeholder="e.g. Returned from Fifth Third Bank" 
+                    type="text"
+                    value={inflowSource}
+                    onChange={(e) => setInflowSource(e.target.value)}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium focus:ring-2 focus:ring-slate-200 outline-none" 
+                    placeholder="e.g. Fifth Third Bank (Vault Withdrawal), Chase Branch #10" 
                   />
                 </div>
+
+                {/* Internal Memo / Notes */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Memo / Internal Notes</label>
+                  <input 
+                    type="text"
+                    value={inflowNotes}
+                    onChange={(e) => setInflowNotes(e.target.value)}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium focus:ring-2 focus:ring-slate-200 outline-none" 
+                    placeholder="e.g. Mid-day cash replenishment for heavy commercial purchasing" 
+                  />
+                </div>
+
+                {/* Live Balance Projection */}
+                {parseFloat(inflowAmount) > 0 && (
+                  <div className="p-4 bg-emerald-50/70 border border-emerald-200 rounded-2xl space-y-2 text-xs animate-in fade-in-50 duration-200">
+                    <span className="text-[10px] font-black text-emerald-800 uppercase tracking-widest block">Projected Balance Impact</span>
+                    <div className="flex items-center justify-between font-mono">
+                      <span className="text-slate-600 font-bold">Current: ${expectedCash.toFixed(2)}</span>
+                      <span className="text-emerald-700 font-black">+${parseFloat(inflowAmount).toFixed(2)}</span>
+                      <span className="text-slate-900 font-black">Result: ${(expectedCash + parseFloat(inflowAmount)).toFixed(2)}</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Action Buttons */}
+                <div className="flex gap-3 pt-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setShowInflowModal(false)} 
+                    className="flex-1 px-6 py-4 text-slate-500 font-bold uppercase text-xs tracking-widest hover:bg-slate-50 rounded-2xl transition-all"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="submit" 
+                    className="flex-[2] bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-emerald-200 flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95"
+                  >
+                    <span>Review & Confirm</span>
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* Step 2: Verification Confirmation */}
+            {inflowStep === 'confirm' && (
+              <div className="space-y-6">
+                <div className="flex items-center gap-3 pb-4 border-b border-slate-100">
+                  <div className="p-3 bg-emerald-50 rounded-2xl text-emerald-600">
+                    <ShieldCheck className="w-7 h-7" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-black text-slate-900 uppercase tracking-tight">Confirm Bank Run Deposit</h3>
+                    <p className="text-slate-500 text-[10px] font-black uppercase tracking-widest">Verify details before writing to ledger</p>
+                  </div>
+                </div>
+
+                {/* Big Verification Card */}
+                <div className="p-6 bg-slate-900 text-white rounded-3xl space-y-5 shadow-xl">
+                  <div className="text-center space-y-1">
+                    <span className="text-[10px] font-black text-emerald-400 uppercase tracking-widest block">Deposit Amount</span>
+                    <p className="font-mono text-3xl sm:text-4xl font-black text-emerald-400">
+                      +${(parseFloat(inflowAmount) || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </p>
+                  </div>
+
+                  <div className="p-4 bg-slate-800/80 rounded-2xl space-y-2.5 text-xs">
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                      <span className="text-slate-400 font-bold uppercase text-[10px]">Category</span>
+                      <span className="font-black text-white uppercase">{inflowCategory === 'Other' && customInflowCategory ? customInflowCategory : inflowCategory}</span>
+                    </div>
+                    {inflowSource && (
+                      <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                        <span className="text-slate-400 font-bold uppercase text-[10px]">Bank / Source</span>
+                        <span className="font-medium text-slate-200 truncate max-w-[200px]">{inflowSource}</span>
+                      </div>
+                    )}
+                    {inflowNotes && (
+                      <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                        <span className="text-slate-400 font-bold uppercase text-[10px]">Notes / Memo</span>
+                        <span className="font-medium text-slate-200 truncate max-w-[200px]">{inflowNotes}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                      <span className="text-slate-400 font-bold uppercase text-[10px]">Session Date</span>
+                      <span className="font-bold text-slate-200">{selectedSession?.date || activeSession?.date || todayStr}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-400 font-bold uppercase text-[10px]">Recorded By</span>
+                      <span className="font-bold text-slate-300 font-mono text-[11px]">{profile?.email}</span>
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-emerald-950/40 border border-emerald-800/50 rounded-2xl flex items-center justify-between text-xs">
+                    <span className="text-emerald-300 font-bold uppercase text-[10px]">Drawer Balance Impact</span>
+                    <span className="font-mono font-bold text-emerald-400">
+                      ${expectedCash.toFixed(2)} → ${(expectedCash + (parseFloat(inflowAmount) || 0)).toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex gap-3 pt-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setInflowStep('form')}
+                    className="flex-1 px-6 py-4 text-slate-600 font-bold uppercase text-xs tracking-widest hover:bg-slate-100 rounded-2xl transition-all"
+                  >
+                    ← Edit Details
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={handleExecuteInflowSubmit}
+                    className="flex-[2] bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-emerald-200 flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>Confirm & Post Deposit</span>
+                  </button>
+                </div>
               </div>
-              <div className="flex gap-3 pt-4">
-                <button type="button" onClick={() => setShowInflowModal(false)} className="flex-1 px-8 py-4 text-slate-500 font-bold uppercase text-xs tracking-widest">Back</button>
-                <button disabled={processing} type="submit" className="flex-[2] bg-emerald-600 text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-emerald-200">Record Deposit</button>
+            )}
+
+            {/* Step 3: Submitting State */}
+            {inflowStep === 'submitting' && (
+              <div className="py-12 px-4 text-center space-y-6 animate-in fade-in-50 duration-200">
+                <div className="w-20 h-20 bg-emerald-50 rounded-full flex items-center justify-center mx-auto text-emerald-600">
+                  <Loader2 className="w-10 h-10 animate-spin" />
+                </div>
+                <div className="space-y-2">
+                  <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Writing to Ledger...</h3>
+                  <p className="text-slate-500 text-xs font-medium">{inflowSubmittalMsg || 'Synchronizing cash transactions...'}</p>
+                </div>
+                <div className="w-48 h-1.5 bg-slate-100 rounded-full mx-auto overflow-hidden">
+                  <div className="h-full bg-emerald-500 rounded-full animate-pulse w-full" />
+                </div>
               </div>
-            </form>
+            )}
+
+            {/* Step 4: Success Receipt */}
+            {inflowStep === 'success' && confirmedInflowTx && (
+              <div className="space-y-6 animate-in zoom-in-95 duration-200">
+                <div className="text-center space-y-2">
+                  <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-3 shadow-inner">
+                    <CheckCircle2 className="w-10 h-10" />
+                  </div>
+                  <span className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-[10px] font-black uppercase tracking-widest inline-block">
+                    Deposit Logged Successfully
+                  </span>
+                  <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Posted to Cash Ledger</h3>
+                  <p className="text-slate-500 text-xs">Transaction ID: <strong className="font-mono text-slate-700">#TX-{confirmedInflowTx.id.substring(0, 8).toUpperCase()}</strong></p>
+                </div>
+
+                {/* Receipt Breakdown */}
+                <div className="p-5 bg-slate-50 rounded-2xl border border-slate-200 space-y-3 text-xs">
+                  <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+                    <span className="text-slate-500 font-bold uppercase text-[10px]">Category</span>
+                    <span className="font-black text-slate-900 uppercase">{confirmedInflowTx.category}</span>
+                  </div>
+                  <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+                    <span className="text-slate-500 font-bold uppercase text-[10px]">Deposit Amount</span>
+                    <span className="font-mono font-black text-emerald-600 text-base">+${confirmedInflowTx.amount.toFixed(2)}</span>
+                  </div>
+                  {confirmedInflowTx.notes && (
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+                      <span className="text-slate-500 font-bold uppercase text-[10px]">Source & Notes</span>
+                      <span className="font-medium text-slate-700 text-right truncate max-w-[200px]">{confirmedInflowTx.notes}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between items-center pt-1">
+                    <span className="text-slate-500 font-bold uppercase text-[10px]">Updated Cash Drawer Balance</span>
+                    <span className="font-mono font-black text-slate-900 text-sm">${confirmedInflowTx.newBalance.toFixed(2)}</span>
+                  </div>
+                </div>
+
+                {/* Finish / Record Another Actions */}
+                <div className="space-y-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => handleFinishInflow(confirmedInflowTx.id)}
+                    className="w-full bg-slate-900 hover:bg-slate-800 text-white px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95"
+                  >
+                    <Check className="w-4 h-4 text-emerald-400" />
+                    <span>Done & View on Ledger</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleResetForAnotherInflow}
+                    className="w-full bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-6 py-3 rounded-2xl font-bold text-xs uppercase tracking-widest transition-all"
+                  >
+                    + Record Another Deposit
+                  </button>
+                </div>
+              </div>
+            )}
+
           </div>
         </div>
       )}
 
-      {/* Expense Modal */}
+      {/* Expense Modal with 4-Step Submittal & Confirmation Sequence */}
       {showExpenseModal && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
-          <div className="bg-white rounded-[2.5rem] p-10 max-w-md w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
-            <div className="flex items-center gap-4 mb-8">
-              <div className="p-4 bg-red-50 rounded-3xl text-red-600">
-                <ArrowDownCircle className="w-8 h-8" />
-              </div>
-              <div className="space-y-1">
-                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">One-Off Expense</h3>
-                <p className="text-slate-500 text-xs font-black uppercase tracking-widest">Non-Material Outflow</p>
-              </div>
-            </div>
-            <form onSubmit={(e) => handleAddTransaction(e, 'expense')} className="space-y-6">
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Category</label>
-                  <select name="category" required className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl font-black text-xs uppercase tracking-widest outline-none focus:ring-2 focus:ring-slate-200">
-                    <option value="Fuel">Fuel</option>
-                    <option value="Vendor Payout">Vendor Payout</option>
-                    <option value="Supplies">Supplies</option>
-                    <option value="Employee Advance">Employee Advance</option>
-                    <option value="Other">Other</option>
-                  </select>
+          <div className="bg-white rounded-[2.5rem] p-6 sm:p-10 max-w-lg w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
+            
+            {/* Step 1: Expense Input Form */}
+            {expenseStep === 'form' && (
+              <form onSubmit={handleProceedToExpenseConfirm} className="space-y-6">
+                <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-red-50 rounded-2xl text-red-600">
+                      <ArrowDownCircle className="w-7 h-7" />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-black text-slate-900 uppercase tracking-tight">Record Expense</h3>
+                      <p className="text-slate-500 text-[10px] font-black uppercase tracking-widest">Non-Material Outflow from Cash Drawer</p>
+                    </div>
+                  </div>
+                  <button 
+                    type="button" 
+                    onClick={() => setShowExpenseModal(false)}
+                    className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
                 </div>
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Amount</label>
-                  <div className="relative">
-                    <DollarSign className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5" />
-                    <input name="amount" type="number" step="0.01" required className="w-full pl-14 pr-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-lg font-mono font-black outline-none focus:ring-4 focus:ring-red-500/10" placeholder="0.00" />
+
+                {/* Session Target Indicator */}
+                <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-200/80 flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-2">
+                    <Calendar className="w-4 h-4 text-slate-400" />
+                    <span className="font-bold text-slate-600">Session: <strong className="text-slate-900">{selectedSession?.date || activeSession?.date || todayStr}</strong></span>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest block">Available Cash</span>
+                    <span className="font-mono font-black text-slate-900">${expectedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                   </div>
                 </div>
+
+                {/* Category Preset Selector */}
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Internal Notes</label>
-                  <input name="notes" className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-medium outline-none focus:ring-2 focus:ring-slate-200" placeholder="e.g. Diesel for Yard Truck" />
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Expense Category</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { label: 'Fuel', icon: Fuel },
+                      { label: 'Vendor Payout', icon: Truck },
+                      { label: 'Yard Supplies', icon: ShoppingCart },
+                      { label: 'Equipment Repair', icon: Wrench },
+                      { label: 'Employee Advance', icon: Users },
+                      { label: 'Hauling & Freight', icon: Truck },
+                      { label: 'Utilities & Operations', icon: Zap },
+                      { label: 'Other', icon: Tag }
+                    ].map(cat => {
+                      const isSelected = expenseCategory === cat.label;
+                      const Icon = cat.icon;
+                      return (
+                        <button
+                          key={cat.label}
+                          type="button"
+                          onClick={() => setExpenseCategory(cat.label)}
+                          className={cn(
+                            "flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-xs font-black uppercase tracking-wider transition-all text-left",
+                            isSelected 
+                              ? "bg-red-600 text-white border-red-600 shadow-md shadow-red-200" 
+                              : "bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200"
+                          )}
+                        >
+                          <Icon className={cn("w-3.5 h-3.5", isSelected ? "text-white" : "text-red-600")} />
+                          <span className="truncate">{cat.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {expenseCategory === 'Other' && (
+                    <div className="pt-2 animate-in fade-in-50 duration-200">
+                      <input
+                        type="text"
+                        value={customCategory}
+                        onChange={(e) => setCustomCategory(e.target.value)}
+                        placeholder="Enter custom expense category..."
+                        required
+                        className="w-full px-4 py-3 bg-slate-50 border border-red-300 rounded-xl text-xs font-bold text-slate-900 outline-none focus:ring-2 focus:ring-red-500/20"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Amount Input with Shortcuts */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Expense Amount</label>
+                    {expenseAmount && parseFloat(expenseAmount) > 0 && (
+                      <span className="text-[10px] font-black text-red-600 uppercase tracking-widest">
+                        -${(parseFloat(expenseAmount) || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      </span>
+                    )}
+                  </div>
+                  <div className="relative">
+                    <DollarSign className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-400 w-6 h-6" />
+                    <input 
+                      type="number" 
+                      step="0.01" 
+                      min="0.01"
+                      required 
+                      autoFocus
+                      value={expenseAmount}
+                      onChange={(e) => setExpenseAmount(e.target.value)}
+                      className="w-full pl-14 pr-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-2xl font-mono font-black focus:ring-4 focus:ring-red-500/10 focus:border-red-500 outline-none transition-all"
+                      placeholder="0.00"
+                    />
+                  </div>
+
+                  {/* Quick Preset Buttons */}
+                  <div className="flex items-center gap-1.5 pt-1 overflow-x-auto pb-1">
+                    {[20, 50, 100, 250, 500].map(val => (
+                      <button
+                        key={val}
+                        type="button"
+                        onClick={() => {
+                          const curr = parseFloat(expenseAmount) || 0;
+                          setExpenseAmount((curr + val).toFixed(2));
+                        }}
+                        className="px-2.5 py-1 bg-slate-100 hover:bg-red-50 hover:text-red-700 border border-slate-200 rounded-lg text-[10px] font-mono font-bold text-slate-600 transition-all shrink-0"
+                      >
+                        +${val}
+                      </button>
+                    ))}
+                    {expenseAmount && (
+                      <button
+                        type="button"
+                        onClick={() => setExpenseAmount('')}
+                        className="px-2 py-1 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all shrink-0"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Payee / Vendor Recipient */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Payee / Vendor / Recipient</label>
+                  <input 
+                    type="text"
+                    value={expensePayee}
+                    onChange={(e) => setExpensePayee(e.target.value)}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium focus:ring-2 focus:ring-slate-200 outline-none" 
+                    placeholder="e.g. Pilot Flying J #402, NAPA Auto Parts, Fastenal, John Doe" 
+                  />
+                </div>
+
+                {/* Internal Memo / Notes */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Internal Notes / Memo / Receipt #</label>
+                  <input 
+                    type="text"
+                    value={expenseNotes}
+                    onChange={(e) => setExpenseNotes(e.target.value)}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium focus:ring-2 focus:ring-slate-200 outline-none" 
+                    placeholder="e.g. 50 Gal Off-road diesel for yard loader (Receipt #8392)" 
+                  />
+                </div>
+
+                {/* Live Balance Projection */}
+                {parseFloat(expenseAmount) > 0 && (
+                  <div className="p-4 bg-red-50/70 border border-red-200 rounded-2xl space-y-2 text-xs animate-in fade-in-50 duration-200">
+                    <span className="text-[10px] font-black text-red-800 uppercase tracking-widest block">Projected Balance Impact</span>
+                    <div className="flex items-center justify-between font-mono">
+                      <span className="text-slate-600 font-bold">Current: ${expectedCash.toFixed(2)}</span>
+                      <span className="text-red-700 font-black">-${parseFloat(expenseAmount).toFixed(2)}</span>
+                      <span className="text-slate-900 font-black">Result: ${Math.max(0, expectedCash - parseFloat(expenseAmount)).toFixed(2)}</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Action Buttons */}
+                <div className="flex gap-3 pt-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setShowExpenseModal(false)} 
+                    className="flex-1 px-6 py-4 text-slate-500 font-bold uppercase text-xs tracking-widest hover:bg-slate-50 rounded-2xl transition-all"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="submit" 
+                    className="flex-[2] bg-red-600 hover:bg-red-500 text-white px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-red-200 flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95"
+                  >
+                    <span>Review & Confirm</span>
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* Step 2: Verification Confirmation */}
+            {expenseStep === 'confirm' && (
+              <div className="space-y-6">
+                <div className="flex items-center gap-3 pb-4 border-b border-slate-100">
+                  <div className="p-3 bg-red-50 rounded-2xl text-red-600">
+                    <ShieldCheck className="w-7 h-7" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-black text-slate-900 uppercase tracking-tight">Confirm Expense Outlay</h3>
+                    <p className="text-slate-500 text-[10px] font-black uppercase tracking-widest">Verify details before writing to ledger</p>
+                  </div>
+                </div>
+
+                {/* Big Verification Card */}
+                <div className="p-6 bg-slate-900 text-white rounded-3xl space-y-5 shadow-xl">
+                  <div className="text-center space-y-1">
+                    <span className="text-[10px] font-black text-red-400 uppercase tracking-widest block">Payout Amount</span>
+                    <p className="font-mono text-3xl sm:text-4xl font-black text-red-400">
+                      -${(parseFloat(expenseAmount) || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </p>
+                  </div>
+
+                  <div className="p-4 bg-slate-800/80 rounded-2xl space-y-2.5 text-xs">
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                      <span className="text-slate-400 font-bold uppercase text-[10px]">Category</span>
+                      <span className="font-black text-white uppercase">{expenseCategory === 'Other' && customCategory ? customCategory : expenseCategory}</span>
+                    </div>
+                    {expensePayee && (
+                      <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                        <span className="text-slate-400 font-bold uppercase text-[10px]">Payee / Vendor</span>
+                        <span className="font-medium text-slate-200 truncate max-w-[200px]">{expensePayee}</span>
+                      </div>
+                    )}
+                    {expenseNotes && (
+                      <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                        <span className="text-slate-400 font-bold uppercase text-[10px]">Notes / Memo</span>
+                        <span className="font-medium text-slate-200 truncate max-w-[200px]">{expenseNotes}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                      <span className="text-slate-400 font-bold uppercase text-[10px]">Session Date</span>
+                      <span className="font-bold text-slate-200">{selectedSession?.date || activeSession?.date || todayStr}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-400 font-bold uppercase text-[10px]">Recorded By</span>
+                      <span className="font-bold text-slate-300 font-mono text-[11px]">{profile?.email}</span>
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-red-950/40 border border-red-800/50 rounded-2xl flex items-center justify-between text-xs">
+                    <span className="text-red-300 font-bold uppercase text-[10px]">Drawer Balance Impact</span>
+                    <span className="font-mono font-bold text-red-400">
+                      ${expectedCash.toFixed(2)} → ${Math.max(0, expectedCash - (parseFloat(expenseAmount) || 0)).toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex gap-3 pt-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setExpenseStep('form')}
+                    className="flex-1 px-6 py-4 text-slate-600 font-bold uppercase text-xs tracking-widest hover:bg-slate-100 rounded-2xl transition-all"
+                  >
+                    ← Edit Details
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={handleExecuteExpenseSubmit}
+                    className="flex-[2] bg-red-600 hover:bg-red-500 text-white px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-red-200 flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>Confirm & Post Expense</span>
+                  </button>
                 </div>
               </div>
-              <div className="flex gap-3 pt-4">
-                <button type="button" onClick={() => setShowExpenseModal(false)} className="flex-1 px-8 py-4 text-slate-500 font-bold uppercase text-xs tracking-widest">Back</button>
-                <button disabled={processing} type="submit" className="flex-[2] bg-red-600 text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-red-200">Record Expense</button>
+            )}
+
+            {/* Step 3: Submitting State */}
+            {expenseStep === 'submitting' && (
+              <div className="py-12 px-4 text-center space-y-6 animate-in fade-in-50 duration-200">
+                <div className="w-20 h-20 bg-red-50 rounded-full flex items-center justify-center mx-auto text-red-600">
+                  <Loader2 className="w-10 h-10 animate-spin" />
+                </div>
+                <div className="space-y-2">
+                  <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Writing to Ledger...</h3>
+                  <p className="text-slate-500 text-xs font-medium">{expenseSubmittalMsg || 'Synchronizing cash transactions...'}</p>
+                </div>
+                <div className="w-48 h-1.5 bg-slate-100 rounded-full mx-auto overflow-hidden">
+                  <div className="h-full bg-red-500 rounded-full animate-pulse w-full" />
+                </div>
               </div>
-            </form>
+            )}
+
+            {/* Step 4: Success Receipt */}
+            {expenseStep === 'success' && confirmedExpenseTx && (
+              <div className="space-y-6 animate-in zoom-in-95 duration-200">
+                <div className="text-center space-y-2">
+                  <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-3 shadow-inner">
+                    <CheckCircle2 className="w-10 h-10" />
+                  </div>
+                  <span className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-[10px] font-black uppercase tracking-widest inline-block">
+                    Expense Logged Successfully
+                  </span>
+                  <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Posted to Cash Ledger</h3>
+                  <p className="text-slate-500 text-xs">Transaction ID: <strong className="font-mono text-slate-700">#TX-{confirmedExpenseTx.id.substring(0, 8).toUpperCase()}</strong></p>
+                </div>
+
+                {/* Receipt Breakdown */}
+                <div className="p-5 bg-slate-50 rounded-2xl border border-slate-200 space-y-3 text-xs">
+                  <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+                    <span className="text-slate-500 font-bold uppercase text-[10px]">Category</span>
+                    <span className="font-black text-slate-900 uppercase">{confirmedExpenseTx.category}</span>
+                  </div>
+                  <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+                    <span className="text-slate-500 font-bold uppercase text-[10px]">Expense Amount</span>
+                    <span className="font-mono font-black text-red-600 text-base">-${confirmedExpenseTx.amount.toFixed(2)}</span>
+                  </div>
+                  {confirmedExpenseTx.notes && (
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-200">
+                      <span className="text-slate-500 font-bold uppercase text-[10px]">Payee & Notes</span>
+                      <span className="font-medium text-slate-700 text-right truncate max-w-[200px]">{confirmedExpenseTx.notes}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between items-center pt-1">
+                    <span className="text-slate-500 font-bold uppercase text-[10px]">Updated Cash Drawer Balance</span>
+                    <span className="font-mono font-black text-slate-900 text-sm">${confirmedExpenseTx.newBalance.toFixed(2)}</span>
+                  </div>
+                </div>
+
+                {/* Finish / Record Another Actions */}
+                <div className="space-y-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => handleFinishExpense(confirmedExpenseTx.id)}
+                    className="w-full bg-slate-900 hover:bg-slate-800 text-white px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95"
+                  >
+                    <Check className="w-4 h-4 text-emerald-400" />
+                    <span>Done & View on Ledger</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleResetForAnotherExpense}
+                    className="w-full bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-6 py-3 rounded-2xl font-bold text-xs uppercase tracking-widest transition-all"
+                  >
+                    + Record Another Expense
+                  </button>
+                </div>
+              </div>
+            )}
+
           </div>
         </div>
       )}

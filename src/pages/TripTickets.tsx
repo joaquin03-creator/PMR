@@ -33,6 +33,7 @@ import { cn, generateTicketId } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import ManagerPinModal from '../components/ManagerPinModal';
+import TripTicketDocument from '../components/TripTicketDocument';
 
 export default function TripTickets({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
@@ -1081,7 +1082,7 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                   <p className="text-sm font-black text-indigo-600 uppercase">{selectedTicket.createdByName || 'System'}</p>
                 </div>
                 <div className="space-y-1">
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Total Load Weight</p>
+                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Net Material Weight</p>
                   <p className="text-3xl font-black text-slate-900">{(selectedTicket.totalWeight || 0).toLocaleString()} lb</p>
                 </div>
                 <div className="text-right space-y-1">
@@ -1258,131 +1259,8 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
               </div>
             </div>
             
-            <div className="flex-1 overflow-y-auto p-12 bg-slate-100 no-scrollbar print:p-0 print:bg-transparent">
-              {/* Landscape BOL Container */}
-              <div className="bg-white shadow-2xl mx-auto w-full max-w-[1100px] min-h-[770px] p-16 font-serif text-slate-900 bol-container relative flex flex-col overflow-visible">
-                <div className="flex justify-between items-start mb-12">
-                  <div className="space-y-1">
-                    <h1 className="text-4xl font-black uppercase tracking-tight text-slate-900">{COMPANY_NAME}</h1>
-                    <p className="text-sm text-slate-400 font-medium tracking-wide mt-0.5">{COMPANY_WEBSITE}</p>
-                    <p className="text-sm text-slate-500 font-bold mt-1">{COMPANY_ADDRESS}</p>
-                    <p className="text-sm text-slate-500 mt-1">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
-                  </div>
-                  <div className="h-14 w-auto flex items-center justify-center">
-                    <BrandLogo className="h-full w-auto object-contain grayscale opacity-60" grayscale />
-                  </div>
-                </div>
-
-                <div className="text-center space-y-2 mb-12 border-y border-slate-100 py-4">
-                  <div className="flex items-center justify-center gap-8 text-[10px] font-bold uppercase tracking-[0.3em] text-slate-400">
-                    <span>Official Bill of Lading</span>
-                    <div className="w-1.5 h-1.5 rounded-full bg-slate-200" />
-                    <span>Dispatch Ticket</span>
-                    <div className="w-1.5 h-1.5 rounded-full bg-slate-200" />
-                    <span>{new Date(selectedTicket.timestamp).toLocaleString()}</span>
-                  </div>
-                </div>
-                
-                <div className="grid grid-cols-2 gap-20 mb-12">
-                  <div className="space-y-8">
-                    <div className="space-y-1">
-                      <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Destination</p>
-                      <p className="text-2xl font-black text-slate-900 uppercase tracking-tight">{selectedTicket.destination}</p>
-                      {selectedTicket.buyerAddress && (
-                        <p className="text-sm text-slate-500">{selectedTicket.buyerAddress}</p>
-                      )}
-                      {selectedTicket.buyerPhone && (
-                        <p className="text-sm text-slate-500">{selectedTicket.buyerPhone}</p>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-2 gap-8">
-                      <div className="space-y-1">
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Carrier</p>
-                        <p className="text-sm font-bold uppercase">{selectedTicket.carrier || 'Internal'}</p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Driver</p>
-                        <p className="text-sm font-bold uppercase">{selectedTicket.driver}</p>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="space-y-8 text-right">
-                    <div className="grid grid-cols-2 gap-8">
-                      <div className="space-y-1">
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">BOL #</p>
-                        <p className="text-sm font-bold">{selectedTicket.bolNumber || 'N/A'}</p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Truck ID</p>
-                        <p className="text-sm font-bold uppercase">{selectedTicket.vehicle}</p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Trailer #</p>
-                        <p className="text-sm font-bold uppercase">{selectedTicket.trailerNumber || 'N/A'}</p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Seal #</p>
-                        <p className="text-sm font-bold uppercase">{selectedTicket.sealNumber || 'N/A'}</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                
-                <div className="flex-1">
-                  <table className="w-full border-collapse">
-                    <thead>
-                      <tr className="border-b-2 border-slate-900">
-                        <th className="py-4 text-left text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Material Description</th>
-                        <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Weight (lb)</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {selectedTicket.materials.map((item, idx) => {
-                        const material = materials.find(m => m.id === item.materialId);
-                        return (
-                          <tr key={idx}>
-                            <td className="py-6">
-                              <p className="font-bold text-slate-900 uppercase tracking-tight">{material?.name || 'N/A'}</p>
-                              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Code: {material?.code || 'N/A'}</p>
-                            </td>
-                            <td className="py-6 text-right font-black text-slate-900 text-lg">
-                              {item.weight.toLocaleString()}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="mt-8 pt-8 border-t-2 border-slate-900 flex justify-between items-end">
-                  <div className="space-y-6">
-                    {selectedTicket.notes && (
-                      <div className="max-w-md space-y-2">
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Notes</p>
-                        <p className="text-xs text-slate-500 italic">{selectedTicket.notes}</p>
-                      </div>
-                    )}
-                    <div className="pt-8 space-y-2">
-                      <div className="w-64 border-b border-slate-300"></div>
-                      <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Authorized Signature</p>
-                    </div>
-                  </div>
-                  <div className="text-right space-y-2">
-                    <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Total Load Weight</p>
-                    <p className="text-5xl font-black text-slate-900">{(selectedTicket.totalWeight || 0).toLocaleString()} <span className="text-xl text-slate-400">lb</span></p>
-                  </div>
-                </div>
-
-                <div className="mt-12 pt-8 flex justify-between items-end border-t border-slate-100">
-                  <div className="text-[10px] font-bold text-slate-300 uppercase tracking-[0.3em]">
-                    {COMPANY_NAME}
-                  </div>
-                  <div className="text-[10px] font-bold text-slate-300 uppercase tracking-[0.3em]">
-                    TICKET ID: {selectedTicket.id.toUpperCase()}
-                  </div>
-                </div>
-              </div>
+            <div className="flex-1 overflow-y-auto p-6 bg-slate-100 no-scrollbar print:p-0 print:bg-transparent">
+              <TripTicketDocument ticket={selectedTicket} materials={materials} />
             </div>
           </div>
         </div>

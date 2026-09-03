@@ -19,15 +19,18 @@ import {
   FileText,
   Wallet,
   Settings,
-  Search
+  Search,
+  Receipt
 } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { cn } from '../lib/utils';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { useSettings } from '../context/SettingsContext';
+import { useQuickTicket } from '../context/QuickTicketContext';
 import { COMPANY_NAME, handleImageError } from '../constants';
 import { BrandLogo } from './BrandLogo';
 import SpotlightSearch from './SpotlightSearch';
+import QuickTicketModal from './QuickTicketModal';
 
 interface LayoutProps {
   user: User;
@@ -36,6 +39,7 @@ interface LayoutProps {
 
 export default function Layout({ user, profile }: LayoutProps) {
   const { settings } = useSettings();
+  const { isQuickTicketOpen, openQuickTicket, closeQuickTicket, activeDraftId } = useQuickTicket();
   const location = useLocation();
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -210,11 +214,11 @@ export default function Layout({ user, profile }: LayoutProps) {
           >
             <Menu className="w-6 h-6" />
           </button>
-          <div className="flex-1 max-w-sm lg:max-w-md mx-4 lg:mx-6 hidden md:block">
+          <div className="flex-1 max-w-sm lg:max-w-md mx-4 lg:mx-6 hidden md:flex items-center gap-3">
             <button
               onClick={() => setSearchOpen(true)}
               className={cn(
-                "w-full flex items-center justify-between px-4 py-2.5 bg-slate-100 hover:bg-slate-200/50 border border-slate-200/30 rounded-2xl text-slate-400 hover:text-slate-500 transition-all text-[10px] font-bold uppercase tracking-wider outline-none focus-visible:ring-2 focus-visible:ring-blue-500",
+                "flex-1 flex items-center justify-between px-4 py-2.5 bg-slate-100 hover:bg-slate-200/50 border border-slate-200/30 rounded-2xl text-slate-400 hover:text-slate-500 transition-all text-[10px] font-bold uppercase tracking-wider outline-none focus-visible:ring-2 focus-visible:ring-blue-500",
                 settings.theme === 'dark' && "bg-slate-800 hover:bg-slate-700/65 border-slate-700/80 text-slate-500 hover:text-slate-400"
               )}
             >
@@ -226,9 +230,27 @@ export default function Layout({ user, profile }: LayoutProps) {
                 <kbd className="px-1.5 py-0.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded text-[9px] font-black tracking-normal">⌘K</kbd>
               </div>
             </button>
+            <button
+              onClick={() => openQuickTicket()}
+              className="flex items-center gap-2 px-3.5 py-2.5 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-slate-950 font-black text-xs uppercase tracking-wider rounded-2xl shadow-md hover:shadow-lg shadow-amber-500/20 active:scale-95 transition-all shrink-0 cursor-pointer"
+              title="Create quick buy ticket"
+              aria-label="Quick Ticket"
+            >
+              <Receipt className="w-4 h-4 text-slate-950" />
+              <span className="hidden lg:inline">Quick Ticket</span>
+            </button>
           </div>
           <div className="flex-1 md:hidden" />
-          <div className="flex items-center gap-6">
+          <div className="flex items-center gap-3 sm:gap-6">
+            <button
+              onClick={() => openQuickTicket()}
+              className="flex items-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-2xl md:hidden transition-all shadow-md shadow-amber-500/20 active:scale-95 outline-none font-black text-xs uppercase tracking-wider shrink-0"
+              aria-label="Quick Ticket"
+              title="Quick Ticket"
+            >
+              <Receipt className="w-4 h-4 text-slate-950" />
+              <span>Quick Ticket</span>
+            </button>
             <button
               onClick={() => setSearchOpen(true)}
               className={cn(
@@ -282,10 +304,30 @@ export default function Layout({ user, profile }: LayoutProps) {
           </div>
         </main>
       </div>
+
+      {/* Mobile Floating Action Button (FAB) */}
+      <div className="fixed bottom-6 right-6 z-40 sm:hidden print:hidden">
+        <button
+          onClick={() => openQuickTicket()}
+          className="flex items-center gap-2 px-4 py-3.5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs uppercase tracking-wider rounded-full shadow-2xl shadow-amber-500/40 active:scale-95 transition-all border-2 border-amber-400"
+          aria-label="Open Quick Ticket"
+        >
+          <Receipt className="w-4 h-4 text-slate-950" />
+          <span>Quick Ticket</span>
+        </button>
+      </div>
+
       <SpotlightSearch 
         isOpen={searchOpen} 
         onClose={() => setSearchOpen(false)} 
         profile={profile} 
+      />
+
+      <QuickTicketModal
+        isOpen={isQuickTicketOpen}
+        onClose={closeQuickTicket}
+        profile={profile}
+        initialDraftId={activeDraftId}
       />
     </div>
   );

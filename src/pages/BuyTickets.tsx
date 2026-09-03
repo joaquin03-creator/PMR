@@ -51,6 +51,8 @@ import { Scan, QrCode } from 'lucide-react';
 import { printTicket } from '../lib/printTicket';
 import BuyTicketPrint from '../components/BuyTicketPrint';
 import USBBarcodeScannerModal from '../components/USBBarcodeScannerModal';
+import { calculateMaterialLineItem, isTonMaterial, formatUnitPrice, getRateUnitLabel } from '../lib/scrapPricing';
+import { PricingUnitBadge } from '../components/PricingUnitBadge';
 
 interface BuyTicketsProps {
   profile: UserProfile | null;
@@ -749,17 +751,21 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
     const previewTicket: BuyTicket = {
       id: 'PREVIEW',
       customerId: selectedCustomer?.id || 'NEW',
-      materials: items.map(item => ({
-        materialId: item.materialId,
-        grossWeight: item.grossWeight,
-        tareWeight: item.tareWeight,
-        netWeight: item.netWeight,
-        pricePerUnit: item.pricePerUnit,
-        totalAmount: item.totalAmount,
-        deductionWeight: item.deductionWeight,
-        deductionReason: item.deductionReason,
-        notes: item.notes
-      })),
+      materials: items.map(item => {
+        const effectiveUnit = item.unit || item.material?.unit;
+        return {
+          materialId: item.materialId,
+          grossWeight: item.grossWeight,
+          tareWeight: item.tareWeight,
+          netWeight: item.netWeight,
+          pricePerUnit: item.pricePerUnit,
+          totalAmount: item.totalAmount,
+          deductionWeight: item.deductionWeight,
+          deductionReason: item.deductionReason,
+          notes: item.notes,
+          unit: (isTonMaterial(effectiveUnit, item.material?.category, item.material?.name) ? 'ton' : 'lb')
+        };
+      }),
       totalAmount,
       status: 'completed',
       timestamp: ticketDetails.customTimestamp ? new Date(ticketDetails.customTimestamp).toISOString() : new Date().toISOString(),
@@ -771,10 +777,17 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
   };
 
   const calculateItem = (item: typeof items[0]) => {
-    const physicalNet = roundNetWeight(Math.max(0, item.grossWeight - item.tareWeight));
-    const paidWeight = Math.max(0, physicalNet - (item.deductionWeight || 0));
-    const total = Math.round((paidWeight * item.pricePerUnit) * 100) / 100;
-    return { ...item, netWeight: physicalNet, totalAmount: total };
+    const effectiveUnit = item.unit || item.material?.unit;
+    const line = calculateMaterialLineItem(
+      item.grossWeight,
+      item.tareWeight,
+      item.deductionWeight,
+      item.pricePerUnit,
+      effectiveUnit,
+      item.material?.category,
+      item.material?.name
+    );
+    return { ...item, netWeight: line.netWeight, totalAmount: line.totalAmount, unit: line.unit };
   };
 
   const addItem = () => {
@@ -785,6 +798,9 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
       grossWeight: 0, 
       tareWeight: 0, 
       netWeight: 0, 
+      deductionWeight: 0,
+      deductionReason: '',
+      notes: '',
       pricePerUnit: 0, 
       totalAmount: 0,
       materialSearch: '',
@@ -805,6 +821,9 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
         if (updates.material) {
           updated.materialId = updates.material.id;
           updated.pricePerUnit = updates.material.buyPrice;
+          if (!updates.unit) {
+            updated.unit = isTonMaterial(updates.material.unit, updates.material.category, updates.material.name) ? 'ton' : 'lb';
+          }
         }
         return calculateItem(updated);
       }
@@ -922,13 +941,24 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
       if (!customerId) throw new Error("Customer ID missing");
 
       const ticketMaterials: BuyTicketMaterial[] = items.map(item => {
+        const effectiveUnit = item.unit || item.material?.unit;
+        const line = calculateMaterialLineItem(
+          item.grossWeight,
+          item.tareWeight,
+          item.deductionWeight,
+          item.pricePerUnit,
+          effectiveUnit,
+          item.material?.category,
+          item.material?.name
+        );
         const material: BuyTicketMaterial = {
           materialId: item.materialId,
           grossWeight: item.grossWeight,
           tareWeight: item.tareWeight,
-          netWeight: item.netWeight,
+          netWeight: line.netWeight,
           pricePerUnit: item.pricePerUnit,
-          totalAmount: item.totalAmount
+          totalAmount: line.totalAmount,
+          unit: (isTonMaterial(effectiveUnit, item.material?.category, item.material?.name) ? 'ton' : 'lb')
         };
         
         if (item.deductionWeight !== undefined) material.deductionWeight = item.deductionWeight;
@@ -939,10 +969,12 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
         return material;
       });
 
+      const calculatedFinalTotal = Math.round(ticketMaterials.reduce((sum, item) => sum + (item.totalAmount || 0), 0) * 100) / 100;
+
       const ticketData: Omit<BuyTicket, 'id'> & { [key: string]: any } = {
         customerId,
         materials: ticketMaterials,
-        totalAmount,
+        totalAmount: calculatedFinalTotal,
         status: 'completed',
         timestamp: ticketDetails.customTimestamp ? new Date(ticketDetails.customTimestamp).toISOString() : new Date().toISOString(),
         vehiclePlate: ticketDetails.vehiclePlate || '',
@@ -2084,7 +2116,23 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                 {items.map((item, index) => (
                   <article key={item.id} className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm space-y-8 relative group" aria-label={`Item ${index + 1}`}>
                     <div className="flex items-center justify-between">
-                      <span className="px-3 py-1 bg-slate-100 rounded-full text-[10px] font-black text-slate-500 uppercase tracking-widest">Item #{index + 1}</span>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <span className="px-3 py-1 bg-slate-100 rounded-full text-[10px] font-black text-slate-500 uppercase tracking-widest">Item #{index + 1}</span>
+                        {item.material && (
+                          <PricingUnitBadge 
+                            unit={item.unit || item.material.unit} 
+                            category={item.material.category} 
+                            materialName={item.material.name}
+                            price={item.pricePerUnit}
+                            size="sm"
+                            showRateBreakdown={true}
+                            interactive={true}
+                            onToggleUnit={(newUnit) => {
+                              updateItem(item.id, { unit: newUnit });
+                            }}
+                          />
+                        )}
+                      </div>
                       {items.length > 1 && (
                         <button 
                           onClick={() => removeItem(item.id)}
@@ -2125,6 +2173,11 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                               }
                             }}
                             onFocus={() => updateItem(item.id, { isDropdownOpen: true })}
+                            onBlur={() => {
+                              setTimeout(() => {
+                                updateItem(item.id, { isDropdownOpen: false });
+                              }, 200);
+                            }}
                             onKeyDown={(e) => {
                               if (e.key === 'Tab' || e.key === 'Enter') {
                                 if (item.material) {
@@ -2238,15 +2291,29 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                                           document.getElementById(`gross-${item.id}`)?.focus();
                                         }, 100);
                                       }}
+                                      onClick={() => {
+                                        updateItem(item.id, { material: m, isDropdownOpen: false, materialSearch: '', pricePerUnit: m.buyPrice });
+                                        setTimeout(() => {
+                                          document.getElementById(`gross-${item.id}`)?.focus();
+                                        }, 100);
+                                      }}
                                       className="w-full px-6 py-3 text-left hover:bg-blue-50 transition-colors flex items-center justify-between group outline-none focus:bg-blue-50"
                                     >
                                       <div>
                                         <p className="font-black text-slate-900">{m.code}</p>
                                         <p className="text-xs text-slate-500 font-medium">{m.name}</p>
                                       </div>
-                                      <span className="text-sm font-black text-blue-600">
-                                        ${m.buyPrice.toFixed(2)}
-                                      </span>
+                                      <div className="flex items-center gap-2">
+                                        <PricingUnitBadge 
+                                          unit={m.unit}
+                                          category={m.category}
+                                          materialName={m.name}
+                                          size="xs"
+                                        />
+                                        <span className="text-sm font-black text-blue-600">
+                                          ${m.buyPrice.toFixed(2)} / {m.unit || 'lb'}
+                                        </span>
+                                      </div>
                                     </button>
                                   ))}
                               </div>
@@ -2256,7 +2323,7 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                       </div>
 
                       <div className="space-y-2">
-                        <label htmlFor={`gross-${item.id}`} className="text-xs font-black text-slate-400 uppercase tracking-widest">Gross Weight</label>
+                        <label htmlFor={`gross-${item.id}`} className="text-xs font-black text-slate-400 uppercase tracking-widest">Gross Weight (lb)</label>
                         <input 
                           id={`gross-${item.id}`}
                           type="number"
@@ -2272,7 +2339,7 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                         />
                       </div>
                       <div className="space-y-2">
-                        <label htmlFor={`tare-${item.id}`} className="text-xs font-black text-slate-400 uppercase tracking-widest">Tare Weight</label>
+                        <label htmlFor={`tare-${item.id}`} className="text-xs font-black text-slate-400 uppercase tracking-widest">Tare Weight (lb)</label>
                         <input 
                           id={`tare-${item.id}`}
                           type="number"
@@ -2309,7 +2376,19 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
 
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
                       <div className="space-y-2">
-                        <label htmlFor={`price-${item.id}`} className="text-xs font-black text-slate-400 uppercase tracking-widest">Price per lb</label>
+                        <div className="flex items-center justify-between gap-1">
+                          <label htmlFor={`price-${item.id}`} className="text-xs font-black text-slate-400 uppercase tracking-widest truncate">
+                            Price per {isTonMaterial(item.unit || item.material?.unit, item.material?.category, item.material?.name) ? 'Ton ($/NT)' : 'lb ($/lb)'}
+                          </label>
+                          {item.material && (
+                            <PricingUnitBadge 
+                              unit={item.unit || item.material.unit} 
+                              category={item.material.category} 
+                              materialName={item.material.name}
+                              size="xs"
+                            />
+                          )}
+                        </div>
                         <div className="relative">
                           <DollarSign className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" aria-hidden="true" />
                           <input 
@@ -2382,7 +2461,19 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                         </div>
                         <div className="border-l border-slate-200 pl-6">
                           <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Net Weight</p>
-                          <p className="text-xl font-black text-slate-900">{item.netWeight.toLocaleString()} lb</p>
+                          <div className="flex flex-wrap items-baseline gap-2">
+                            <p className="text-xl font-black text-slate-900">{item.netWeight.toLocaleString()} lb</p>
+                            {(item.deductionWeight || 0) > 0 && (
+                              <span className="text-xs font-bold text-red-600 bg-red-50 px-2 py-0.5 rounded-lg border border-red-200">
+                                Paid: {Math.max(0, item.netWeight - item.deductionWeight).toLocaleString()} lb
+                              </span>
+                            )}
+                            {isTonMaterial(item.unit || item.material?.unit, item.material?.category, item.material?.name) && (
+                              <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-lg border border-blue-200">
+                                {((Math.max(0, item.netWeight - (item.deductionWeight || 0))) / 2000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 })} NT
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
                       <div className="text-right">
@@ -2762,8 +2853,30 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                             </div>
                           )}
                           <div>
-                            <p className="font-black text-slate-900 text-sm">{item.material?.name}</p>
-                            <p className="text-[10px] text-slate-500 font-bold uppercase">{item.netWeight.toLocaleString()} lb @ ${item.pricePerUnit.toFixed(2)}</p>
+                            <div className="flex items-center gap-2">
+                              <p className="font-black text-slate-900 text-sm">{item.material?.name}</p>
+                              {item.material && (
+                                <PricingUnitBadge 
+                                  unit={item.unit || item.material.unit} 
+                                  category={item.material.category} 
+                                  materialName={item.material.name}
+                                  size="xs"
+                                />
+                              )}
+                            </div>
+                            <p className="text-[10px] text-slate-500 font-bold uppercase">
+                              {(() => {
+                                const effectiveUnit = item.unit || item.material?.unit;
+                                const isTon = isTonMaterial(effectiveUnit, item.material?.category, item.material?.name);
+                                const paidLbs = (item.netWeight || 0) - (item.deductionWeight || 0);
+                                const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, effectiveUnit, item.material?.category, item.material?.name);
+                                const tons = paidLbs / 2000;
+                                const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+                                return isTon
+                                  ? `${paidLbs.toLocaleString()} lb (${tonsStr} NT) @ ${rateFormatted}`
+                                  : `${paidLbs.toLocaleString()} lb @ ${rateFormatted}`;
+                              })()}
+                            </p>
                           </div>
                         </div>
                         <p className="font-black text-blue-600 text-sm whitespace-nowrap">${item.totalAmount.toFixed(2)}</p>
@@ -3033,10 +3146,15 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                     <p className="text-[10px] font-bold text-slate-400 uppercase">Items</p>
                     {(lastCreatedTicket.materials || []).map((item, idx) => {
                       const material = materials.find(m => m.id === item.materialId);
+                      const isTon = isTonMaterial(item.unit || material?.unit, material?.category, material?.name);
                       const displayNetWeight = (item.netWeight || 0) - (item.deductionWeight || 0);
                       const itemTotal = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0)
                         ? item.totalAmount
-                        : (displayNetWeight * (item.pricePerUnit || 0));
+                        : (isTon ? ((displayNetWeight / 2000) * (item.pricePerUnit || 0)) : (displayNetWeight * (item.pricePerUnit || 0)));
+                      const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
+                      const tons = displayNetWeight / 2000;
+                      const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
                       return (
                         <div key={idx} className="space-y-1 border-b border-slate-50 pb-2 last:border-0">
                           <div className="flex justify-between gap-4 text-[11px]">
@@ -3052,8 +3170,9 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                             <span>
                               {item.netWeight} lb
                               {item.deductionWeight ? ` (Ded: -${item.deductionWeight} lb)` : ''}
+                              {isTon ? ` (${tonsStr} NT)` : ''}
                             </span>
-                            <span>@ ${(item.pricePerUnit || 0).toFixed(2)}/lb</span>
+                            <span>@ {rateFormatted}</span>
                           </div>
                           {item.notes && (
                             <p className="text-[9px] text-slate-400 italic pl-5">Note: {item.notes}</p>
@@ -3081,8 +3200,10 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                       ${((lastCreatedTicket.totalAmount !== undefined && lastCreatedTicket.totalAmount > 0)
                         ? lastCreatedTicket.totalAmount
                         : (lastCreatedTicket.materials || []).reduce((sum, m) => {
+                            const material = materials.find(mat => mat.id === m.materialId);
+                            const isTon = isTonMaterial(m.unit || material?.unit, material?.category, material?.name);
                             const net = (m.netWeight || 0) - (m.deductionWeight || 0);
-                            return sum + (m.totalAmount || (net * (m.pricePerUnit || 0)));
+                            return sum + (m.totalAmount !== undefined && m.totalAmount > 0 ? m.totalAmount : (isTon ? ((net / 2000) * (m.pricePerUnit || 0)) : (net * (m.pricePerUnit || 0))));
                           }, 0)
                       ).toFixed(2)}
                     </span>

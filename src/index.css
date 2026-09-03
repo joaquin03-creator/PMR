@@ -25,8 +25,9 @@
   }
   
   @media print {
-    @page { margin: 0.5in; size: letter portrait; }
-    @page landscape-document { size: letter landscape; margin: 0.5in; }
+    @page { margin: 0.25in; size: letter portrait; }
+    @page landscape-document { size: letter landscape; margin: 0.25in; }
+    @page bol-portrait-document { size: letter portrait; margin: 0.25in; }
     
     html, body {
       background: white !important;
@@ -124,11 +125,12 @@
     }
 
     /* Document replicas should display as clean, non-absolute relative blocks inside page flow */
-    #printable-invoice, .bol-container { 
+    #printable-invoice {
       page: landscape-document !important;
       visibility: visible !important; 
       position: relative !important; 
       display: flex !important;
+      flex-direction: column !important;
       width: 100% !important; 
       max-width: 100% !important;
       height: auto !important;
@@ -138,6 +140,30 @@
       background: white !important; 
       box-shadow: none !important;
       border: none !important;
+    }
+    .bol-container { 
+      page: bol-portrait-document !important;
+      visibility: visible !important; 
+      position: relative !important; 
+      display: flex !important;
+      flex-direction: column !important;
+      width: 100% !important; 
+      max-width: 100% !important;
+      height: auto !important;
+      min-height: 0 !important;
+      padding: 0 !important; 
+      margin: 0 !important;
+      background: white !important; 
+      box-shadow: none !important;
+      border: none !important;
+    }
+    #printable-invoice tr, .bol-container tr,
+    #printable-invoice .avoid-break, .bol-container .avoid-break {
+      break-inside: avoid !important;
+      page-break-inside: avoid !important;
+    }
+    #printable-invoice thead, .bol-container thead {
+      display: table-header-group !important;
     }
     .no-print, .no-print * { display: none !important; }
   }

@@ -1,7 +1,7 @@
 import {
 useState, useEffect, useMemo } from 'react';
 import {
-useSearchParams } from 'react-router-dom';
+useSearchParams, useLocation } from 'react-router-dom';
 import {
 auth, db } from '../firebase';
 import {
@@ -47,6 +47,8 @@ import {
 BuyTicketPrint } from '../components/BuyTicketPrint';
 import {
 logAuditEvent } from '../lib/audit';
+import {
+isTonMaterial, formatUnitPrice, formatRateBreakdown } from '../lib/scrapPricing';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
@@ -76,6 +78,21 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     direction: 'desc'
   });
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
+  const [dateFilter, setDateFilter] = useState<'all' | 'today'>(() => {
+    const filter = searchParams.get('filter') || searchParams.get('date');
+    if (filter === 'today' || filter === new Date().toLocaleDateString('en-CA')) {
+      return 'today';
+    }
+    return 'all';
+  });
+
+  useEffect(() => {
+    const filter = searchParams.get('filter') || searchParams.get('date') || location.state?.filter || location.state?.date;
+    if (filter === 'today' || filter === new Date().toLocaleDateString('en-CA')) {
+      setDateFilter('today');
+    }
+  }, [searchParams, location.state]);
 
   // Handle URL deep linking for selecting a ticket
   useEffect(() => {
@@ -139,8 +156,23 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
 
   const getCustomerName = (id: string) => customers.find(c => c.id === id)?.name || 'Unknown Customer';
 
+  const todayLocalDateString = useMemo(() => new Date().toLocaleDateString('en-CA'), []);
+
+  const todayTicketsCount = useMemo(() => {
+    return buyTickets.filter(ticket => {
+      if (!ticket.timestamp) return false;
+      return new Date(ticket.timestamp).toLocaleDateString('en-CA') === todayLocalDateString;
+    }).length;
+  }, [buyTickets, todayLocalDateString]);
+
   const sortedAndFilteredTickets = useMemo(() => {
     const filtered = buyTickets.filter(ticket => {
+      if (dateFilter === 'today') {
+        if (!ticket.timestamp) return false;
+        const ticketLocalDate = new Date(ticket.timestamp).toLocaleDateString('en-CA');
+        if (ticketLocalDate !== todayLocalDateString) return false;
+      }
+
       const customer = customers.find(c => c.id === ticket.customerId);
       const customerName = customer?.name.toLowerCase() || '';
       const ticketId = ticket.id.toLowerCase();
@@ -426,7 +458,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       </header>
 
       {/* Search and Filter Bar */}
-      <div className="flex flex-col md:flex-row gap-6">
+      <div className="flex flex-col md:flex-row items-stretch md:items-center gap-4">
         <div className="relative group flex-1">
           <label htmlFor="ticket-search" className="sr-only">Search by customer name or ticket ID</label>
           <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 group-focus-within:text-blue-500 transition-colors" aria-hidden="true" />
@@ -438,6 +470,38 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
           />
+        </div>
+
+        {/* Date Filter Pills */}
+        <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 p-1.5 rounded-2xl shrink-0 self-start md:self-auto">
+          <button
+            onClick={() => setDateFilter('all')}
+            className={cn(
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer",
+              dateFilter === 'all'
+                ? "bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm"
+                : "text-slate-500 hover:text-slate-900 dark:text-slate-400"
+            )}
+          >
+            All Tickets ({buyTickets.length})
+          </button>
+          <button
+            onClick={() => setDateFilter('today')}
+            className={cn(
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center gap-1.5 cursor-pointer",
+              dateFilter === 'today'
+                ? "bg-blue-600 text-white shadow-sm"
+                : "text-slate-500 hover:text-slate-900 dark:text-slate-400"
+            )}
+          >
+            <span>Today</span>
+            <span className={cn(
+              "px-1.5 py-0.5 rounded-full text-[10px] font-extrabold",
+              dateFilter === 'today' ? "bg-blue-700 text-white" : "bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300"
+            )}>
+              {todayTicketsCount}
+            </span>
+          </button>
         </div>
       </div>
 
@@ -757,7 +821,16 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                           <div className="text-right shrink-0">
                             <p className="text-lg font-black text-slate-900">${item.totalAmount.toFixed(2)}</p>
                             <p className="text-[10px] text-slate-400 font-bold uppercase">
-                              {item.netWeight - (item.deductionWeight || 0)} lb paid @ ${item.pricePerUnit.toFixed(2)}/lb
+                              {(() => {
+                                const isTon = isTonMaterial(item.unit || material?.unit, material?.category, material?.name);
+                                const paidLbs = (item.netWeight || 0) - (item.deductionWeight || 0);
+                                const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
+                                const tons = paidLbs / 2000;
+                                const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+                                return isTon
+                                  ? `${paidLbs.toLocaleString()} lb (${tonsStr} NT) paid @ ${rateFormatted}`
+                                  : `${paidLbs.toLocaleString()} lb paid @ ${rateFormatted}`;
+                              })()}
                             </p>
                           </div>
                         </div>
@@ -964,6 +1037,12 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                     <p className="text-[10px] font-bold text-slate-400 uppercase">Items</p>
                     {(selectedTicket.materials || []).map((item, idx) => {
                       const material = materials.find(m => m.id === item.materialId);
+                      const isTon = isTonMaterial(item.unit || material?.unit, material?.category, material?.name);
+                      const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
+                      const displayNetWeight = (item.netWeight || 0) - (item.deductionWeight || 0);
+                      const tons = displayNetWeight / 2000;
+                      const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
                       return (
                         <div key={idx} className="space-y-1 border-b border-slate-50 pb-2 last:border-0">
                           <div className="flex justify-between gap-4 text-[11px]">
@@ -979,8 +1058,9 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                             <span>
                               {item.netWeight} lb
                               {item.deductionWeight ? ` (Ded: -${item.deductionWeight} lb)` : ''}
+                              {isTon ? ` (${tonsStr} NT)` : ''}
                             </span>
-                            <span>@ ${item.pricePerUnit.toFixed(2)}/lb</span>
+                            <span>@ {rateFormatted}</span>
                           </div>
                           {item.notes && (
                             <p className="text-[9px] text-slate-400 italic pl-5">Note: {item.notes}</p>

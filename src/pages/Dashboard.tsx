@@ -33,7 +33,8 @@ import {
   ExternalLink,
   Copy,
   Camera,
-  AlertTriangle
+  AlertTriangle,
+  Receipt
 } from 'lucide-react';
 import { cn, generateTicketId, getCustomerDataGaps } from '../lib/utils';
 import { Link, useNavigate } from 'react-router-dom';
@@ -44,9 +45,12 @@ import { CameraCapture } from '../components/CameraCapture';
 import { ScaleCaptureButton } from '../components/ScaleCaptureButton';
 import SignaturePad from '../components/SignaturePad';
 import { useSettings } from '../context/SettingsContext';
+import { useQuickTicket } from '../context/QuickTicketContext';
 import { useIDScanner } from '../hooks/useIDScanner';
 import { Scan, QrCode } from 'lucide-react';
 import { roundNetWeight } from '../lib/weightUtils';
+import { calculateMaterialLineItem, isTonMaterial, formatUnitPrice, getRateUnitLabel } from '../lib/scrapPricing';
+import { PricingUnitBadge } from '../components/PricingUnitBadge';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE, handleImageError, APP_VERSION } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
 import { printTicket } from '../lib/printTicket';
@@ -243,6 +247,7 @@ export default function Dashboard({ profile }: DashboardProps) {
   };
   
   const navigate = useNavigate();
+  const { openQuickTicket } = useQuickTicket();
 
   // Floating Compliance Stack State
   const [complianceDismissals, setComplianceDismissals] = useState<Record<string, string>>(() => {
@@ -293,7 +298,7 @@ export default function Dashboard({ profile }: DashboardProps) {
     idExpiration: ''
   });
   const [isQtNewCustomer, setIsQtNewCustomer] = useState(false);
-  const [qtItems, setQtItems] = useState<{ id: string, material: Material | null, gross: number, tare: number, deduction: number, overridePrice?: number, materialSearch?: string, isDropdownOpen?: boolean, photoUrl?: string }[]>([
+  const [qtItems, setQtItems] = useState<{ id: string, material: Material | null, gross: number, tare: number, deduction: number, overridePrice?: number, unit?: 'lb' | 'ton', materialSearch?: string, isDropdownOpen?: boolean, photoUrl?: string }[]>([
     { id: Math.random().toString(36).substr(2, 9), material: null, gross: 0, tare: 0, deduction: 0, materialSearch: '', isDropdownOpen: false, photoUrl: '' }
   ]);
   const [qtProcessing, setQtProcessing] = useState(false);
@@ -301,6 +306,24 @@ export default function Dashboard({ profile }: DashboardProps) {
   const [qtSuccess, setQtSuccess] = useState(false);
   const [qtVerificationStatus, setQtVerificationStatus] = useState<'idle' | 'verifying' | 'verified' | 'failed' | 'offline-saved'>('idle');
   const [qtCreatedTicketId, setQtCreatedTicketId] = useState<string>('');
+  const [printedTicket, setPrintedTicket] = useState<{
+    id: string;
+    customerId: string;
+    customerName: string;
+    materials: BuyTicketMaterial[];
+    items: typeof qtItems;
+    totalAmount: number;
+    netWeight: number;
+    timestamp: string;
+    paymentMethod: 'cash' | 'check' | 'other' | 'eft';
+    vehiclePlate?: string;
+    vehicleType?: string;
+    signatureUrl?: string;
+    customerPhotoUrl?: string;
+    vehiclePhotoUrl?: string;
+    loadPhotoUrl?: string;
+    idImageUrl?: string;
+  } | null>(null);
   const [isPreviewOnly, setIsPreviewOnly] = useState(false);
   const [qtCustomerPhotoUrl, setQtCustomerPhotoUrl] = useState('');
   const [qtVehiclePhotoUrl, setQtVehiclePhotoUrl] = useState('');
@@ -569,13 +592,20 @@ export default function Dashboard({ profile }: DashboardProps) {
   } | null>(null);
 
   const qtTotals = qtItems.reduce((acc, item) => {
-    const physicalNet = roundNetWeight(Math.max(0, item.gross - item.tare));
-    const paidWeight = Math.max(0, physicalNet - (item.deduction || 0));
     const price = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
-    const amount = Math.round((paidWeight * price) * 100) / 100;
+    const effectiveUnit = item.unit || item.material?.unit;
+    const line = calculateMaterialLineItem(
+      item.gross,
+      item.tare,
+      item.deduction,
+      price,
+      effectiveUnit,
+      item.material?.category,
+      item.material?.name
+    );
     return {
-      netWeight: acc.netWeight + physicalNet,
-      totalAmount: acc.totalAmount + amount
+      netWeight: acc.netWeight + line.netWeight,
+      totalAmount: acc.totalAmount + line.totalAmount
     };
   }, { netWeight: 0, totalAmount: 0 });
 
@@ -986,6 +1016,112 @@ export default function Dashboard({ profile }: DashboardProps) {
       .slice(0, 3);
   }, [todayTickets, materials]);
 
+  // ─── LAST WEEK SAME-DAY COMPARISON & SMART TARGETS ───────────────────
+  const lastWeekDateInfo = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 7);
+    const ymd = d.toLocaleDateString('en-CA');
+    const dayName = d.toLocaleDateString('en-US', { weekday: 'long' });
+    return { ymd, dayName };
+  }, [currentTime]);
+
+  const lastWeekSameDayTickets = useMemo(() => {
+    return buyTickets.filter(t => {
+      if (!t.timestamp) return false;
+      const ticketLocalDate = new Date(t.timestamp).toLocaleDateString('en-CA');
+      return ticketLocalDate === lastWeekDateInfo.ymd && t.status !== 'voided' && t.status !== 'cancelled';
+    });
+  }, [buyTickets, lastWeekDateInfo.ymd]);
+
+  const lastWeekSameDaySpend = useMemo(() => {
+    return lastWeekSameDayTickets.reduce((sum, t) => sum + t.totalAmount, 0);
+  }, [lastWeekSameDayTickets]);
+
+  const lastWeekSameDayCustomers = useMemo(() => {
+    const custIds = new Set<string>();
+    lastWeekSameDayTickets.forEach(t => {
+      if (t.customerId) custIds.add(t.customerId);
+    });
+    return custIds.size;
+  }, [lastWeekSameDayTickets]);
+
+  const lastWeekSameDayProfit = useMemo(() => {
+    const resale = lastWeekSameDayTickets.reduce((sum, t) => {
+      const ticketResale = (t.materials || []).reduce((mSum, m) => {
+        const histSellPrice = getSellPriceForDay(m.materialId, t.timestamp);
+        return mSum + (histSellPrice * m.netWeight);
+      }, 0);
+      return sum + ticketResale;
+    }, 0);
+    return Math.max(0, resale - lastWeekSameDaySpend);
+  }, [lastWeekSameDayTickets, lastWeekSameDaySpend, dailySnapshots, pricingSnapshots, materials]);
+
+  const lastWeekSameDayMargin = useMemo(() => {
+    const resale = lastWeekSameDayTickets.reduce((sum, t) => {
+      const ticketResale = (t.materials || []).reduce((mSum, m) => {
+        const histSellPrice = getSellPriceForDay(m.materialId, t.timestamp);
+        return mSum + (histSellPrice * m.netWeight);
+      }, 0);
+      return sum + ticketResale;
+    }, 0);
+    return resale > 0 ? (lastWeekSameDayProfit / resale) * 100 : 0;
+  }, [lastWeekSameDayTickets, lastWeekSameDayProfit, dailySnapshots, pricingSnapshots, materials]);
+
+  // Check manual targets in systemConfig (supports flat and nested dailyTargets)
+  const manualSpendTarget = systemConfig?.dailySpendTarget ?? systemConfig?.dailyTargets?.spend;
+  const hasManualSpend = typeof manualSpendTarget === 'number' && manualSpendTarget > 0;
+  const effectiveSpendTarget = hasManualSpend
+    ? manualSpendTarget
+    : (lastWeekSameDaySpend > 0 ? lastWeekSameDaySpend : (settings.dailySpendTarget || 5000));
+
+  const manualCustomerTarget = systemConfig?.dailyCustomerTarget ?? systemConfig?.dailyTargets?.customers;
+  const hasManualCustomers = typeof manualCustomerTarget === 'number' && manualCustomerTarget > 0;
+  const effectiveCustomerTarget = hasManualCustomers
+    ? manualCustomerTarget
+    : (lastWeekSameDayCustomers > 0 ? lastWeekSameDayCustomers : (settings.dailyCustomerTarget || 30));
+
+  const manualProfitTarget = systemConfig?.dailyProfitTarget ?? systemConfig?.dailyTargets?.profit;
+  const hasManualProfit = typeof manualProfitTarget === 'number' && manualProfitTarget > 0;
+  const effectiveProfitTarget = hasManualProfit
+    ? manualProfitTarget
+    : (lastWeekSameDayProfit > 0 ? lastWeekSameDayProfit : 1500);
+
+  const manualMarginTarget = systemConfig?.dailyMarginTarget ?? systemConfig?.dailyTargets?.margin;
+  const hasManualMargin = typeof manualMarginTarget === 'number' && manualMarginTarget > 0;
+  const effectiveMarginTarget = hasManualMargin
+    ? manualMarginTarget
+    : (lastWeekSameDayMargin > 0 ? lastWeekSameDayMargin : 15);
+
+  const handleSaveDailyTarget = async (
+    field: 'dailySpendTarget' | 'dailyCustomerTarget' | 'dailyProfitTarget' | 'dailyMarginTarget',
+    newVal: number
+  ) => {
+    if (profile?.role !== 'manager') return;
+    try {
+      const shortKey = field === 'dailySpendTarget' ? 'spend' :
+                       field === 'dailyCustomerTarget' ? 'customers' :
+                       field === 'dailyProfitTarget' ? 'profit' : 'margin';
+
+      const configRef = doc(db, 'system', 'config');
+      await setDoc(configRef, {
+        [field]: newVal,
+        dailyTargets: {
+          ...(systemConfig?.dailyTargets || {}),
+          [shortKey]: newVal
+        },
+        lastUpdated: new Date().toISOString()
+      }, { merge: true });
+
+      firestore(
+        'Daily Target Saved',
+        `Successfully updated daily target for ${shortKey} to ${newVal.toLocaleString()}.`
+      );
+    } catch (err: any) {
+      console.error('Failed to save target:', err);
+      toastError('Update Failed', `Could not save daily target: ${err.message || err}`);
+    }
+  };
+
   const handleIDScan = async () => {
     const result = await scan();
     if (result.success) {
@@ -1106,18 +1242,28 @@ export default function Dashboard({ profile }: DashboardProps) {
       if (!customerId) throw new Error("Customer ID missing");
 
       const ticketMaterials: BuyTicketMaterial[] = qtItems.map(item => {
-        const physicalNet = roundNetWeight(Math.max(0, item.gross - item.tare));
-        const paidWeight = Math.max(0, physicalNet - (item.deduction || 0));
         const price = item.overridePrice !== undefined ? item.overridePrice : item.material!.buyPrice;
+        const effectiveUnit = item.unit || item.material?.unit;
+        const isTon = isTonMaterial(effectiveUnit, item.material?.category, item.material?.name);
+        const line = calculateMaterialLineItem(
+          item.gross,
+          item.tare,
+          item.deduction,
+          price,
+          effectiveUnit,
+          item.material?.category,
+          item.material?.name
+        );
         return {
           materialId: item.material!.id,
           grossWeight: item.gross,
           tareWeight: item.tare,
-          netWeight: physicalNet, // Store physical net (Gross - Tare)
+          netWeight: line.netWeight,
           pricePerUnit: price,
-          totalAmount: Math.round((paidWeight * price) * 100) / 100,
+          totalAmount: line.totalAmount,
           deductionWeight: item.deduction || 0,
-          photoUrl: item.photoUrl || ''
+          photoUrl: item.photoUrl || '',
+          unit: isTon ? 'ton' : 'lb'
         };
       });
 
@@ -1314,14 +1460,41 @@ export default function Dashboard({ profile }: DashboardProps) {
         await deleteDoc(doc(db, 'ticketDrafts', activeDraftId));
         setActiveDraftId(null);
       }
+
+      const customerName = qtCustomer?.name || qtNewCustomer.name || 'Unknown Customer';
+      const calculatedFinalTotal = Math.round(ticketMaterials.reduce((sum, item) => sum + (item.totalAmount || 0), 0) * 100) / 100;
+      const totalNetWeight = ticketMaterials.reduce((sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 0);
+
+      const ticketSnapshot = {
+        id: docRef.id,
+        customerId,
+        customerName,
+        materials: ticketMaterials,
+        items: [...qtItems],
+        totalAmount: calculatedFinalTotal,
+        netWeight: totalNetWeight,
+        timestamp: ticketData.timestamp,
+        paymentMethod: 'cash' as const,
+        vehiclePlate: qtVehiclePlate || '',
+        vehicleType: qtVehicleType || '',
+        signatureUrl: qtSignatureUrl || '',
+        customerPhotoUrl: qtCustomerPhotoUrl || '',
+        vehiclePhotoUrl: qtVehiclePhotoUrl || '',
+        loadPhotoUrl: qtLoadPhotoUrl || '',
+        idImageUrl: qtIdImageUrl || '',
+      };
+
+      // 1. Capture snapshot FIRST
+      setPrintedTicket(ticketSnapshot);
+      setQtCreatedTicketId(docRef.id);
       setQtSuccess(true);
       
-      // Immediately trigger the print dialogue automatically for the quick ticket flow
+      // 2. Then print
       const tempTicket: BuyTicket = {
         id: docRef.id,
         customerId,
         materials: ticketMaterials,
-        totalAmount: totalAmount || 0,
+        totalAmount: calculatedFinalTotal,
         status: 'completed',
         timestamp: ticketData.timestamp,
         paymentMethod: 'cash',
@@ -1338,7 +1511,7 @@ export default function Dashboard({ profile }: DashboardProps) {
         await printTicket(
           <BuyTicketPrint 
             ticket={tempTicket} 
-            customerName={qtCustomer?.name || qtNewCustomer.name || 'N/A'} 
+            customerName={customerName} 
             materials={materials} 
             format={settings.receiptFormat}
           />,
@@ -1353,9 +1526,13 @@ export default function Dashboard({ profile }: DashboardProps) {
         `Quick Ticket #${docRef.id.toUpperCase()} successfully written to Firestore and sent to printer.`
       );
 
-      // Automatically close the quick ticket and reset all state to save a click or two!
-      setShowQuickTicket(false);
-      resetQuickTicket();
+      setDbHistoryAlert({
+        isOpen: true,
+        ticketId: docRef.id,
+        customerName,
+        totalAmount: calculatedFinalTotal,
+        timestamp: new Date().toISOString()
+      });
     } catch (error: any) {
       console.error('Error creating quick ticket:', error);
       setQtVerificationStatus('failed');
@@ -1393,6 +1570,7 @@ export default function Dashboard({ profile }: DashboardProps) {
     setQtSuccess(false);
     setQtVerificationStatus('idle');
     setQtCreatedTicketId('');
+    setPrintedTicket(null);
     setIdCheckResult(null);
   };
 
@@ -1573,20 +1751,27 @@ export default function Dashboard({ profile }: DashboardProps) {
               {currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center">
             <button
-              onClick={() => setShowQuickTicket(true)}
-              className="flex items-center gap-1.5 px-3 py-2 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition-all shadow-sm active:scale-95"
+              onClick={() => openQuickTicket()}
+              className="group flex items-center gap-3 px-4 sm:px-5 py-2.5 sm:py-3 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-slate-950 rounded-2xl shadow-lg shadow-amber-500/25 active:scale-95 transition-all text-left border border-amber-400/80 cursor-pointer"
+              title="Create streamlined walk-in buy ticket"
+              aria-label="Quick Ticket"
             >
-              <Plus className="w-4 h-4" />
-              <span className="hidden sm:inline">Quick Ticket</span>
-            </button>
-            <button
-              onClick={() => setShowFullTicket(true)}
-              className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 transition-all shadow-sm active:scale-95"
-            >
-              <FileText className="w-4 h-4" />
-              <span className="hidden sm:inline">Full Ticket</span>
+              <div className="p-2 bg-slate-950 text-amber-400 rounded-xl group-hover:scale-105 transition-transform shrink-0">
+                <Receipt className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="font-black text-xs sm:text-sm uppercase tracking-wider">Quick Ticket</span>
+                  <span className="text-[10px] font-black px-2 py-0.5 bg-amber-200/90 text-amber-950 rounded-full shrink-0">
+                    Fast Flow
+                  </span>
+                </div>
+                <p className="text-[11px] font-bold text-slate-800/80 hidden sm:block">
+                  Create streamlined walk-in buy ticket
+                </p>
+              </div>
             </button>
           </div>
         </div>
@@ -1600,36 +1785,55 @@ export default function Dashboard({ profile }: DashboardProps) {
               title="Material Spend"
               value={totalSpent}
               formattedValue={`$${Math.round(totalSpent).toLocaleString()}`}
-              target={settings.dailySpendTarget || 5000}
+              target={effectiveSpendTarget}
               unit="$"
               color="#3b82f6"
-              onClick={() => navigate('/reports?tab=financial')}
+              onClick={() => navigate('/reports?tab=overview&range=daily', { state: { tab: 'overview', timeRange: 'daily' } })}
+              editable={profile?.role === 'manager'}
+              isAutoSuggested={!hasManualSpend}
+              autoDayLabel={lastWeekDateInfo.dayName}
+              onSaveTarget={(val) => handleSaveDailyTarget('dailySpendTarget', val)}
             />
             <ArcGauge
               title="Customers Today"
               value={uniqueCustomersCountToday}
               formattedValue={String(uniqueCustomersCountToday)}
-              target={settings.dailyCustomerTarget || 30}
+              target={effectiveCustomerTarget}
               unit="customers"
               color="#8b5cf6"
-              onClick={() => navigate('/buy-tickets')}
+              onClick={() => navigate('/ticket-history?filter=today', { state: { filter: 'today' } })}
+              editable={profile?.role === 'manager'}
+              isAutoSuggested={!hasManualCustomers}
+              autoDayLabel={lastWeekDateInfo.dayName}
+              onSaveTarget={(val) => handleSaveDailyTarget('dailyCustomerTarget', val)}
             />
             <ArcGauge
               title="Expected Profit"
               value={todayEstProfit}
               formattedValue={`$${Math.round(todayEstProfit).toLocaleString()}`}
-              targetLabel="Spread Profit"
+              target={effectiveProfitTarget}
+              unit="$"
               color="#10b981"
-              onClick={() => navigate('/reports?tab=margin')}
+              onClick={() => navigate('/reports?tab=sales', { state: { tab: 'sales' } })}
+              editable={profile?.role === 'manager'}
+              isAutoSuggested={!hasManualProfit}
+              autoDayLabel={lastWeekDateInfo.dayName}
+              onSaveTarget={(val) => handleSaveDailyTarget('dailyProfitTarget', val)}
             />
             <ArcGauge
               title="Margin %"
               value={todayProfitMargin}
               formattedValue={`${todayProfitMargin.toFixed(1)}%`}
-              targetLabel="Min 15% Target"
+              target={effectiveMarginTarget}
+              unit="%"
+              targetLabel={hasManualMargin ? `Target: ${effectiveMarginTarget.toFixed(1)}%` : `Min ${effectiveMarginTarget.toFixed(1)}% Target`}
               isMargin={true}
               marginVal={todayProfitMargin}
-              onClick={() => navigate('/reports?tab=margin')}
+              onClick={() => navigate('/reports?tab=sales', { state: { tab: 'sales' } })}
+              editable={profile?.role === 'manager'}
+              isAutoSuggested={!hasManualMargin}
+              autoDayLabel={lastWeekDateInfo.dayName}
+              onSaveTarget={(val) => handleSaveDailyTarget('dailyMarginTarget', val)}
             />
           </div>
 
@@ -1739,13 +1943,12 @@ export default function Dashboard({ profile }: DashboardProps) {
                   <button
                     onClick={() => {
                       if (d.type === 'quick') {
-                        resumeQuickDraft(d.id);
+                        openQuickTicket(d.id);
                       } else {
-                        setResumeDraftId(d.id);
-                        setShowFullTicket(true);
+                        navigate('/buy-tickets');
                       }
                     }}
-                    className="flex-grow py-2.5 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition-all text-center"
+                    className="flex-grow py-2.5 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition-all text-center cursor-pointer"
                   >
                     Resume Ticket
                   </button>
@@ -2362,16 +2565,18 @@ export default function Dashboard({ profile }: DashboardProps) {
                     </div>
                     <div className="grid grid-cols-2 gap-y-3 text-sm">
                       <span className="text-slate-400">Verifying Ticket ID:</span>
-                      <span className="font-mono font-bold text-right text-slate-800 break-all">{qtCreatedTicketId || 'Writing...'}</span>
+                      <span className="font-mono font-bold text-right text-slate-800 break-all">{printedTicket?.id || qtCreatedTicketId || 'Writing...'}</span>
                       
                       <span className="text-slate-400">Customer:</span>
-                      <span className="font-bold text-right text-slate-800">{qtCustomer?.name || qtNewCustomer.name || 'Unknown'}</span>
+                      <span className="font-bold text-right text-slate-800">{printedTicket?.customerName || qtCustomer?.name || qtNewCustomer.name || 'Unknown'}</span>
                       
                       <span className="text-slate-400">Total Net Weight:</span>
-                      <span className="font-bold text-right text-slate-800">{netWeight} lb</span>
+                      <span className="font-bold text-right text-slate-800">{printedTicket ? `${printedTicket.netWeight} lb` : `${netWeight} lb`}</span>
                       
                       <span className="text-slate-400">Total Payout:</span>
-                      <span className="font-mono font-black text-right text-green-600">${totalAmount.toFixed(2)}</span>
+                      <span className="font-mono font-black text-right text-green-600">
+                        ${(printedTicket?.totalAmount ?? totalAmount).toFixed(2)}
+                      </span>
                     </div>
                   </div>
 
@@ -2451,6 +2656,26 @@ export default function Dashboard({ profile }: DashboardProps) {
                               </button>
                             )}
                             
+                            <div className="flex items-center justify-between gap-2 mb-2">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Item #{index + 1}</span>
+                                {item.material && (
+                                  <PricingUnitBadge 
+                                    unit={item.unit || item.material.unit} 
+                                    category={item.material.category} 
+                                    materialName={item.material.name}
+                                    price={item.overridePrice !== undefined ? item.overridePrice : item.material.buyPrice}
+                                    size="sm"
+                                    showRateBreakdown={true}
+                                    interactive={true}
+                                    onToggleUnit={(newUnit) => {
+                                      setQtItems(prev => prev.map(i => i.id === item.id ? { ...i, unit: newUnit } : i));
+                                    }}
+                                  />
+                                )}
+                              </div>
+                            </div>
+                            
                             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                               <div className="sm:col-span-1 space-y-1.5 relative">
                                 <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Material</label>
@@ -2471,6 +2696,13 @@ export default function Dashboard({ profile }: DashboardProps) {
                                       }
                                     }}
                                     onFocus={() => setQtItems(prev => prev.map(i => i.id === item.id ? { ...i, isDropdownOpen: true } : i))}
+                                    onBlur={() => {
+                                      setTimeout(() => {
+                                        setQtItems(prev => prev.map(i =>
+                                          i.id === item.id ? { ...i, isDropdownOpen: false } : i
+                                        ));
+                                      }, 200);
+                                    }}
                                     onKeyDown={(e) => {
                                       if (e.key === 'Tab' || e.key === 'Enter') {
                                         const search = (item.materialSearch || '').toLowerCase();
@@ -2500,10 +2732,12 @@ export default function Dashboard({ profile }: DashboardProps) {
                                         
                                         if (filtered.length > 0) {
                                           const m = filtered[0];
+                                          const isTon = isTonMaterial(m.unit, m.category, m.name);
                                           setQtItems(prev => prev.map(i => i.id === item.id ? { 
                                             ...i, 
                                             material: m, 
                                             overridePrice: m.buyPrice,
+                                            unit: isTon ? 'ton' : 'lb',
                                             isDropdownOpen: false,
                                             materialSearch: ''
                                           } : i));
@@ -2547,10 +2781,35 @@ export default function Dashboard({ profile }: DashboardProps) {
                                               onMouseDown={(e) => {
                                                 // Use onMouseDown to prevent blur before click
                                                 e.preventDefault();
+                                                const isTon = isTonMaterial(m.unit, m.category, m.name);
                                                 setQtItems(prev => prev.map(i => i.id === item.id ? { 
                                                   ...i, 
                                                   material: m, 
                                                   overridePrice: m.buyPrice,
+                                                  unit: isTon ? 'ton' : 'lb',
+                                                  isDropdownOpen: false,
+                                                  materialSearch: ''
+                                                } : i));
+                                              }}
+                                              onTouchStart={(e) => {
+                                                e.preventDefault();
+                                                const isTon = isTonMaterial(m.unit, m.category, m.name);
+                                                setQtItems(prev => prev.map(i => i.id === item.id ? { 
+                                                  ...i, 
+                                                  material: m, 
+                                                  overridePrice: m.buyPrice,
+                                                  unit: isTon ? 'ton' : 'lb',
+                                                  isDropdownOpen: false,
+                                                  materialSearch: ''
+                                                } : i));
+                                              }}
+                                              onClick={() => {
+                                                const isTon = isTonMaterial(m.unit, m.category, m.name);
+                                                setQtItems(prev => prev.map(i => i.id === item.id ? { 
+                                                  ...i, 
+                                                  material: m, 
+                                                  overridePrice: m.buyPrice,
+                                                  unit: isTon ? 'ton' : 'lb',
                                                   isDropdownOpen: false,
                                                   materialSearch: ''
                                                 } : i));
@@ -2559,7 +2818,16 @@ export default function Dashboard({ profile }: DashboardProps) {
                                             >
                                               <div className="flex items-center justify-between gap-2">
                                                 <span className="text-xs font-bold text-slate-900">{m.code} - {m.name}</span>
-                                                <span className="text-[10px] font-bold text-blue-600">${m.buyPrice.toFixed(2)}</span>
+                                                <div className="flex items-center gap-1.5 shrink-0">
+                                                  <PricingUnitBadge 
+                                                    unit={m.unit}
+                                                    category={m.category}
+                                                    materialName={m.name}
+                                                    price={m.buyPrice}
+                                                    size="xs"
+                                                  />
+                                                  <span className="text-[10px] font-bold text-blue-600">${m.buyPrice.toFixed(2)}</span>
+                                                </div>
                                               </div>
                                               <span className="text-[10px] text-slate-400 uppercase tracking-wider">{m.category}</span>
                                             </button>
@@ -2610,7 +2878,19 @@ export default function Dashboard({ profile }: DashboardProps) {
                                   />
                                 </div>
                                 <div className="space-y-2">
-                                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Price ($/lb)</label>
+                                  <div className="flex items-center justify-between gap-1">
+                                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest truncate">
+                                      {isTonMaterial(item.unit || item.material?.unit, item.material?.category, item.material?.name) ? 'Price ($/NT)' : 'Price ($/lb)'}
+                                    </label>
+                                    {item.material && (
+                                      <PricingUnitBadge 
+                                        unit={item.unit || item.material.unit} 
+                                        category={item.material.category} 
+                                        materialName={item.material.name}
+                                        size="xs"
+                                      />
+                                    )}
+                                  </div>
                                   <input 
                                     type="number"
                                     step="0.01"
@@ -2626,7 +2906,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                                           material: null, 
                                           gross: 0, 
                                           tare: 0, 
-                                          deduction: 0,
+                                          deduction: 0, 
                                           materialSearch: '', 
                                           isDropdownOpen: true 
                                         }]);
@@ -2637,36 +2917,67 @@ export default function Dashboard({ profile }: DashboardProps) {
                               </div>
                             </div>
                             
-                            <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-200">
-                              <div className="flex items-center gap-3">
-                                <div className="flex items-center gap-2">
-                                  <ScaleCaptureButton 
-                                    onCapture={(weight, photoUrl) => setQtItems(prev => prev.map(i => i.id === item.id ? { ...i, gross: weight, photoUrl } : i))} 
-                                  />
-                                  {item.photoUrl && (
-                                    <div className="w-8 h-8 rounded-lg border border-slate-200 overflow-hidden shadow-sm hover:scale-[3] transition-transform cursor-zoom-in z-20 bg-white origin-left">
-                                      <img 
-                                        src={item.photoUrl} 
-                                        alt="Material" 
-                                        className="w-full h-full object-cover"
-                                        referrerPolicy="no-referrer"
-                                        onError={handleImageError}
+                            {(() => {
+                              const price = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
+                              const effectiveUnit = item.unit || item.material?.unit;
+                              const line = calculateMaterialLineItem(
+                                item.gross,
+                                item.tare,
+                                item.deduction,
+                                price,
+                                effectiveUnit,
+                                item.material?.category,
+                                item.material?.name
+                              );
+                              const isTon = isTonMaterial(effectiveUnit, item.material?.category, item.material?.name);
+                              const rateFormatted = formatUnitPrice(price, effectiveUnit, item.material?.category, item.material?.name);
+                              const tons = line.paidWeightLbs / 2000;
+                              const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
+                              return (
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-xs pt-2 border-t border-slate-200">
+                                  <div className="flex items-center gap-3">
+                                    <div className="flex items-center gap-2">
+                                      <ScaleCaptureButton 
+                                        onCapture={(weight, photoUrl) => setQtItems(prev => prev.map(i => i.id === item.id ? { ...i, gross: weight, photoUrl } : i))} 
                                       />
+                                      {item.photoUrl && (
+                                        <div className="w-8 h-8 rounded-lg border border-slate-200 overflow-hidden shadow-sm hover:scale-[3] transition-transform cursor-zoom-in z-20 bg-white origin-left">
+                                          <img 
+                                            src={item.photoUrl} 
+                                            alt="Material" 
+                                            className="w-full h-full object-cover"
+                                            referrerPolicy="no-referrer"
+                                            onError={handleImageError}
+                                          />
+                                        </div>
+                                      )}
                                     </div>
-                                  )}
+                                    <div className="flex flex-wrap gap-x-3 gap-y-1 border-l border-slate-200 pl-3 text-slate-500 items-center">
+                                      <span>Net: <span className="font-bold text-slate-900">{line.netWeight} lb</span></span>
+                                      {(item.deduction || 0) > 0 && (
+                                        <span className="text-red-500">Deduc: <span className="font-bold">-{item.deduction} lb</span></span>
+                                      )}
+                                      <span>Paid: <span className="font-bold text-slate-900">{line.paidWeightLbs} lb {isTon ? `(${tonsStr} NT)` : ''}</span></span>
+                                      <span>Rate: <span className="font-bold text-slate-900">{rateFormatted}</span></span>
+                                      {item.material && (
+                                        <span className={cn(
+                                          "px-1.5 py-0.5 rounded text-[10px] font-extrabold uppercase border",
+                                          isTon 
+                                            ? "bg-indigo-50 text-indigo-700 border-indigo-200" 
+                                            : "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                        )}>
+                                          {isTon ? 'Ton Calc' : 'Pound Calc'}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <span className="font-black text-blue-600 text-sm whitespace-nowrap">
+                                    Subtotal: ${line.totalAmount.toFixed(2)}
+                                  </span>
                                 </div>
-                                <div className="flex gap-4 border-l border-slate-200 pl-3">
-                                  <span className="text-slate-500">Net: <span className="font-bold text-slate-900">{roundNetWeight(Math.max(0, item.gross - item.tare))} lb</span></span>
-                                  <span className="text-slate-500">Unit Price: <span className="font-bold text-slate-900">${(item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0)).toFixed(2)}</span></span>
-                                </div>
-                              </div>
-                              <span className="font-black text-blue-600 text-sm">Subtotal: ${(() => {
-                                const physicalNet = roundNetWeight(Math.max(0, item.gross - item.tare));
-                                const paidWeight = Math.max(0, physicalNet - (item.deduction || 0));
-                                const price = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
-                                return (paidWeight * price).toFixed(2);
-                              })()}</span>
-                            </div>
+                              );
+                            })()}
                           </div>
                         ))}
                       </div>
@@ -3497,34 +3808,47 @@ export default function Dashboard({ profile }: DashboardProps) {
                               <div className="p-6 bg-white rounded-3xl border border-slate-200 shadow-sm space-y-4">
                                 <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">Materials Summary</p>
                                 <div className="space-y-2 max-h-[200px] overflow-y-auto pr-2 custom-scrollbar">
-                                  {qtItems.map((item, idx) => (
-                                    <div key={item.id} className={cn(
-                                      "flex items-center justify-between p-3 rounded-xl border transition-all",
-                                      (!item.material || (item.gross - item.tare) <= 0) ? "bg-red-50 border-red-200" : "bg-white border-slate-100"
-                                    )}>
-                                      <div className="flex items-center gap-3">
-                                        <span className="w-6 h-6 bg-slate-100 text-slate-500 rounded-full flex items-center justify-center text-[10px] font-bold">
-                                          {idx + 1}
-                                        </span>
-                                        <div>
-                                          <p className={cn("font-bold text-sm", !item.material && "text-red-500 italic")}>
-                                            {item.material?.name || 'Missing Material'}
-                                          </p>
-                                          <p className="text-[10px] text-slate-400">
-                                            {roundNetWeight(Math.max(0, item.gross - item.tare))} lb @ ${(item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0)).toFixed(2)}/lb
-                                          </p>
+                                  {qtItems.map((item, idx) => {
+                                    const price = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
+                                    const line = calculateMaterialLineItem(
+                                      item.gross,
+                                      item.tare,
+                                      item.deduction,
+                                      price,
+                                      item.material?.unit,
+                                      item.material?.category,
+                                      item.material?.name
+                                    );
+                                    const isTon = isTonMaterial(item.material?.unit, item.material?.category, item.material?.name);
+                                    const rateFormatted = formatUnitPrice(price, item.material?.unit, item.material?.category, item.material?.name);
+                                    const tons = line.paidWeightLbs / 2000;
+                                    const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
+                                    return (
+                                      <div key={item.id} className={cn(
+                                        "flex items-center justify-between p-3 rounded-xl border transition-all",
+                                        (!item.material || (item.gross - item.tare) <= 0) ? "bg-red-50 border-red-200" : "bg-white border-slate-100"
+                                      )}>
+                                        <div className="flex items-center gap-3">
+                                          <span className="w-6 h-6 bg-slate-100 text-slate-500 rounded-full flex items-center justify-center text-[10px] font-bold">
+                                            {idx + 1}
+                                          </span>
+                                          <div>
+                                            <p className={cn("font-bold text-sm", !item.material && "text-red-500 italic")}>
+                                              {item.material?.name || 'Missing Material'}
+                                            </p>
+                                            <p className="text-[10px] text-slate-400">
+                                              {line.paidWeightLbs} lb {isTon ? `(${tonsStr} NT) ` : ''}@ {rateFormatted}
+                                              {(item.deduction || 0) > 0 ? ` (Deduc: -${item.deduction} lb)` : ''}
+                                            </p>
+                                          </div>
                                         </div>
+                                        <p className="font-black text-slate-900">
+                                          ${line.totalAmount.toFixed(2)}
+                                        </p>
                                       </div>
-                                      <p className="font-black text-slate-900">
-                                        ${(() => {
-                                          const physicalNet = roundNetWeight(Math.max(0, item.gross - item.tare));
-                                          const paidWeight = Math.max(0, physicalNet - (item.deduction || 0));
-                                          const price = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
-                                          return (paidWeight * price).toFixed(2);
-                                        })()}
-                                      </p>
-                                    </div>
-                                  ))}
+                                    );
+                                  })}
                                 </div>
 
                                 <div className="pt-8 border-t border-slate-200 flex justify-between items-center">
@@ -3657,16 +3981,27 @@ export default function Dashboard({ profile }: DashboardProps) {
                 <div className="space-y-3">
                   <div className="flex justify-between gap-4">
                     <span className="text-slate-500 uppercase text-[10px] font-bold">Customer</span>
-                    <span className="text-right font-bold">{qtCustomer?.name || qtNewCustomer.name || 'N/A'}</span>
+                    <span className="text-right font-bold">{printedTicket?.customerName || qtCustomer?.name || qtNewCustomer.name || 'N/A'}</span>
                   </div>
                   
                   <div className="border-t border-slate-100 pt-3 space-y-2">
                     <p className="text-[10px] font-bold text-slate-400 uppercase">Items</p>
-                    {qtItems.map((item, idx) => {
-                      const physicalNet = Math.max(0, item.gross - item.tare);
-                      const paidWeight = Math.max(0, physicalNet - (item.deduction || 0));
+                    {(printedTicket ? printedTicket.items : qtItems).map((item, idx) => {
+                      const isTon = isTonMaterial(item.material?.unit, item.material?.category, item.material?.name);
                       const finalPrice = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
-                      const itemTotal = paidWeight * finalPrice;
+                      const line = calculateMaterialLineItem(
+                        item.gross,
+                        item.tare,
+                        item.deduction,
+                        finalPrice,
+                        item.material?.unit,
+                        item.material?.category,
+                        item.material?.name
+                      );
+                      const rateFormatted = formatUnitPrice(finalPrice, item.material?.unit, item.material?.category, item.material?.name);
+                      const tons = line.paidWeightLbs / 2000;
+                      const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
                       return (
                         <div key={item.id} className="space-y-1 border-b border-slate-50 pb-2 last:border-0" id={`print-item-${item.id}`}>
                           <div className="flex justify-between gap-4 text-[11px]">
@@ -3675,12 +4010,15 @@ export default function Dashboard({ profile }: DashboardProps) {
                               <span className="font-bold">{item.material?.name || 'N/A'}</span>
                             </div>
                             <div className="text-right font-bold">
-                              ${itemTotal.toFixed(2)}
+                              ${line.totalAmount.toFixed(2)}
                             </div>
                           </div>
                           <div className="flex justify-between text-[9px] text-slate-500 pl-5">
-                            <span>{paidWeight} lb</span>
-                            <span>@ ${finalPrice.toFixed(2)}/lb</span>
+                            <span>
+                              {line.paidWeightLbs} lb
+                              {isTon ? ` (${tonsStr} NT)` : ''}
+                            </span>
+                            <span>@ {rateFormatted}</span>
                           </div>
                           {item.deduction ? (
                             <p className="text-[9px] text-red-500 pl-5">Deduction: -{item.deduction} lb</p>
@@ -3692,11 +4030,11 @@ export default function Dashboard({ profile }: DashboardProps) {
 
                   <div className="flex justify-between gap-4 text-base border-t border-slate-900 pt-3 mt-4">
                     <span className="font-black uppercase">Total Net Weight</span>
-                    <span className="font-black">{netWeight} lb</span>
+                    <span className="font-black">{printedTicket ? printedTicket.netWeight : netWeight} lb</span>
                   </div>
                   <div className="flex justify-between gap-4 text-xl border-t-2 border-slate-900 pt-4 mt-4">
                     <span className="font-black uppercase">Total Payout</span>
-                    <span className="font-black">${totalAmount.toFixed(2)}</span>
+                    <span className="font-black">${(printedTicket ? printedTicket.totalAmount : totalAmount).toFixed(2)}</span>
                   </div>
                 </div>
                 
@@ -3707,8 +4045,8 @@ export default function Dashboard({ profile }: DashboardProps) {
                     </p>
                   </div>
                   <div className="pt-2 border-slate-300 w-full flex flex-col items-center">
-                    {qtSignatureUrl ? (
-                      <img src={qtSignatureUrl} alt="Signature" className="h-16 object-contain" />
+                    {(printedTicket?.signatureUrl || qtSignatureUrl) ? (
+                      <img src={printedTicket?.signatureUrl || qtSignatureUrl} alt="Signature" className="h-16 object-contain" />
                     ) : (
                       <div className="pt-8 border-b border-slate-300 w-full"></div>
                     )}
@@ -3718,7 +4056,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                 
                 <div className="mt-12 pt-8 border-t border-dashed border-slate-300 text-center space-y-2">
                   <p className="text-[10px] text-slate-400">Thank you for your business.</p>
-                  <p className="text-[10px] font-bold text-slate-900">TICKET ID: {Math.random().toString(36).substr(2, 9).toUpperCase()}</p>
+                  <p className="text-[10px] font-bold text-slate-900">TICKET ID: {(printedTicket?.id || qtCreatedTicketId || Math.random().toString(36).substr(2, 9)).toUpperCase()}</p>
                   <div className="flex justify-center gap-1 pt-2">
                     {[...Array(20)].map((_, i) => (
                       <div key={i} className="w-1 h-4 bg-slate-900" style={{ opacity: Math.random() * 0.5 + 0.5 }}></div>
@@ -3739,21 +4077,45 @@ export default function Dashboard({ profile }: DashboardProps) {
                 onClick={async () => {
                   setShowPrintPreview(false);
                   await new Promise(r => setTimeout(r, 150));
-                  const tempTicket: BuyTicket = {
+                  const ticketToPrint: BuyTicket = printedTicket ? {
+                    id: printedTicket.id,
+                    customerId: printedTicket.customerId,
+                    materials: printedTicket.materials,
+                    totalAmount: printedTicket.totalAmount,
+                    status: 'completed',
+                    timestamp: printedTicket.timestamp,
+                    paymentMethod: printedTicket.paymentMethod,
+                    customerPhotoUrl: printedTicket.customerPhotoUrl,
+                    vehiclePhotoUrl: printedTicket.vehiclePhotoUrl,
+                    loadPhotoUrl: printedTicket.loadPhotoUrl,
+                    idImageUrl: printedTicket.idImageUrl,
+                    vehiclePlate: printedTicket.vehiclePlate,
+                    vehicleType: printedTicket.vehicleType,
+                    signatureUrl: printedTicket.signatureUrl
+                  } : {
                     id: qtCreatedTicketId || 'QUICK',
                     customerId: qtCustomer?.id || 'new',
                     materials: qtItems.map(item => {
-                      const physicalNet = Math.max(0, item.gross - item.tare);
-                      const paidWeight = Math.max(0, physicalNet - (item.deduction || 0));
                       const price = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
+                      const isTon = isTonMaterial(item.material?.unit, item.material?.category, item.material?.name);
+                      const line = calculateMaterialLineItem(
+                        item.gross,
+                        item.tare,
+                        item.deduction,
+                        price,
+                        item.material?.unit,
+                        item.material?.category,
+                        item.material?.name
+                      );
                       return {
                         materialId: item.material?.id || '',
                         grossWeight: item.gross,
                         tareWeight: item.tare,
-                        netWeight: physicalNet,
+                        netWeight: line.netWeight,
                         pricePerUnit: price,
-                        totalAmount: paidWeight * price,
-                        deductionWeight: item.deduction || 0
+                        totalAmount: line.totalAmount,
+                        deductionWeight: item.deduction || 0,
+                        unit: isTon ? 'ton' : 'lb'
                       };
                     }),
                     totalAmount: totalAmount || 0,
@@ -3770,8 +4132,8 @@ export default function Dashboard({ profile }: DashboardProps) {
 
                   await printTicket(
                     <BuyTicketPrint 
-                      ticket={tempTicket} 
-                      customerName={qtCustomer?.name || qtNewCustomer.name || 'N/A'} 
+                      ticket={ticketToPrint} 
+                      customerName={printedTicket?.customerName || qtCustomer?.name || qtNewCustomer.name || 'N/A'} 
                       materials={materials} 
                       format={settings.receiptFormat}
                     />,
@@ -3809,15 +4171,30 @@ export default function Dashboard({ profile }: DashboardProps) {
           <div className="border-t border-black pt-4 space-y-2">
             <p className="text-xs font-bold uppercase">Items</p>
             {qtItems.map((item, idx) => {
-              const physicalNet = roundNetWeight(Math.max(0, item.gross - item.tare));
-              const paidWeight = Math.max(0, physicalNet - (item.deduction || 0));
               const price = item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || 0);
+              const isTon = isTonMaterial(item.material?.unit, item.material?.category, item.material?.name);
+              const line = calculateMaterialLineItem(
+                item.gross,
+                item.tare,
+                item.deduction,
+                price,
+                item.material?.unit,
+                item.material?.category,
+                item.material?.name
+              );
+              const rateFormatted = formatUnitPrice(price, item.material?.unit, item.material?.category, item.material?.name);
+              const tons = line.paidWeightLbs / 2000;
+              const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
               return (
                 <div key={item.id} className="flex justify-between text-sm">
                   <span>{idx + 1}. {item.material?.name}</span>
                   <div className="text-right">
-                    <span>{paidWeight} lb @ ${price.toFixed(2)}</span>
-                    <p className="font-bold">${(paidWeight * price).toFixed(2)}</p>
+                    <span>
+                      {line.paidWeightLbs} lb
+                      {isTon ? ` (${tonsStr} NT)` : ''} @ {rateFormatted}
+                    </span>
+                    <p className="font-bold">${line.totalAmount.toFixed(2)}</p>
                   </div>
                 </div>
               );

@@ -2,6 +2,7 @@ import React from 'react';
 import { BuyTicket, Material } from '../types';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE } from '../constants';
 import { useSettings } from '../context/SettingsContext';
+import { isTonMaterial, formatUnitPrice, calculateMaterialLineItem } from '../lib/scrapPricing';
 
 interface BuyTicketPrintProps {
   ticket: BuyTicket;
@@ -81,10 +82,19 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
   );
 
   const calculatedTotalAmount = ticketMaterials.reduce((sum, item) => {
-    const paidWeight = Math.max(0, (item.netWeight || 0) - (item.deductionWeight || 0));
+    const material = materials.find((m) => m.id === item.materialId);
+    const line = calculateMaterialLineItem(
+      item.grossWeight,
+      item.tareWeight,
+      item.deductionWeight,
+      item.pricePerUnit,
+      item.unit || material?.unit,
+      material?.category,
+      material?.name
+    );
     const itemTotal = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0)
       ? item.totalAmount
-      : (paidWeight * (item.pricePerUnit || 0));
+      : line.totalAmount;
     return sum + itemTotal;
   }, 0);
 
@@ -354,7 +364,24 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
           
           {ticketMaterials.map((item, index) => {
             const material = materials.find((m) => m.id === item.materialId);
-            const displayNetWeight = item.netWeight - (item.deductionWeight || 0);
+            const isTon = isTonMaterial(item.unit || material?.unit, material?.category, material?.name);
+            const line = calculateMaterialLineItem(
+              item.grossWeight,
+              item.tareWeight,
+              item.deductionWeight,
+              item.pricePerUnit,
+              item.unit || material?.unit,
+              material?.category,
+              material?.name
+            );
+            const displayNetWeight = line.paidWeightLbs;
+            const itemTotalAmount = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0) 
+              ? item.totalAmount 
+              : line.totalAmount;
+            const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
+            const tons = displayNetWeight / 2000;
+            const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
             return (
               <div key={index} style={itemContainerStyle}>
                 <div style={{ fontWeight: 'bold', marginBottom: '2px' }}>
@@ -363,7 +390,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
                 
                 <div style={itemLineStyle}>
                   <span>Gross Wt:</span>
-                  <span>{item.netWeight ?? '0'} lb</span>
+                  <span>{item.netWeight ?? line.netWeight} lb</span>
                 </div>
                 {(item.deductionWeight || 0) > 0 && (
                   <div style={itemLineStyle}>
@@ -373,9 +400,15 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
                 )}
                 
                 <div style={itemLineStyle}>
-                  <span>{displayNetWeight} lb @ ${(item.pricePerUnit || 0).toFixed(2)}/lb</span>
+                  <span>
+                    {isTon ? (
+                      `${displayNetWeight.toLocaleString()} lb (${tonsStr} NT) @ ${rateFormatted}`
+                    ) : (
+                      `${displayNetWeight.toLocaleString()} lb @ ${rateFormatted}`
+                    )}
+                  </span>
                   <span style={{ fontWeight: 'bold' }}>
-                    ${((item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0) ? item.totalAmount : (displayNetWeight * (item.pricePerUnit || 0))).toFixed(2)}
+                    ${itemTotalAmount.toFixed(2)}
                   </span>
                 </div>
                 
@@ -388,7 +421,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
           <div style={totalsContainerStyle}>
             <div style={itemLineStyle}>
               <span>TOTAL WEIGHT:</span>
-              <span>{totalNetWeight} lb</span>
+              <span>{totalNetWeight.toLocaleString()} lb</span>
             </div>
             <div style={{ ...itemLineStyle, fontSize: '16px', fontWeight: 'bold', marginTop: '4px', paddingTop: '4px', borderTop: '2px dashed #000' }}>
               <span>TOTAL PAYOUT:</span>
@@ -403,28 +436,51 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
               <th style={thStyle}># Item / Material</th>
               <th style={thRightStyle}>Net Weight (lb)</th>
               <th style={thRightStyle}>Deductions (lb)</th>
-              <th style={thRightStyle}>Paid Weight (lb)</th>
-              <th style={thRightStyle}>Price/lb</th>
+              <th style={thRightStyle}>Paid Weight</th>
+              <th style={thRightStyle}>Price / Rate</th>
               <th style={thRightStyle}>Total Payout</th>
             </tr>
           </thead>
           <tbody>
             {ticketMaterials.map((item, index) => {
               const material = materials.find((m) => m.id === item.materialId);
-              const displayNetWeight = (item.netWeight || 0) - (item.deductionWeight || 0);
+              const isTon = isTonMaterial(item.unit || material?.unit, material?.category, material?.name);
+              const line = calculateMaterialLineItem(
+                item.grossWeight,
+                item.tareWeight,
+                item.deductionWeight,
+                item.pricePerUnit,
+                item.unit || material?.unit,
+                material?.category,
+                material?.name
+              );
+              const displayNetWeight = line.paidWeightLbs;
               const itemTotalAmount = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0) 
                 ? item.totalAmount 
-                : (displayNetWeight * (item.pricePerUnit || 0));
+                : line.totalAmount;
+              const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
+              const tons = displayNetWeight / 2000;
+              const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
               return (
                 <tr key={index}>
                   <td style={tdStyle}>
                     <div><strong>{material?.code ? `[${material.code}] ` : ''}{material?.name || 'N/A'}</strong></div>
                     {item.notes && <div style={{ fontSize: '10px', color: '#666666', fontStyle: 'italic' }}>Note: {item.notes}</div>}
                   </td>
-                  <td style={tdRightStyle}>{item.netWeight ?? '0'}</td>
+                  <td style={tdRightStyle}>{item.netWeight ?? line.netWeight}</td>
                   <td style={tdRightStyle}>{item.deductionWeight || '0'}</td>
-                  <td style={tdRightStyle}><strong>{displayNetWeight} lb</strong></td>
-                  <td style={tdRightStyle}>${(item.pricePerUnit || 0).toFixed(2)}</td>
+                  <td style={tdRightStyle}>
+                    <strong>{displayNetWeight.toLocaleString()} lb</strong>
+                    {isTon && (
+                      <div style={{ fontSize: '11px', color: '#444444' }}>
+                        ({tonsStr} NT)
+                      </div>
+                    )}
+                  </td>
+                  <td style={tdRightStyle}>
+                    <span style={{ fontWeight: 'bold' }}>{rateFormatted}</span>
+                  </td>
                   <td style={tdRightStyle}><strong>${itemTotalAmount.toFixed(2)}</strong></td>
                 </tr>
               );
@@ -433,7 +489,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
             {/* Totals Section */}
             <tr style={totalRowStyle}>
               <td colSpan={3} style={totalTdStyle}>TOTALS</td>
-              <td style={totalTdRightStyle}>{totalNetWeight} lb</td>
+              <td style={totalTdRightStyle}>{totalNetWeight.toLocaleString()} lb</td>
               <td style={totalTdStyle}></td>
               <td style={totalTdRightStyle}>${finalTotalAmount.toFixed(2)}</td>
             </tr>

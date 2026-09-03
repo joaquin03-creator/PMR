@@ -29,6 +29,7 @@ import { cn } from './lib/utils';
 
 import { SettingsProvider } from './context/SettingsContext';
 import { ToastProvider } from './context/ToastContext';
+import { QuickTicketProvider } from './context/QuickTicketContext';
 
 const ALLOWED_ADMIN_EMAILS = [
   'tiffany@preferredmetalsrecycling.com',
@@ -766,7 +767,8 @@ export default function App() {
     <ErrorBoundary>
       <SettingsProvider>
         <ToastProvider>
-          <Router>
+          <QuickTicketProvider>
+            <Router>
           <div className="relative min-h-screen">
             {/* Announcement Banner */}
             {systemConfig?.announcement?.active && (
@@ -839,6 +841,7 @@ export default function App() {
             </Routes>
           </div>
         </Router>
+          </QuickTicketProvider>
       </ToastProvider>
     </SettingsProvider>
   </ErrorBoundary>

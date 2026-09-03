@@ -46,6 +46,8 @@ import { BuyTicketPrint } from './BuyTicketPrint';
 import { logAuditEvent } from '../lib/audit';
 import { roundNetWeight } from '../lib/weightUtils';
 import { isCatalyticConverterMat, checkCatalyticConverterLimit } from '../lib/catalyticUtils';
+import { calculateMaterialLineItem, isTonMaterial, formatUnitPrice, getRateUnitLabel } from '../lib/scrapPricing';
+import { PricingUnitBadge } from './PricingUnitBadge';
 
 const normalizeName = (name: string) =>
   name.toLowerCase().replace(/[^a-z\s]/g, '').replace(/\s+/g, ' ').trim();
@@ -289,6 +291,24 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
   const [success, setQtSuccess] = useState(false);
   const [qtVerificationStatus, setQtVerificationStatus] = useState<'idle' | 'verifying' | 'verified' | 'failed' | 'offline-saved'>('idle');
   const [lastCreatedTicket, setLastCreatedTicket] = useState<BuyTicket | null>(null);
+  const [printedTicket, setPrintedTicket] = useState<{
+    id: string;
+    customerId: string;
+    customerName: string;
+    materials: BuyTicketMaterial[];
+    items: typeof items;
+    totalAmount: number;
+    netWeight: number;
+    timestamp: string;
+    paymentMethod: 'cash' | 'check' | 'other' | 'eft';
+    vehiclePlate?: string;
+    vehicleType?: string;
+    signatureUrl?: string;
+    customerPhotoUrl?: string;
+    vehiclePhotoUrl?: string;
+    loadPhotoUrl?: string;
+    idImageUrl?: string;
+  } | null>(null);
   const [showPrintPreview, setShowPrintPreview] = useState(false);
   const [isPreviewOnly, setIsPreviewOnly] = useState(false);
   const [idCheckResult, setIdCheckResult] = useState<{ prohibited: boolean, reason?: string } | null>(null);
@@ -517,7 +537,8 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
         totalAmount: item.totalAmount,
         deductionWeight: item.deductionWeight,
         deductionReason: item.deductionReason,
-        notes: item.notes
+        notes: item.notes,
+        unit: (isTonMaterial(item.unit || item.material?.unit, item.material?.category, item.material?.name) ? 'ton' : 'lb')
       })),
       totalAmount,
       status: 'completed',
@@ -530,10 +551,16 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
   };
 
   const calculateItem = (item: typeof items[0]) => {
-    const physicalNet = roundNetWeight(Math.max(0, item.grossWeight - item.tareWeight));
-    const paidWeight = Math.max(0, physicalNet - (item.deductionWeight || 0));
-    const total = Math.round((paidWeight * item.pricePerUnit) * 100) / 100;
-    return { ...item, netWeight: physicalNet, totalAmount: total };
+    const line = calculateMaterialLineItem(
+      item.grossWeight,
+      item.tareWeight,
+      item.deductionWeight,
+      item.pricePerUnit,
+      item.unit || item.material?.unit,
+      item.material?.category,
+      item.material?.name
+    );
+    return { ...item, netWeight: line.netWeight, totalAmount: line.totalAmount };
   };
 
   const addItem = () => {
@@ -544,10 +571,14 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       grossWeight: 0, 
       tareWeight: 0, 
       netWeight: 0, 
+      deductionWeight: 0,
+      deductionReason: '',
+      notes: '',
       pricePerUnit: 0, 
       totalAmount: 0,
       materialSearch: '',
-      isDropdownOpen: false
+      isDropdownOpen: false,
+      unit: undefined
     }]);
   };
 
@@ -561,10 +592,11 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
     setItems(prev => prev.map(i => {
       if (i.id === id) {
         const updated = { ...i, ...updates };
-        // If material changed, update price
+        // If material changed, update price and default unit
         if (updates.material) {
           updated.materialId = updates.material.id;
           updated.pricePerUnit = updates.material.buyPrice;
+          updated.unit = updates.material.unit as 'lb' | 'ton' | undefined;
         }
         return calculateItem(updated);
       }
@@ -716,7 +748,8 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
           tareWeight: item.tareWeight,
           netWeight: item.netWeight,
           pricePerUnit: item.pricePerUnit,
-          totalAmount: item.totalAmount
+          totalAmount: item.totalAmount,
+          unit: (isTonMaterial(item.unit || item.material?.unit, item.material?.category, item.material?.name) ? 'ton' : 'lb')
         };
         
         if (item.deductionWeight !== undefined) material.deductionWeight = item.deductionWeight;
@@ -727,10 +760,12 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
         return material;
       });
 
+      const calculatedFinalTotal = Math.round(ticketMaterials.reduce((sum, item) => sum + (item.totalAmount || 0), 0) * 100) / 100;
+
       const ticketData: Omit<BuyTicket, 'id'> = {
         customerId,
         materials: ticketMaterials,
-        totalAmount,
+        totalAmount: calculatedFinalTotal,
         status: 'completed',
         timestamp: ticketDetails.customTimestamp ? new Date(ticketDetails.customTimestamp).toISOString() : new Date().toISOString(),
         businessName: bName,
@@ -818,6 +853,30 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
           }
         }
       }
+      const customerName = selectedCustomer?.name || newCustomer.name || 'Unknown Customer';
+      const totalNetWeight = ticketMaterials.reduce((sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 0);
+
+      const ticketSnapshot = {
+        id: docRef.id,
+        customerId,
+        customerName,
+        materials: ticketMaterials,
+        items: [...items],
+        totalAmount: calculatedFinalTotal,
+        netWeight: totalNetWeight,
+        timestamp: ticketData.timestamp,
+        paymentMethod: (ticketData.paymentMethod || 'cash') as 'cash' | 'check' | 'other' | 'eft',
+        vehiclePlate: ticketData.vehiclePlate || '',
+        vehicleType: ticketData.vehicleType || '',
+        signatureUrl: ticketData.signatureUrl || '',
+        customerPhotoUrl: ticketData.customerPhotoUrl || '',
+        vehiclePhotoUrl: ticketData.vehiclePhotoUrl || '',
+        loadPhotoUrl: ticketData.loadPhotoUrl || '',
+        idImageUrl: ticketData.idImageUrl || '',
+      };
+
+      // 1. Capture snapshot FIRST
+      setPrintedTicket(ticketSnapshot);
       setLastCreatedTicket({ id: docRef.id, ...ticketData });
 
       // Update Inventory
@@ -922,8 +981,8 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       setDbHistoryAlert({
         isOpen: true,
         ticketId: docRef.id,
-        customerName: selectedCustomer?.name || newCustomer.name || 'Unknown Customer',
-        totalAmount: totalAmount || 0,
+        customerName,
+        totalAmount: calculatedFinalTotal,
         timestamp: new Date().toISOString()
       });
     } catch (error) {
@@ -952,6 +1011,7 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
     setQtSuccess(false);
     setQtVerificationStatus('idle');
     setLastCreatedTicket(null);
+    setPrintedTicket(null);
     setShowPrintPreview(false);
     setIdCheckResult(null);
   };
@@ -1037,18 +1097,20 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                 </div>
                 <div className="grid grid-cols-2 gap-y-3 text-sm">
                   <span className="text-slate-400">Verified Ticket ID:</span>
-                  <span className="font-mono font-bold text-right text-slate-800 break-all">{lastCreatedTicket?.id || 'Writing to DB...'}</span>
+                  <span className="font-mono font-bold text-right text-slate-800 break-all">{printedTicket?.id || lastCreatedTicket?.id || 'Writing to DB...'}</span>
                   
                   <span className="text-slate-400">Customer:</span>
-                  <span className="font-bold text-right text-slate-800">{selectedCustomer?.name || newCustomer.name || 'Unknown'}</span>
+                  <span className="font-bold text-right text-slate-800">{printedTicket?.customerName || selectedCustomer?.name || newCustomer.name || 'Unknown'}</span>
                   
                   <span className="text-slate-400">Total Net Weight:</span>
                   <span className="font-bold text-right text-slate-800">
-                    {items.reduce((sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 0)} lb
+                    {printedTicket ? `${printedTicket.netWeight} lb` : `${items.reduce((sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 0)} lb`}
                   </span>
                   
                   <span className="text-slate-400">Total Payout:</span>
-                  <span className="font-mono font-black text-right text-green-600">${totalAmount.toFixed(2)}</span>
+                  <span className="font-mono font-black text-right text-green-600">
+                    ${(printedTicket?.totalAmount ?? (lastCreatedTicket?.totalAmount ?? totalAmount)).toFixed(2)}
+                  </span>
                 </div>
               </div>
 
@@ -1601,7 +1663,17 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                     {items.map((item, index) => (
                       <div key={item.id} className="p-6 bg-slate-50 rounded-2xl border border-slate-200 space-y-6 relative group">
                         <div className="flex items-center justify-between">
-                          <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Item #{index + 1}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Item #{index + 1}</span>
+                            {item.material && (
+                              <PricingUnitBadge 
+                                unit={item.unit || item.material.unit}
+                                category={item.material.category}
+                                materialName={item.material.name}
+                                size="sm"
+                              />
+                            )}
+                          </div>
                         {items.length > 1 && (
                           <button 
                             onClick={() => removeItem(item.id)}
@@ -1640,34 +1712,9 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                                 }}
                                 onFocus={() => updateItem(item.id, { isDropdownOpen: true })}
                                 onBlur={() => {
-                                  // Delay to allow onMouseDown/onTouchStart to fire first
                                   setTimeout(() => {
-                                    setItems(currentItems => currentItems.map(i => {
-                                      if (i.id === item.id) {
-                                        if (i.isDropdownOpen) {
-                                          const search = (i.materialSearch || '').toLowerCase();
-                                          if (search && !i.material) {
-                                            const filtered = materials.filter(m => 
-                                              m.name.toLowerCase().includes(search) || 
-                                              m.code.toLowerCase().includes(search)
-                                            );
-                                            if (filtered.length > 0) {
-                                              return {
-                                                ...i,
-                                                material: filtered[0],
-                                                materialSearch: '',
-                                                isDropdownOpen: false,
-                                                materialId: filtered[0].id,
-                                                pricePerUnit: filtered[0].buyPrice
-                                              };
-                                            }
-                                          }
-                                          return { ...i, isDropdownOpen: false };
-                                        }
-                                      }
-                                      return i;
-                                    }));
-                                  }, 150);
+                                    updateItem(item.id, { isDropdownOpen: false });
+                                  }, 200);
                                 }}
                                 onKeyDown={(e) => {
                                   if (e.key === 'Tab' || e.key === 'Enter') {
@@ -1736,12 +1783,16 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                                       .map(m => (
                                         <button
                                           key={m.id}
+                                          type="button"
                                           onMouseDown={(e) => {
                                             e.preventDefault();
                                             updateItem(item.id, { material: m, isDropdownOpen: false, materialSearch: '', pricePerUnit: m.buyPrice });
                                           }}
                                           onTouchStart={(e) => {
                                             e.preventDefault();
+                                            updateItem(item.id, { material: m, isDropdownOpen: false, materialSearch: '', pricePerUnit: m.buyPrice });
+                                          }}
+                                          onClick={() => {
                                             updateItem(item.id, { material: m, isDropdownOpen: false, materialSearch: '', pricePerUnit: m.buyPrice });
                                           }}
                                           className="w-full px-4 py-2 text-left text-xs hover:bg-blue-50 transition-colors flex items-center justify-between group"
@@ -1751,9 +1802,17 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                                             <span className="mx-2 text-slate-300">|</span>
                                             <span className="text-slate-600">{m.name}</span>
                                           </div>
-                                          <span className="text-[10px] font-bold text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            ${m.buyPrice.toFixed(2)}
-                                          </span>
+                                          <div className="flex items-center gap-2">
+                                            <PricingUnitBadge 
+                                              unit={m.unit}
+                                              category={m.category}
+                                              materialName={m.name}
+                                              size="xs"
+                                            />
+                                            <span className="text-[10px] font-bold text-blue-600">
+                                              ${m.buyPrice.toFixed(2)} / {m.unit || 'lb'}
+                                            </span>
+                                          </div>
                                         </button>
                                       ))}
                                   </div>
@@ -1797,7 +1856,19 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                             />
                           </div>
                           <div className="space-y-1">
-                            <label className="text-[10px] font-bold text-slate-500 uppercase">Price per lb</label>
+                            <div className="flex items-center justify-between gap-1">
+                              <label className="text-[10px] font-bold text-slate-500 uppercase truncate">
+                                Price per {isTonMaterial(item.unit || item.material?.unit, item.material?.category, item.material?.name) ? 'Ton ($/NT)' : 'lb ($/lb)'}
+                              </label>
+                              {item.material && (
+                                <PricingUnitBadge 
+                                  unit={item.unit || item.material.unit} 
+                                  category={item.material.category} 
+                                  materialName={item.material.name}
+                                  size="xs"
+                                />
+                              )}
+                            </div>
                             <div className="relative">
                               <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                               <input 
@@ -1857,7 +1928,19 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                                 </div>
                               )}
                             </div>
-                            <span className="text-xs font-medium text-slate-500 uppercase border-l border-slate-200 pl-3">Net: <span className="text-slate-900 font-bold">{item.netWeight} lb</span></span>
+                            <span className="text-xs font-medium text-slate-500 uppercase border-l border-slate-200 pl-3">
+                              Net: <span className="text-slate-900 font-bold">{item.netWeight} lb</span>
+                              {(item.deductionWeight || 0) > 0 && (
+                                <span className="ml-1.5 text-[10px] font-bold text-red-600 bg-red-50 px-1.5 py-0.5 rounded border border-red-200">
+                                  Paid: {Math.max(0, item.netWeight - item.deductionWeight).toLocaleString()} lb
+                                </span>
+                              )}
+                              {isTonMaterial(item.unit || item.material?.unit, item.material?.category, item.material?.name) && (
+                                <span className="ml-1.5 text-[10px] font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200">
+                                  {((Math.max(0, item.netWeight - (item.deductionWeight || 0))) / 2000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 })} NT
+                                </span>
+                              )}
+                            </span>
                           </div>
                           <span className="text-sm font-black text-blue-600">${item.totalAmount.toFixed(2)}</span>
                         </div>
@@ -2115,12 +2198,32 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                   <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200">
                     <h5 className="text-[10px] font-bold text-slate-400 uppercase mb-2">Items Summary</h5>
                     <div className="space-y-2 max-h-32 overflow-y-auto custom-scrollbar">
-                      {items.map(item => (
-                        <div key={item.id} className="flex justify-between text-xs border-b border-slate-100 pb-1">
-                          <span className="text-slate-600">{item.material?.name}</span>
-                          <span className="font-bold text-slate-900">{item.netWeight} lb @ ${item.pricePerUnit.toFixed(2)}</span>
-                        </div>
-                      ))}
+                      {items.map(item => {
+                        const effectiveUnit = item.unit || item.material?.unit;
+                        const isTon = isTonMaterial(effectiveUnit, item.material?.category, item.material?.name);
+                        const paidLbs = (item.netWeight || 0) - (item.deductionWeight || 0);
+                        const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, effectiveUnit, item.material?.category, item.material?.name);
+                        const tons = paidLbs / 2000;
+                        const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+                        return (
+                          <div key={item.id} className="flex justify-between items-center text-xs border-b border-slate-100 pb-1">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-slate-600 font-medium">{item.material?.name}</span>
+                              {item.material && (
+                                <PricingUnitBadge 
+                                  unit={effectiveUnit} 
+                                  category={item.material.category} 
+                                  materialName={item.material.name}
+                                  size="xs"
+                                />
+                              )}
+                            </div>
+                            <span className="font-bold text-slate-900">
+                              {paidLbs} lb {isTon ? `(${tonsStr} NT) ` : ''}@ {rateFormatted}
+                            </span>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>
@@ -2316,10 +2419,15 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                     <p className="text-[10px] font-bold text-slate-400 uppercase">Items</p>
                     {(lastCreatedTicket.materials || []).map((item, idx) => {
                       const material = materials.find(m => m.id === item.materialId);
+                      const isTon = isTonMaterial(item.unit || material?.unit, material?.category, material?.name);
                       const displayNetWeight = (item.netWeight || 0) - (item.deductionWeight || 0);
                       const itemTotal = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0)
                         ? item.totalAmount
-                        : (displayNetWeight * (item.pricePerUnit || 0));
+                        : (isTon ? ((displayNetWeight / 2000) * (item.pricePerUnit || 0)) : (displayNetWeight * (item.pricePerUnit || 0)));
+                      const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
+                      const tons = displayNetWeight / 2000;
+                      const tonsStr = tons.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+
                       return (
                         <div key={idx} className="space-y-1 border-b border-slate-50 pb-2 last:border-0">
                           <div className="flex justify-between gap-4 text-[11px]">
@@ -2335,8 +2443,9 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                             <span>
                               {item.netWeight} lb
                               {item.deductionWeight ? ` (Ded: -${item.deductionWeight} lb)` : ''}
+                              {isTon ? ` (${tonsStr} NT)` : ''}
                             </span>
-                            <span>@ ${(item.pricePerUnit || 0).toFixed(2)}/lb</span>
+                            <span>@ {rateFormatted}</span>
                           </div>
                           {item.notes && (
                             <p className="text-[9px] text-slate-400 italic pl-5">Note: {item.notes}</p>
@@ -2358,8 +2467,10 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                       ${((lastCreatedTicket.totalAmount !== undefined && lastCreatedTicket.totalAmount > 0)
                         ? lastCreatedTicket.totalAmount
                         : (lastCreatedTicket.materials || []).reduce((sum, m) => {
+                            const material = materials.find(mat => mat.id === m.materialId);
+                            const isTon = isTonMaterial(m.unit || material?.unit, material?.category, material?.name);
                             const net = (m.netWeight || 0) - (m.deductionWeight || 0);
-                            return sum + (m.totalAmount || (net * (m.pricePerUnit || 0)));
+                            return sum + (m.totalAmount !== undefined && m.totalAmount > 0 ? m.totalAmount : (isTon ? ((net / 2000) * (m.pricePerUnit || 0)) : (net * (m.pricePerUnit || 0))));
                           }, 0)
                       ).toFixed(2)}
                     </span>
@@ -2399,11 +2510,28 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                 onClick={async () => {
                   setShowPrintPreview(false);
                   await new Promise(r => setTimeout(r, 150));
-                  if (lastCreatedTicket) {
+                  const ticketToPrint: BuyTicket | null = printedTicket ? {
+                    id: printedTicket.id,
+                    customerId: printedTicket.customerId,
+                    materials: printedTicket.materials,
+                    totalAmount: printedTicket.totalAmount,
+                    status: 'completed',
+                    timestamp: printedTicket.timestamp,
+                    paymentMethod: printedTicket.paymentMethod,
+                    vehiclePlate: printedTicket.vehiclePlate,
+                    vehicleType: printedTicket.vehicleType,
+                    signatureUrl: printedTicket.signatureUrl,
+                    customerPhotoUrl: printedTicket.customerPhotoUrl,
+                    vehiclePhotoUrl: printedTicket.vehiclePhotoUrl,
+                    loadPhotoUrl: printedTicket.loadPhotoUrl,
+                    idImageUrl: printedTicket.idImageUrl,
+                  } : lastCreatedTicket;
+
+                  if (ticketToPrint) {
                     await printTicket(
                       <BuyTicketPrint 
-                        ticket={lastCreatedTicket} 
-                        customerName={getCustomerName(lastCreatedTicket.customerId)} 
+                        ticket={ticketToPrint} 
+                        customerName={printedTicket?.customerName || getCustomerName(ticketToPrint.customerId)} 
                         materials={materials} 
                         format={settings.receiptFormat}
                       />,

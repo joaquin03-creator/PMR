@@ -91,6 +91,7 @@ export interface BuyTicketMaterial {
   deductionReason?: string;
   notes?: string;
   photoUrl?: string;
+  unit?: 'lb' | 'ton';
 }
 
 export interface BuyTicket {
@@ -364,6 +365,16 @@ export interface SystemConfig {
   lastUpdated: string;
   dnbLastImportedAt?: string;
   cameraSetupComplete?: boolean;
+  dailySpendTarget?: number;
+  dailyCustomerTarget?: number;
+  dailyProfitTarget?: number;
+  dailyMarginTarget?: number;
+  dailyTargets?: {
+    spend?: number;
+    customers?: number;
+    profit?: number;
+    margin?: number;
+  };
 }
 
 export interface CashSession {

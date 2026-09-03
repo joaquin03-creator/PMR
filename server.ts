@@ -605,56 +605,6 @@ async function startServer() {
     }
   });
 
-  // Automated LEADS/DHS Submission Endpoint
-  app.post("/api/submit-leads", async (req, res) => {
-    const { reportData, date, submittedBy } = req.body;
-    const submissionUrl = process.env.WORKCENTER_SUBMISSION_URL;
-    const apiKey = process.env.WORKCENTER_API_KEY;
-    const accountId = process.env.WORKCENTER_ACCOUNT_ID;
-
-    console.log(`Compliance submission initiated for ${date} by ${submittedBy}`);
-
-    // If no URL configured yet, we return a "Pre-flight Check" success with a warning
-    if (!submissionUrl) {
-      return res.status(200).json({ 
-        status: "mock_success", 
-        message: "Submission simulation successful. Please configure WORKCENTER_SUBMISSION_URL in settings for live transmission.",
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    try {
-      // Robust submission logic using axios
-      const response = await axios.post(submissionUrl, {
-        source: "Preferred Metals Recycling App",
-        accountId: accountId,
-        reportDate: date,
-        submittedAt: new Date().toISOString(),
-        submissionUser: submittedBy,
-        data: reportData // This would be the filtered CSV or JSON payload
-      }, {
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "Accept": "application/json"
-        },
-        timeout: 15000 // 15s timeout for compliance endpoints
-      });
-
-      res.json({
-        status: "success",
-        externalResponse: response.data,
-        message: "Data successfully transmitted to WorkCenter."
-      });
-    } catch (error: any) {
-      console.error("LEADS Submission Error:", error.message);
-      res.status(500).json({
-        status: "failed",
-        error: error.message,
-        details: error.response?.data || "No external error details"
-      });
-    }
-  });
 
   // API 404 handler - ensure any unmatched /api/* request returns JSON, never HTML
   app.use("/api/*", (req, res) => {
