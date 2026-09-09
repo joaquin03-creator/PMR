@@ -7,7 +7,8 @@ export async function logAuditEvent(
   entityId: string,
   action: AuditLog['action'],
   changes?: AuditLog['changes'],
-  notes?: string
+  notes?: string,
+  requiresManagerReview?: boolean
 ) {
   try {
     const user = auth.currentUser;
@@ -20,7 +21,8 @@ export async function logAuditEvent(
       changes,
       performedBy: user.email || 'unknown',
       timestamp: new Date().toISOString(),
-      notes
+      notes,
+      ...(requiresManagerReview !== undefined ? { requiresManagerReview } : {})
     };
 
     await addDoc(collection(db, 'auditLogs'), logData);

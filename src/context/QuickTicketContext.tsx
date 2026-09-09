@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useRef, useCallback, ReactNode } from 'react';
 
 interface QuickTicketContextType {
   isQuickTicketOpen: boolean;
@@ -6,6 +6,7 @@ interface QuickTicketContextType {
   closeQuickTicket: () => void;
   toggleQuickTicket: () => void;
   activeDraftId: string | null;
+  focusMaterialInputRef: React.MutableRefObject<(() => void) | null>;
 }
 
 const QuickTicketContext = createContext<QuickTicketContextType | undefined>(undefined);
@@ -13,15 +14,20 @@ const QuickTicketContext = createContext<QuickTicketContextType | undefined>(und
 export function QuickTicketProvider({ children }: { children: ReactNode }) {
   const [isQuickTicketOpen, setIsQuickTicketOpen] = useState(false);
   const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
+  const focusMaterialInputRef = useRef<(() => void) | null>(null);
 
-  const openQuickTicket = (draftId?: string) => {
+  const openQuickTicket = useCallback((draftId?: string) => {
     if (draftId) {
       setActiveDraftId(draftId);
     } else {
       setActiveDraftId(null);
     }
     setIsQuickTicketOpen(true);
-  };
+    // Attempt focus after a short delay — works for mouse clicks
+    setTimeout(() => {
+      focusMaterialInputRef.current?.();
+    }, 200);
+  }, []);
 
   const closeQuickTicket = () => {
     setIsQuickTicketOpen(false);
@@ -40,6 +46,7 @@ export function QuickTicketProvider({ children }: { children: ReactNode }) {
         closeQuickTicket,
         toggleQuickTicket,
         activeDraftId,
+        focusMaterialInputRef,
       }}
     >
       {children}

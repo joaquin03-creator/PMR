@@ -20,7 +20,8 @@ import {
   Wallet,
   Settings,
   Search,
-  Receipt
+  Receipt,
+  Bug
 } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { cn } from '../lib/utils';
@@ -31,6 +32,8 @@ import { COMPANY_NAME, handleImageError } from '../constants';
 import { BrandLogo } from './BrandLogo';
 import SpotlightSearch from './SpotlightSearch';
 import QuickTicketModal from './QuickTicketModal';
+import { Hint } from './Hint';
+import { ReportProblemModal } from './ReportProblemModal';
 
 interface LayoutProps {
   user: User;
@@ -43,8 +46,10 @@ export default function Layout({ user, profile }: LayoutProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const isOnline = useNetworkStatus();
+  const { isOnline, pendingSyncCount } = useNetworkStatus();
+  const stationName = typeof window !== 'undefined' ? (localStorage.getItem('pm_connected_laptop_id') || localStorage.getItem('pmr_hardware_id') || '') : '';
   const [searchOpen, setSearchOpen] = useState(false);
+  const [problemReportOpen, setProblemReportOpen] = useState(false);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -231,7 +236,16 @@ export default function Layout({ user, profile }: LayoutProps) {
               </div>
             </button>
             <button
-              onClick={() => openQuickTicket()}
+              onClick={() => {
+                openQuickTicket();
+                setTimeout(() => {
+                  const input = document.querySelector('[data-material-search]') as HTMLInputElement;
+                  if (input) {
+                    input.focus({ preventScroll: false });
+                    input.click();
+                  }
+                }, 350);
+              }}
               className="flex items-center gap-2 px-3.5 py-2.5 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-slate-950 font-black text-xs uppercase tracking-wider rounded-2xl shadow-md hover:shadow-lg shadow-amber-500/20 active:scale-95 transition-all shrink-0 cursor-pointer"
               title="Create quick buy ticket"
               aria-label="Quick Ticket"
@@ -243,7 +257,16 @@ export default function Layout({ user, profile }: LayoutProps) {
           <div className="flex-1 md:hidden" />
           <div className="flex items-center gap-3 sm:gap-6">
             <button
-              onClick={() => openQuickTicket()}
+              onClick={() => {
+                openQuickTicket();
+                setTimeout(() => {
+                  const input = document.querySelector('[data-material-search]') as HTMLInputElement;
+                  if (input) {
+                    input.focus({ preventScroll: false });
+                    input.click();
+                  }
+                }, 350);
+              }}
               className="flex items-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-2xl md:hidden transition-all shadow-md shadow-amber-500/20 active:scale-95 outline-none font-black text-xs uppercase tracking-wider shrink-0"
               aria-label="Quick Ticket"
               title="Quick Ticket"
@@ -261,30 +284,41 @@ export default function Layout({ user, profile }: LayoutProps) {
             >
               <Search className="w-5.25 h-5.25" />
             </button>
-            <div className={cn(
-              "flex items-center gap-2 px-3.5 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest transition-all duration-300",
-              isOnline 
-                ? "bg-emerald-50 text-emerald-700 border border-emerald-100/80" 
-                : "bg-rose-50 text-rose-800 border border-rose-200 animate-pulse",
-              settings.theme === 'dark' && (
+            {stationName && (
+              <div className="hidden xl:flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700 shrink-0">
+                <span className="w-2 h-2 rounded-full bg-slate-400 dark:bg-slate-500 inline-block" />
+                <span>{stationName}</span>
+              </div>
+            )}
+            <div className="flex items-center gap-2 shrink-0">
+              <div className={cn(
+                "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold transition-all duration-300",
                 isOnline 
-                  ? "bg-emerald-950/30 text-emerald-400 border-emerald-800/50" 
-                  : "bg-rose-950/30 text-rose-400 border-rose-800"
-              )
-            )}>
-              {isOnline ? (
-                <>
-                  <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full inline-block animate-pulse" />
-                  <Wifi className="w-3.5 h-3.5 text-emerald-500" />
-                  <span>Connectivity: Online</span>
-                </>
-              ) : (
-                <>
-                  <span className="w-1.5 h-1.5 bg-rose-500 rounded-full inline-block animate-ping" />
-                  <WifiOff className="w-3.5 h-3.5 text-rose-500" />
-                  <span className="font-extrabold text-rose-700 dark:text-rose-400">Connectivity: Disconnected (Working on Local Cache)</span>
-                </>
+                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800/60" 
+                  : "bg-amber-50 text-amber-800 border border-amber-300 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800"
+              )}>
+                <span className={cn(
+                  "w-2 h-2 rounded-full inline-block",
+                  isOnline ? "bg-emerald-500 animate-pulse" : "bg-amber-500 animate-pulse"
+                )} />
+                <span>{isOnline ? "Online" : "Offline — changes will sync"}</span>
+              </div>
+              <Hint text="Amber means the internet is down. Keep working — tickets save on this device and print normally, then sync when the connection returns." />
+              {pendingSyncCount > 0 && (
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-black bg-amber-100 text-amber-900 border border-amber-300 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-700 animate-pulse shadow-sm">
+                  <span>Pending sync: {pendingSyncCount}</span>
+                </div>
               )}
+              <button
+                type="button"
+                id="report-problem-btn"
+                onClick={() => setProblemReportOpen(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 bg-slate-100 hover:bg-slate-200/70 dark:bg-slate-800 dark:hover:bg-slate-700 rounded-xl border border-slate-200 dark:border-slate-700 transition-all cursor-pointer shadow-xs"
+                title="Report a Problem"
+              >
+                <Bug className="w-3.5 h-3.5 text-rose-500" />
+                <span className="hidden xl:inline">Report a Problem</span>
+              </button>
             </div>
             <span className={cn(
               "text-xs font-black text-slate-400 uppercase tracking-widest hidden sm:inline",
@@ -308,7 +342,16 @@ export default function Layout({ user, profile }: LayoutProps) {
       {/* Mobile Floating Action Button (FAB) */}
       <div className="fixed bottom-6 right-6 z-40 sm:hidden print:hidden">
         <button
-          onClick={() => openQuickTicket()}
+          onClick={() => {
+            openQuickTicket();
+            setTimeout(() => {
+              const input = document.querySelector('[data-material-search]') as HTMLInputElement;
+              if (input) {
+                input.focus({ preventScroll: false });
+                input.click();
+              }
+            }, 350);
+          }}
           className="flex items-center gap-2 px-4 py-3.5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs uppercase tracking-wider rounded-full shadow-2xl shadow-amber-500/40 active:scale-95 transition-all border-2 border-amber-400"
           aria-label="Open Quick Ticket"
         >
@@ -328,6 +371,14 @@ export default function Layout({ user, profile }: LayoutProps) {
         onClose={closeQuickTicket}
         profile={profile}
         initialDraftId={activeDraftId}
+      />
+
+      <ReportProblemModal
+        isOpen={problemReportOpen}
+        onClose={() => setProblemReportOpen(false)}
+        profile={profile}
+        stationName={stationName}
+        isOnline={isOnline}
       />
     </div>
   );

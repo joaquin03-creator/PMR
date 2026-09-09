@@ -3,9 +3,10 @@ import { useSearchParams } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, doc, updateDoc, addDoc, query, orderBy, limit, getDocs, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { Material, PricingSnapshot } from '../types';
-import { Plus, Search, Edit2, TrendingUp, TrendingDown, Minus, Loader2, X, ShieldCheck, FileSpreadsheet, History, RotateCcw, AlertCircle, CheckCircle2, Lock, Sliders, Trash2, AlertTriangle } from 'lucide-react';
+import { Plus, Search, Edit2, TrendingUp, TrendingDown, Minus, Loader2, X, ShieldCheck, FileSpreadsheet, History, RotateCcw, AlertCircle, CheckCircle2, Lock, Sliders, Trash2, AlertTriangle, Copy } from 'lucide-react';
 import Papa from 'papaparse';
 import { cn } from '../lib/utils';
+import MaterialDuplicateManagerModal from '../components/MaterialDuplicateManagerModal';
 
 import { UserProfile } from '../types';
 
@@ -86,6 +87,9 @@ export default function ManagePrices({ profile }: ManagePricesProps) {
   const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
   const [deleteAllConfirmText, setDeleteAllConfirmText] = useState('');
   const [deletingAll, setDeletingAll] = useState(false);
+
+  // Duplicate Manager state
+  const [showDuplicateManager, setShowDuplicateManager] = useState(false);
 
   useEffect(() => {
     if (!auth.currentUser) return;
@@ -1377,6 +1381,16 @@ To fix this:
           <p className="text-slate-500 font-medium mt-1">Update buy and sale prices across the system.</p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
+          {profile?.role === 'manager' && (
+            <button
+              onClick={() => setShowDuplicateManager(true)}
+              className="px-4 py-3 bg-amber-500 text-slate-950 rounded-2xl font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-amber-600 transition-all shadow-lg shadow-amber-500/20 active:scale-95 shrink-0"
+              title="Material Duplicate Manager"
+            >
+              <Copy className="w-3.5 h-3.5" />
+              Find Duplicates
+            </button>
+          )}
           {materials.length > 0 && (
             <button
               onClick={() => {
@@ -2186,6 +2200,16 @@ To fix this:
             </div>
           </div>
         </div>
+      )}
+
+      {/* Material Duplicate Manager Modal */}
+      {showDuplicateManager && (
+        <MaterialDuplicateManagerModal
+          isOpen={showDuplicateManager}
+          onClose={() => setShowDuplicateManager(false)}
+          materials={materials}
+          profile={profile}
+        />
       )}
     </main>
   );

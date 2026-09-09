@@ -2395,9 +2395,16 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
                             id={`price-${item.id}`}
                             type="number"
                             step="0.01"
+                            min="0"
                             className="w-full pl-12 pr-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-black text-lg"
                             value={item.pricePerUnit || ''}
-                            onChange={e => updateItem(item.id, { pricePerUnit: Number(e.target.value) })}
+                            onChange={e => updateItem(item.id, { pricePerUnit: e.target.value === '' ? 0 : Math.max(0, Number(e.target.value)) })}
+                            onBlur={e => {
+                              if (e.target.value !== '') {
+                                const num = Math.max(0, parseFloat(e.target.value) || 0);
+                                updateItem(item.id, { pricePerUnit: parseFloat(num.toFixed(2)) });
+                              }
+                            }}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') {
                                 e.preventDefault();

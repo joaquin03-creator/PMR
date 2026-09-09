@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useState, useEffect, useMemo } from 'react';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { auth, db, storage } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc, writeBatch, query, where, getDocs } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { Customer } from '../types';
+import { Customer, BuyTicket, Material, UserProfile } from '../types';
 import { 
   Users, 
   Plus, 
@@ -26,7 +26,13 @@ import {
   ArrowRightLeft,
   AlertTriangle,
   Truck,
-  Sparkles
+  Sparkles,
+  Download,
+  Copy,
+  Check,
+  Receipt,
+  ChevronRight,
+  ExternalLink
 } from 'lucide-react';
 import { cn, getCustomerDataGaps } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
@@ -35,12 +41,13 @@ import { logAuditEvent } from '../lib/audit';
 import { handleImageError } from '../constants';
 import ManagerPinModal from '../components/ManagerPinModal';
 import { useToast } from '../context/ToastContext';
-
-import { UserProfile } from '../types';
+import { Hint } from '../components/Hint';
 
 export default function Customers({ profile }: { profile: UserProfile | null }) {
+  const navigate = useNavigate();
   const { firestore, success, error: toastError, info } = useToast();
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [materials, setMaterials] = useState<Material[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
@@ -63,6 +70,18 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
   const [searchParams, setSearchParams] = useSearchParams();
   const [filterMissingPhotos, setFilterMissingPhotos] = useState(false);
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+  // Feature 1: Export customer phone numbers for SMS
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportLoading, setExportLoading] = useState(false);
+  const [exportData, setExportData] = useState<{ customer: Customer; totalTickets: number }[]>([]);
+  const [copiedPhoneNumbers, setCopiedPhoneNumbers] = useState(false);
+
+  // Feature 2: Customer ticket history drill-down
+  const [customerTickets, setCustomerTickets] = useState<BuyTicket[]>([]);
+  const [customerTicketsLoading, setCustomerTicketsLoading] = useState(false);
+
+  const isManager = profile?.role === 'manager' || (profile?.role as string) === 'admin';
 
   useEffect(() => {
     const filterParam = searchParams.get('filter');
@@ -107,14 +126,193 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
       setCustomers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Customer[]);
       setLoading(false);
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'customers'));
+
+    const unsubMaterials = onSnapshot(collection(db, 'materials'), (snapshot) => {
+      setMaterials(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Material[]);
+    }, (err) => console.warn('materials snapshot error', err));
+
     return () => {
       try {
         unsubscribe();
       } catch (e) {
         console.warn('unsubscribe customers error', e);
       }
+      try {
+        unsubMaterials();
+      } catch (e) {
+        console.warn('unsubscribe materials error', e);
+      }
     };
   }, [profile]);
+
+  // Load customer ticket history when profile is viewed
+  useEffect(() => {
+    if (!selectedCustomer) {
+      setCustomerTickets([]);
+      return;
+    }
+
+    let isMounted = true;
+    setCustomerTicketsLoading(true);
+
+    const fetchCustomerTickets = async () => {
+      try {
+        const ticketsRef = collection(db, 'buyTickets');
+        const q = query(
+          ticketsRef,
+          where('customerId', '==', selectedCustomer.id)
+        );
+        const snap = await getDocs(q);
+        if (!isMounted) return;
+
+        const tickets = snap.docs.map(d => ({ id: d.id, ...d.data() } as BuyTicket));
+        // Sort by timestamp descending
+        tickets.sort((a, b) => {
+          const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+          const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+          return timeB - timeA;
+        });
+
+        // Limit to 50
+        setCustomerTickets(tickets.slice(0, 50));
+      } catch (err) {
+        console.error("Error fetching customer tickets:", err);
+      } finally {
+        if (isMounted) setCustomerTicketsLoading(false);
+      }
+    };
+
+    fetchCustomerTickets();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedCustomer?.id]);
+
+  // Handle Export Contacts for SMS
+  const handleOpenExportModal = async () => {
+    setExportLoading(true);
+    try {
+      const ticketsRef = collection(db, 'buyTickets');
+      const q = query(ticketsRef, where('status', '==', 'completed'));
+      const snap = await getDocs(q);
+      
+      const signedCompletedCountMap: Record<string, number> = {};
+      snap.docs.forEach(docSnap => {
+        const ticket = docSnap.data() as BuyTicket;
+        if (ticket.customerId && ticket.signatureUrl && typeof ticket.signatureUrl === 'string' && ticket.signatureUrl.trim() !== '') {
+          signedCompletedCountMap[ticket.customerId] = (signedCompletedCountMap[ticket.customerId] || 0) + 1;
+        }
+      });
+
+      const eligible: { customer: Customer; totalTickets: number }[] = [];
+      customers.forEach(c => {
+        const hasPhone = !!c.phone && c.phone.trim() !== '';
+        const signedCount = signedCompletedCountMap[c.id] || 0;
+        if (hasPhone && signedCount > 0) {
+          eligible.push({
+            customer: c,
+            totalTickets: signedCount
+          });
+        }
+      });
+
+      // Sort alphabetically by name
+      eligible.sort((a, b) => a.customer.name.localeCompare(b.customer.name));
+
+      setExportData(eligible);
+      setCopiedPhoneNumbers(false);
+      setShowExportModal(true);
+    } catch (err) {
+      console.error("Error gathering export contacts:", err);
+      toastError("Export Failed", "Could not query customer signed transaction records.");
+    } finally {
+      setExportLoading(false);
+    }
+  };
+
+  const plainTextNumbers = useMemo(() => {
+    return exportData
+      .map(item => item.customer.phone ? item.customer.phone.trim() : '')
+      .filter(Boolean)
+      .join('\n');
+  }, [exportData]);
+
+  const handleCopyAllPhoneNumbers = async () => {
+    if (!plainTextNumbers) return;
+    try {
+      await navigator.clipboard.writeText(plainTextNumbers);
+      setCopiedPhoneNumbers(true);
+      setTimeout(() => setCopiedPhoneNumbers(false), 2500);
+      success("Copied to Clipboard", `${exportData.length} phone numbers copied.`);
+    } catch (err) {
+      console.error("Failed to copy phone numbers:", err);
+    }
+  };
+
+  const handleExportCSV = () => {
+    if (exportData.length === 0) return;
+    const today = new Date().toISOString().split('T')[0];
+    const filename = `PMR_Contacts_${today}.csv`;
+    
+    const escapeCsv = (val: string | number | undefined | null) => {
+      if (val === undefined || val === null) return '';
+      const str = String(val);
+      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const headers = ['Name', 'Phone', 'Secondary Phone', 'Total Tickets'];
+    const rows = exportData.map(item => [
+      escapeCsv(item.customer.name),
+      escapeCsv(item.customer.phone),
+      escapeCsv(item.customer.secondaryPhone || ''),
+      escapeCsv(item.totalTickets)
+    ]);
+
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    triggerNotification(`Successfully exported ${exportData.length} contacts to ${filename}!`);
+    setShowExportModal(false);
+  };
+
+  const formatTicketDate = (isoStr?: string) => {
+    if (!isoStr) return 'N/A';
+    try {
+      const d = new Date(isoStr);
+      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + ' ' +
+        d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    } catch {
+      return isoStr;
+    }
+  };
+
+  const getTicketMaterialSummary = (ticket: BuyTicket) => {
+    if (!ticket.materials || ticket.materials.length === 0) return 'No materials';
+    const sorted = [...ticket.materials].sort((a, b) => (b.netWeight || 0) - (a.netWeight || 0));
+    const top2 = sorted.slice(0, 2);
+    const names = top2.map(m => {
+      const found = materials.find(mat => mat.id === m.materialId);
+      return found?.name || 'Material';
+    });
+    return names.join(', ');
+  };
+
+  const handleSelectTicketFromCustomer = (ticketId: string) => {
+    setSelectedCustomer(null);
+    navigate(`/ticket-history?ticketId=${encodeURIComponent(ticketId)}`);
+  };
 
   // Auto-enrich customer profile from previous tickets if missing vehicle info or photos
   useEffect(() => {
@@ -534,19 +732,41 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
           />
         </div>
 
-        <button
-          type="button"
-          onClick={() => setFilterMissingPhotos(prev => !prev)}
-          className={cn(
-            "px-4 py-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 border transition-all shrink-0 cursor-pointer",
-            filterMissingPhotos 
-              ? "bg-amber-500 text-white border-amber-600 shadow-md shadow-amber-200" 
-              : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+        <div className="flex items-center gap-3 flex-wrap">
+          <button
+            type="button"
+            onClick={() => setFilterMissingPhotos(prev => !prev)}
+            className={cn(
+              "px-4 py-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 border transition-all shrink-0 cursor-pointer",
+              filterMissingPhotos 
+                ? "bg-amber-500 text-white border-amber-600 shadow-md shadow-amber-200" 
+                : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+            )}
+          >
+            <AlertTriangle className={cn("w-4 h-4", filterMissingPhotos ? "text-white" : "text-amber-500")} />
+            <span>Missing photos ({incompleteCount})</span>
+          </button>
+
+          {isManager && (
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={exportLoading}
+                onClick={handleOpenExportModal}
+                className="px-5 py-4 bg-white border border-slate-200 text-slate-700 hover:text-blue-600 hover:border-blue-300 hover:bg-blue-50/50 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-all shrink-0 cursor-pointer shadow-sm active:scale-95 disabled:opacity-50"
+                title="Export customer phone numbers for mass SMS"
+              >
+                {exportLoading ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                ) : (
+                  <Download className="w-4 h-4 text-blue-600" />
+                )}
+                <span>Export Contacts</span>
+              </button>
+              <Hint text="Downloads phone numbers for customers who have completed a signed ticket. Use the Copy All box to paste into a mass-text app." />
+            </div>
           )}
-        >
-          <AlertTriangle className={cn("w-4 h-4", filterMissingPhotos ? "text-white" : "text-amber-500")} />
-          <span>Missing photos ({incompleteCount})</span>
-        </button>
+        </div>
       </div>
 
       <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" aria-label="Customer List">
@@ -1569,6 +1789,101 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
                   )}
                 </div>
 
+                {/* Transaction History Section */}
+                {!isEditing && (
+                  <div className="border-t border-slate-100 pt-6 mt-6">
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-2">
+                        <Receipt className="w-5 h-5 text-slate-500" />
+                        <h3 className="text-sm font-bold text-slate-900">Transaction History</h3>
+                        <Hint text="Every ticket for this customer. Click one to open it in Ticket History." />
+                      </div>
+                      <span className="text-xs text-slate-400 font-bold">
+                        {customerTicketsLoading ? 'Loading...' : `${customerTickets.length} ticket${customerTickets.length === 1 ? '' : 's'}`}
+                      </span>
+                    </div>
+
+                    {customerTicketsLoading ? (
+                      <div className="py-8 flex items-center justify-center text-slate-400">
+                        <Loader2 className="w-6 h-6 animate-spin text-blue-600 mr-2" />
+                        <span className="text-xs font-medium">Loading customer transactions...</span>
+                      </div>
+                    ) : customerTickets.length === 0 ? (
+                      <div className="py-6 text-center bg-slate-50 rounded-2xl border border-slate-100">
+                        <FileText className="w-8 h-8 text-slate-300 mx-auto mb-1.5" />
+                        <p className="text-xs font-bold text-slate-500">No transactions on file for this customer.</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-2.5">
+                        {customerTickets.slice(0, 10).map((ticket) => {
+                          const matSummary = getTicketMaterialSummary(ticket);
+                          return (
+                            <div
+                              key={ticket.id}
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => handleSelectTicketFromCustomer(ticket.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  handleSelectTicketFromCustomer(ticket.id);
+                                }
+                              }}
+                              className="w-full text-left p-3.5 bg-slate-50 hover:bg-blue-50/60 border border-slate-200/70 hover:border-blue-300 rounded-2xl transition-all flex items-center justify-between gap-3 group cursor-pointer"
+                            >
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="font-mono font-bold text-xs text-slate-900 group-hover:text-blue-600 transition-colors">
+                                    {ticket.id}
+                                  </span>
+                                  <span className={cn(
+                                    "px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider border",
+                                    ticket.status === 'completed'
+                                      ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                      : ticket.status === 'pending'
+                                      ? "bg-amber-50 text-amber-700 border-amber-200"
+                                      : "bg-red-50 text-red-700 border-red-200"
+                                  )}>
+                                    {ticket.status === 'completed' ? 'Completed' : ticket.status === 'pending' ? 'Draft' : 'Voided'}
+                                  </span>
+                                </div>
+                                <p className="text-xs text-slate-500 font-medium mt-0.5">
+                                  {formatTicketDate(ticket.timestamp)}
+                                </p>
+                                <p className="text-xs text-slate-600 font-medium truncate mt-0.5" title={matSummary}>
+                                  {matSummary}
+                                </p>
+                              </div>
+
+                              <div className="flex items-center gap-3 shrink-0">
+                                <span className="font-black text-slate-900 text-sm">
+                                  ${(ticket.totalAmount || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                </span>
+                                <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-blue-600 group-hover:translate-x-0.5 transition-all" />
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        {customerTickets.length > 10 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const customerName = selectedCustomer.name;
+                              setSelectedCustomer(null);
+                              navigate(`/ticket-history?customer=${encodeURIComponent(customerName)}`);
+                            }}
+                            className="w-full mt-3 py-2.5 px-4 bg-slate-100 hover:bg-blue-50 hover:text-blue-700 text-slate-700 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer border border-transparent hover:border-blue-200"
+                          >
+                            <span>View All ({customerTickets.length}) in Ticket History</span>
+                            <ChevronRight className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="pt-8 border-t border-slate-100 flex gap-4">
                   {isEditing ? (
                     <>
@@ -1856,6 +2171,99 @@ export default function Customers({ profile }: { profile: UserProfile | null }) 
                 className="flex-1 py-4 border border-slate-200 text-slate-600 rounded-2xl font-bold hover:bg-slate-50 transition-all outline-none text-sm"
               >
                 Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Export Contacts Modal for Mass SMS */}
+      {showExportModal && (
+        <div 
+          className="fixed inset-0 bg-slate-900/60 z-[200] flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in duration-200"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="export-contacts-title"
+        >
+          <div className="bg-white rounded-3xl w-full max-w-lg p-7 shadow-2xl animate-in zoom-in-95 duration-200 flex flex-col space-y-5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-blue-50 rounded-2xl flex items-center justify-center text-blue-600">
+                  <Phone className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 id="export-contacts-title" className="text-xl font-bold text-slate-900 font-display">Export Contacts for SMS</h3>
+                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Verified Customer Phone List</p>
+                </div>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setShowExportModal(false)} 
+                className="p-2 hover:bg-slate-100 rounded-full transition-colors cursor-pointer"
+                aria-label="Close modal"
+              >
+                <X className="w-5 h-5 text-slate-400" />
+              </button>
+            </div>
+
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl text-xs text-slate-600 leading-relaxed">
+              Export <strong>{exportData.length}</strong> customer phone numbers? These are customers who have completed a signed transaction with PMR.
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label htmlFor="plain-text-numbers" className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">
+                  Plain Text Phone Numbers ({exportData.length})
+                </label>
+                <button
+                  type="button"
+                  onClick={handleCopyAllPhoneNumbers}
+                  disabled={exportData.length === 0}
+                  className="px-3 py-1.5 bg-slate-100 hover:bg-blue-50 hover:text-blue-600 text-slate-700 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {copiedPhoneNumbers ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      <span className="text-emerald-600">Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy All</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <textarea
+                id="plain-text-numbers"
+                readOnly
+                value={plainTextNumbers}
+                rows={6}
+                placeholder="No phone numbers found"
+                className="w-full p-3 font-mono text-xs bg-slate-900 text-emerald-400 rounded-xl border border-slate-800 outline-none select-all resize-none shadow-inner"
+              />
+              <p className="text-[11px] text-slate-400 italic">
+                One number per line. Ready to copy-paste directly into Google Messages, SimpleTexting, or carrier broadcast tools.
+              </p>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className="flex-1 py-3.5 border border-slate-200 text-slate-600 rounded-xl font-bold hover:bg-slate-50 transition-all text-xs uppercase tracking-wider cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={exportData.length === 0}
+                onClick={handleExportCSV}
+                className="flex-1 py-3.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold transition-all shadow-lg shadow-blue-200 text-xs uppercase tracking-wider flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                <span>Export CSV</span>
               </button>
             </div>
           </div>

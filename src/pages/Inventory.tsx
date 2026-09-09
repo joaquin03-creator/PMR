@@ -1,7 +1,20 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, query, orderBy, addDoc, doc, updateDoc, deleteDoc, setDoc, increment, writeBatch } from 'firebase/firestore';
-import { InventoryItem, Material, ExternalSale, ExternalSaleItem, UserProfile, LoadPlan, LoadPlanBox, MaterialConversion, InventoryAdjustment } from '../types';
+import { 
+  InventoryItem, 
+  Material, 
+  ExternalSale, 
+  ExternalSaleItem, 
+  UserProfile, 
+  LoadPlan, 
+  LoadPlanBox, 
+  MaterialConversion, 
+  InventoryAdjustment,
+  BuyTicket,
+  Invoice,
+  ConversionLog
+} from '../types';
 import { 
   Package, 
   ArrowUpRight, 
@@ -36,13 +49,21 @@ import {
   Zap,
   SlidersHorizontal,
   Scale,
-  HelpCircle
+  HelpCircle,
+  ClipboardCheck,
+  Check,
+  Flame,
+  ArrowRight,
+  AlertTriangle,
+  Sparkles
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { safeSetItem } from '../lib/safeStorage';
 import { COMPANY_NAME, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
+import { Hint } from '../components/Hint';
 
 interface SaleFormItem {
   id: string;
@@ -158,6 +179,34 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   const [inventoryErrors, setInventoryErrors] = useState<string[]>([]);
   const [expandedSaleIds, setExpandedSaleIds] = useState<Record<string, boolean>>({});
 
+  const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+
+  // TOOL 1 — Physical Count Mode State
+  const [isCountMode, setIsCountMode] = useState(false);
+  const [countEntries, setCountEntries] = useState<Record<string, string>>({});
+  const [showConfirmApplyCount, setShowConfirmApplyCount] = useState(false);
+  const [countSuccessSummary, setCountSuccessSummary] = useState<string | null>(null);
+  const [focusedMaterialId, setFocusedMaterialId] = useState<string | null>(null);
+  const countInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+
+  // TOOL 2 — Variance Dashboard State
+  const [sinceLastCountToggle, setSinceLastCountToggle] = useState<boolean>(true);
+
+  // TOOL 3 — Quick Conversion Entry Panel State
+  const [showQuickConvPanel, setShowQuickConvPanel] = useState(false);
+  const [quickConvSourceMatId, setQuickConvSourceMatId] = useState('');
+  const [quickConvInputWeight, setQuickConvInputWeight] = useState('');
+  const [quickConvOutputMatId, setQuickConvOutputMatId] = useState('');
+  const [quickConvOutputWeight, setQuickConvOutputWeight] = useState('');
+  const [quickConvNotes, setQuickConvNotes] = useState('');
+  const [quickConvError, setQuickConvError] = useState<string | null>(null);
+  const [quickConvSuccess, setQuickConvSuccess] = useState<string | null>(null);
+  const [sourceSearchQuery, setSourceSearchQuery] = useState('');
+  const [isSourceDropdownOpen, setIsSourceDropdownOpen] = useState(false);
+  const [outputSearchQuery, setOutputSearchQuery] = useState('');
+  const [isOutputDropdownOpen, setIsOutputDropdownOpen] = useState(false);
+
   // Hooks will run unconditionally. Permission check will happen after loading.
 
   useEffect(() => {
@@ -204,6 +253,22 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       (error) => handleFirestoreError(error, OperationType.LIST, 'inventoryAdjustments')
     );
 
+    const unsubBuyTickets = onSnapshot(
+      collection(db, 'buyTickets'),
+      (snapshot) => {
+        setBuyTickets(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as BuyTicket[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'buyTickets')
+    );
+
+    const unsubInvoices = onSnapshot(
+      collection(db, 'invoices'),
+      (snapshot) => {
+        setInvoices(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Invoice[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'invoices')
+    );
+
     return () => {
       unsubMaterials();
       unsubInventory();
@@ -211,6 +276,8 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       unsubLoadPlans();
       unsubConversions();
       unsubAdjustments();
+      unsubBuyTickets();
+      unsubInvoices();
     };
   }, [profile]);
 
@@ -252,7 +319,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         loadCarrier,
         deductFromStock
       };
-      localStorage.setItem('pm_draft_loadplan', JSON.stringify(draft));
+      safeSetItem('pm_draft_loadplan', JSON.stringify(draft));
     } else {
       localStorage.removeItem('pm_draft_loadplan');
     }
@@ -1427,6 +1494,382 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     });
   }, [adjustments, adjSearch, adjMaterialFilter, adjEstimateFilter, adjTypeFilter, materials]);
 
+  const isManager = (profile?.role as string) === 'manager' || (profile?.role as string) === 'admin';
+
+  // Check if any inventory item has a lastPhysicalCount
+  const hasAnyPhysicalCount = useMemo(() => {
+    return inventory.some(i => !!i.lastPhysicalCount);
+  }, [inventory]);
+
+  // Set default for toggle based on hasAnyPhysicalCount on first load
+  useEffect(() => {
+    if (hasAnyPhysicalCount) {
+      setSinceLastCountToggle(true);
+    }
+  }, [hasAnyPhysicalCount]);
+
+  // TOOL 2 — Variance Dashboard Computations
+  const varianceData = useMemo(() => {
+    return materials.map(mat => {
+      const inv = inventory.find(i => i.materialId === mat.id);
+      const actual = inv?.currentWeight ?? 0;
+      const lastCountDate = inv?.lastPhysicalCount;
+
+      let expected = 0;
+      if (sinceLastCountToggle && lastCountDate) {
+        const baseline = inv.lastPhysicalCountWeight !== undefined ? inv.lastPhysicalCountWeight : (inv.currentWeight ?? 0);
+        
+        const boughtSince = buyTickets
+          .filter(t => t.status === 'completed' && ((t.timestamp || '') > lastCountDate))
+          .reduce((sum, t) => {
+            const lines = (t.materials || []).filter(m => m.materialId === mat.id);
+            return sum + lines.reduce((s, m) => s + (m.netWeight || 0), 0);
+          }, 0);
+
+        const soldSince = invoices
+          .filter(invDoc => invDoc.status === 'paid' && ((invDoc.inventoryDeductedAt || invDoc.date || '') > lastCountDate))
+          .reduce((sum, invDoc) => {
+            const lines = (invDoc.materials || []).filter(m => m.materialId === mat.id);
+            return sum + lines.reduce((s, m) => s + (m.weight || 0), 0);
+          }, 0);
+
+        expected = baseline + (boughtSince - soldSince);
+      } else {
+        const boughtAllTime = buyTickets
+          .filter(t => t.status === 'completed')
+          .reduce((sum, t) => {
+            const lines = (t.materials || []).filter(m => m.materialId === mat.id);
+            return sum + lines.reduce((s, m) => s + (m.netWeight || 0), 0);
+          }, 0);
+
+        const soldAllTime = invoices
+          .filter(invDoc => invDoc.status === 'paid')
+          .reduce((sum, invDoc) => {
+            const lines = (invDoc.materials || []).filter(m => m.materialId === mat.id);
+            return sum + lines.reduce((s, m) => s + (m.weight || 0), 0);
+          }, 0);
+
+        expected = boughtAllTime - soldAllTime;
+      }
+
+      const variance = actual - expected;
+      const absVariance = Math.abs(variance);
+
+      let severity: 'ok' | 'amber' | 'red' = 'ok';
+      let message = '';
+
+      if (absVariance < 5) {
+        severity = 'ok';
+      } else if (variance >= -50 && variance <= -5) {
+        severity = 'amber';
+        message = `Short by ${Math.abs(Math.round(variance)).toLocaleString()} lbs — possible processing loss or unlogged conversion`;
+      } else if (variance < -50) {
+        severity = 'red';
+        message = `Short by ${Math.abs(Math.round(variance)).toLocaleString()} lbs — physical count recommended`;
+      } else if (variance > 50) {
+        severity = 'amber';
+        message = `Over by ${Math.round(variance).toLocaleString()} lbs — possible duplicate ticket or unlogged removal`;
+      } else if (variance > 0) {
+        severity = 'amber';
+        message = `Over by ${Math.round(variance).toLocaleString()} lbs — possible unlogged addition`;
+      }
+
+      return {
+        material: mat,
+        actual,
+        expected,
+        variance,
+        absVariance,
+        severity,
+        message,
+        lastPhysicalCount: lastCountDate,
+        lastPhysicalCountBy: inv?.lastPhysicalCountBy
+      };
+    });
+  }, [materials, inventory, buyTickets, invoices, sinceLastCountToggle]);
+
+  const flaggedVariances = useMemo(() => {
+    return varianceData.filter(v => v.absVariance >= 5);
+  }, [varianceData]);
+
+  // TOOL 1 — Physical Count Mode Handlers
+  const handleStartPhysicalCount = (targetMaterialId?: string) => {
+    setIsCountMode(true);
+    setCountSuccessSummary(null);
+    if (targetMaterialId) {
+      setFocusedMaterialId(targetMaterialId);
+      setTimeout(() => {
+        const inputEl = countInputRefs.current[targetMaterialId];
+        if (inputEl) {
+          inputEl.focus();
+          inputEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 150);
+    }
+  };
+
+  const handleCancelPhysicalCount = () => {
+    setIsCountMode(false);
+    setCountEntries({});
+    setShowConfirmApplyCount(false);
+    setFocusedMaterialId(null);
+  };
+
+  const countedCount = useMemo(() => {
+    return Object.values(countEntries).filter(v => v !== undefined && v.trim() !== '' && !isNaN(Number(v))).length;
+  }, [countEntries]);
+
+  const handleApplyPhysicalCount = async () => {
+    if (!isManager) {
+      alert("Manager access required to apply physical count.");
+      return;
+    }
+
+    setProcessing(true);
+    try {
+      const batch = writeBatch(db);
+      const timestamp = new Date().toISOString();
+      const userName = profile?.displayName || profile?.email || auth.currentUser?.email || 'Authorized Manager';
+
+      const beforeMap: Record<string, number> = {};
+      const afterMap: Record<string, number> = {};
+      let updatedCount = 0;
+
+      materials.forEach(mat => {
+        const enteredVal = countEntries[mat.id];
+        if (enteredVal !== undefined && enteredVal.trim() !== '' && !isNaN(Number(enteredVal))) {
+          const numWeight = Number(enteredVal);
+          const currentWeight = inventory.find(i => i.materialId === mat.id)?.currentWeight ?? 0;
+
+          beforeMap[mat.id] = currentWeight;
+          afterMap[mat.id] = numWeight;
+          updatedCount++;
+
+          const invRef = doc(db, 'inventory', mat.id);
+          batch.set(invRef, {
+            materialId: mat.id,
+            currentWeight: numWeight,
+            lastUpdated: timestamp,
+            lastPhysicalCount: timestamp,
+            lastPhysicalCountBy: userName,
+            lastPhysicalCountWeight: numWeight
+          }, { merge: true });
+        }
+      });
+
+      if (updatedCount === 0) {
+        alert("No physical counts entered. Enter at least one material count before applying.");
+        setProcessing(false);
+        return;
+      }
+
+      await batch.commit();
+
+      await logAuditEvent(
+        'inventory',
+        'physical_count',
+        'adjustment',
+        { before: beforeMap, after: afterMap },
+        `Physical inventory count applied by ${userName} — ${updatedCount} materials updated`
+      );
+
+      const unchangedCount = materials.length - updatedCount;
+      const summaryMsg = `Count applied. ${updatedCount} materials updated, ${unchangedCount} unchanged.`;
+      setCountSuccessSummary(summaryMsg);
+
+      setIsCountMode(false);
+      setCountEntries({});
+      setShowConfirmApplyCount(false);
+      setFocusedMaterialId(null);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, 'inventory');
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  // TOOL 3 — Quick Conversion Presets & Handlers
+  const CONVERSION_PRESETS = [
+    {
+      label: 'THHN → Bare Bright',
+      sourceMatcher: (m: Material) => m.name.toLowerCase().includes('thhn') || m.code.toLowerCase().includes('thhn'),
+      destMatcher: (m: Material) => m.name.toLowerCase().includes('bare bright') || m.code.toLowerCase().includes('bare') || m.code.toLowerCase().includes('cu-1'),
+      typicalYield: 85,
+      notes: 'stripping run — THHN to Bare Bright'
+    },
+    {
+      label: 'Romex → Bare Bright',
+      sourceMatcher: (m: Material) => m.name.toLowerCase().includes('romex') || m.code.toLowerCase().includes('romex'),
+      destMatcher: (m: Material) => m.name.toLowerCase().includes('bare bright') || m.code.toLowerCase().includes('bare') || m.code.toLowerCase().includes('cu-1'),
+      typicalYield: 65,
+      notes: 'stripping run — Romex to Bare Bright'
+    },
+    {
+      label: 'Dirty Rads → Clean Rads',
+      sourceMatcher: (m: Material) => m.name.toLowerCase().includes('dirty rad') || (m.name.toLowerCase().includes('rad') && m.name.toLowerCase().includes('dirty')),
+      destMatcher: (m: Material) => m.name.toLowerCase().includes('clean rad') || (m.name.toLowerCase().includes('rad') && !m.name.toLowerCase().includes('dirty')),
+      typicalYield: 80,
+      notes: 'cleaning run — Dirty Rads to Clean Rads'
+    },
+    {
+      label: 'Dirty Brass → Clean Brass',
+      sourceMatcher: (m: Material) => m.name.toLowerCase().includes('dirty brass') || (m.name.toLowerCase().includes('brass') && m.name.toLowerCase().includes('dirty')),
+      destMatcher: (m: Material) => m.name.toLowerCase().includes('clean brass') || (m.name.toLowerCase().includes('brass') && !m.name.toLowerCase().includes('dirty')),
+      typicalYield: 70,
+      notes: 'sorting/cleaning — Dirty Brass to Clean Brass'
+    }
+  ];
+
+  const handleApplyPreset = (preset: typeof CONVERSION_PRESETS[0]) => {
+    const src = materials.find(preset.sourceMatcher);
+    const dest = materials.find(preset.destMatcher);
+
+    if (src) {
+      setQuickConvSourceMatId(src.id);
+      setSourceSearchQuery(`${src.code} - ${src.name}`);
+    }
+    if (dest) {
+      setQuickConvOutputMatId(dest.id);
+      setOutputSearchQuery(`${dest.code} - ${dest.name}`);
+    }
+
+    setQuickConvNotes(preset.notes);
+
+    const inputNum = parseFloat(quickConvInputWeight);
+    if (!isNaN(inputNum) && inputNum > 0) {
+      setQuickConvOutputWeight((Math.round(inputNum * (preset.typicalYield / 100))).toString());
+    }
+  };
+
+  const handleSaveQuickConversion = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setQuickConvError(null);
+    setQuickConvSuccess(null);
+
+    if (!quickConvSourceMatId || !quickConvOutputMatId) {
+      setQuickConvError('Please select both a source material and an output material.');
+      return;
+    }
+
+    if (quickConvSourceMatId === quickConvOutputMatId) {
+      setQuickConvError('Source and output material cannot be the same.');
+      return;
+    }
+
+    const inWeight = parseFloat(quickConvInputWeight);
+    const outWeight = parseFloat(quickConvOutputWeight);
+
+    if (isNaN(inWeight) || inWeight <= 0) {
+      setQuickConvError('Input weight must be a positive number greater than 0.');
+      return;
+    }
+
+    if (isNaN(outWeight) || outWeight < 0) {
+      setQuickConvError('Output weight must be a valid non-negative number.');
+      return;
+    }
+
+    const sourceInv = inventory.find(i => i.materialId === quickConvSourceMatId);
+    const sourceLive = sourceInv?.currentWeight ?? 0;
+    const sourceMat = materials.find(m => m.id === quickConvSourceMatId);
+    const outputMat = materials.find(m => m.id === quickConvOutputMatId);
+
+    const sourceName = sourceMat ? `[${sourceMat.code}] ${sourceMat.name}` : quickConvSourceMatId;
+    const outputName = outputMat ? `[${outputMat.code}] ${outputMat.name}` : quickConvOutputMatId;
+
+    if (inWeight > sourceLive) {
+      setQuickConvError(`Insufficient live inventory for ${sourceName}: Requested ${inWeight.toLocaleString()} lbs, but only ${sourceLive.toLocaleString()} lbs available in stock.`);
+      return;
+    }
+
+    setProcessing(true);
+    try {
+      const timestamp = new Date().toISOString();
+      const userEmailOrName = profile?.displayName || profile?.email || auth.currentUser?.email || 'User';
+      const yieldPct = inWeight > 0 ? Number(((outWeight / inWeight) * 100).toFixed(2)) : 0;
+
+      const batch = writeBatch(db);
+
+      // Deduct from source
+      const srcInvRef = doc(db, 'inventory', quickConvSourceMatId);
+      batch.set(srcInvRef, {
+        materialId: quickConvSourceMatId,
+        currentWeight: increment(-inWeight),
+        lastUpdated: timestamp
+      }, { merge: true });
+
+      // Add to output
+      const outInvRef = doc(db, 'inventory', quickConvOutputMatId);
+      batch.set(outInvRef, {
+        materialId: quickConvOutputMatId,
+        currentWeight: increment(outWeight),
+        lastUpdated: timestamp
+      }, { merge: true });
+
+      // Add to conversions collection
+      const convRef = doc(collection(db, 'conversions'));
+      const convLogData: ConversionLog = {
+        sourceMatId: quickConvSourceMatId,
+        sourceName: sourceMat?.name || quickConvSourceMatId,
+        inputWeight: inWeight,
+        outputMatId: quickConvOutputMatId,
+        outputName: outputMat?.name || quickConvOutputMatId,
+        outputWeight: outWeight,
+        yieldPct,
+        notes: quickConvNotes.trim() || undefined,
+        createdAt: timestamp,
+        createdBy: userEmailOrName
+      };
+      batch.set(convRef, convLogData);
+
+      // Also add to materialConversions collection for unified conversions tab compatibility
+      const matConvRef = doc(collection(db, 'materialConversions'));
+      batch.set(matConvRef, {
+        sourceMaterialId: quickConvSourceMatId,
+        consumedWeight: inWeight,
+        destinationMaterialId: quickConvOutputMatId,
+        producedWeight: outWeight,
+        yieldPercent: yieldPct,
+        destinations: [{
+          destinationMaterialId: quickConvOutputMatId,
+          producedWeight: outWeight,
+          yieldPercent: yieldPct
+        }],
+        timestamp,
+        status: 'completed',
+        notes: quickConvNotes.trim() || undefined
+      });
+
+      await batch.commit();
+
+      await logAuditEvent(
+        'inventory',
+        convRef.id,
+        'adjustment',
+        { after: convLogData },
+        `Material conversion: ${inWeight.toLocaleString()} lbs ${sourceName} → ${outWeight.toLocaleString()} lbs ${outputName} (${yieldPct.toFixed(1)}% yield)`
+      );
+
+      const msg = `Logged conversion: ${inWeight.toLocaleString()} lbs ${sourceName} → ${outWeight.toLocaleString()} lbs ${outputName} (${yieldPct.toFixed(1)}% yield)`;
+      setQuickConvSuccess(msg);
+      setConversionPageSuccessMsg(msg);
+
+      // Reset form
+      setQuickConvSourceMatId('');
+      setQuickConvInputWeight('');
+      setQuickConvOutputMatId('');
+      setQuickConvOutputWeight('');
+      setQuickConvNotes('');
+      setSourceSearchQuery('');
+      setOutputSearchQuery('');
+      setShowQuickConvPanel(false);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'conversions');
+    } finally {
+      setProcessing(false);
+    }
+  };
+
   // Ensure early returns are only evaluated AFTER all hooks have been declared to avoid hook order violations
   if (loading) {
     return (
@@ -1535,20 +1978,40 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
               Adjust Stock
             </button>
           ) : (
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              {isManager && (
+                <div className="inline-flex items-center gap-1.5">
+                  <button
+                    onClick={() => isCountMode ? handleCancelPhysicalCount() : handleStartPhysicalCount()}
+                    className={cn(
+                      "px-5 py-4.5 rounded-2xl text-xs font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-all shadow-md cursor-pointer active:scale-95",
+                      isCountMode
+                        ? "bg-amber-500 hover:bg-amber-600 text-white shadow-amber-200 ring-2 ring-amber-400"
+                        : "bg-indigo-600 hover:bg-indigo-700 text-white shadow-indigo-100"
+                    )}
+                  >
+                    <ClipboardCheck className="w-4 h-4" />
+                    {isCountMode ? "Exit Count Mode" : "Start Physical Count"}
+                  </button>
+                  <Hint text="Walk the yard and enter what's actually there. Applying the count overwrites the app's numbers — do this weekly or after a big processing day." />
+                </div>
+              )}
+              <div className="inline-flex items-center gap-1.5">
+                <button
+                  onClick={() => setShowQuickConvPanel(true)}
+                  className="px-5 py-4.5 bg-slate-900 hover:bg-slate-800 active:scale-95 text-white rounded-2xl text-xs font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-all shadow-md cursor-pointer"
+                >
+                  <Repeat className="w-4 h-4 text-emerald-400" />
+                  Log Conversion
+                </button>
+                <Hint text="Record stripping or cleaning here — e.g. THHN → Bare Bright. It moves the weight between materials so invoices don't show false shortfalls. Presets fill in typical yields." />
+              </div>
               <button
                 onClick={() => handleOpenAdjustmentModal()}
                 className="px-5 py-4.5 bg-amber-600 hover:bg-amber-700 active:scale-95 text-white rounded-2xl text-xs font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-all shadow-md shadow-amber-100 cursor-pointer"
               >
                 <SlidersHorizontal className="w-4 h-4" />
                 Adjust Stock
-              </button>
-              <button
-                onClick={() => handleOpenConversionModal()}
-                className="px-5 py-4.5 bg-slate-900 hover:bg-slate-800 active:scale-95 text-white rounded-2xl text-xs font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-all shadow-md cursor-pointer"
-              >
-                <Repeat className="w-4 h-4" />
-                Convert Material
               </button>
               <button
                 onClick={() => handleOpenRecordSale()}
@@ -1561,6 +2024,50 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
           )}
         </div>
       </header>
+
+      {/* Page-level success feedback banner for Physical Count */}
+      {countSuccessSummary && (
+        <div className="p-5 bg-emerald-50 border border-emerald-200 rounded-3xl flex items-center justify-between gap-4 text-xs text-emerald-950 shadow-sm animate-in fade-in slide-in-from-top-2 duration-300 mb-6">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-emerald-100 rounded-2xl text-emerald-700 shrink-0">
+              <ClipboardCheck className="w-5 h-5" />
+            </div>
+            <div>
+              <h5 className="font-black uppercase tracking-wider text-emerald-950">Physical Count Applied</h5>
+              <p className="font-medium text-emerald-900 mt-0.5">{countSuccessSummary}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setCountSuccessSummary(null)}
+            className="p-2 text-emerald-700 hover:text-emerald-950 hover:bg-emerald-100 rounded-xl transition-all cursor-pointer"
+            aria-label="Dismiss message"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Page-level success feedback banner for Quick Conversion */}
+      {quickConvSuccess && (
+        <div className="p-5 bg-emerald-50 border border-emerald-200 rounded-3xl flex items-center justify-between gap-4 text-xs text-emerald-950 shadow-sm animate-in fade-in slide-in-from-top-2 duration-300 mb-6">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-emerald-100 rounded-2xl text-emerald-700 shrink-0">
+              <CheckCircle2 className="w-5 h-5" />
+            </div>
+            <div>
+              <h5 className="font-black uppercase tracking-wider text-emerald-950">Conversion Recorded</h5>
+              <p className="font-medium text-emerald-900 mt-0.5">{quickConvSuccess}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setQuickConvSuccess(null)}
+            className="p-2 text-emerald-700 hover:text-emerald-950 hover:bg-emerald-100 rounded-xl transition-all cursor-pointer"
+            aria-label="Dismiss message"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Page-level success feedback banner */}
       {conversionPageSuccessMsg && (
@@ -1607,221 +2114,533 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
 
       {activeTab === 'inventory' && (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-300">
-          {/* Load Dispatch & Ready-to-Ship Leaderboard */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 bg-slate-50 border border-slate-200/60 rounded-[2.5rem] p-8">
-            {/* Column 1 & 2: Leaderboard progress */}
-            <div className="lg:col-span-2 space-y-4">
-              <div className="flex items-center gap-2">
-                <BarChart3 className="w-5 h-5 text-blue-600" />
-                <h2 className="text-lg font-black text-slate-900 uppercase tracking-tight">Load Ready Leaderboard</h2>
-              </div>
-              <p className="text-xs text-slate-400 font-bold uppercase tracking-widest leading-none">Your materials ranked from heaviest to lightest weight</p>
-              
-              <div className="space-y-4 mt-6">
-                {heaviestMaterials.length > 0 ? (
-                  heaviestMaterials.map((item) => {
-                    const maxWeight = heaviestMaterials[0]?.weight || 1;
-                    const percent = Math.min((item.weight / maxWeight) * 100, 100);
-                    return (
-                      <div key={item.id} className="space-y-1.5">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="font-bold text-slate-700 uppercase tracking-tight">
-                            <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200 mr-2 text-[10px] font-black text-slate-500">{item.code}</span>
-                            {item.name}
-                          </span>
-                          <span className="font-black text-slate-900">{item.weight.toLocaleString()} {item.unit}</span>
-                        </div>
-                        <div className="h-3 bg-white border border-slate-200/60 rounded-full overflow-hidden p-[2px]">
-                          <div 
-                            className="h-full bg-blue-600 rounded-full transition-all duration-1000"
-                            style={{ width: `${percent}%` }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })
-                ) : (
-                  <p className="text-sm text-slate-400 font-bold py-6 uppercase tracking-wider">No stock recorded in yard yet. Buy tickets will automatically increase real-time stock levels.</p>
-                )}
-              </div>
-            </div>
-
-            {/* Column 3: Quick Insights */}
-            <div className="bg-white border border-slate-200/85 rounded-3xl p-6 flex flex-col justify-between shadow-sm">
-              <div className="space-y-4">
-                <div className="flex items-center gap-2 text-slate-400">
-                  <TrendingUp className="w-4 h-4 text-emerald-600" />
-                  <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">Dispatch Insights</span>
+          {/* TOOL 2 — Expected vs. Actual Stock Variance Dashboard */}
+          <div className="bg-white border border-slate-200/80 rounded-[2.5rem] p-6 sm:p-8 shadow-sm space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="p-3 bg-blue-50 text-blue-600 rounded-2xl">
+                  <Scale className="w-6 h-6" />
                 </div>
-                
-                <div className="space-y-1">
-                  <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Yard Weight</p>
-                  <p className="text-4xl font-black text-slate-900 tracking-tight">
-                    {totalYardWeight.toLocaleString()} <span className="text-sm font-medium text-slate-400 uppercase tracking-widest">lbs</span>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-xl font-black text-slate-900 uppercase tracking-tight">
+                      Expected vs. Actual Stock Variance
+                    </h2>
+                    <Hint text="Compares what tickets brought in minus what invoices sent out against what the app shows in stock. Amber = small gap, probably an unlogged conversion. Red = do a count on that material." />
+                  </div>
+                  <p className="text-xs text-slate-500 font-medium mt-0.5">
+                    Calculates theoretical expected weight from completed buy tickets and paid invoices vs. live on-hand inventory.
                   </p>
                 </div>
+              </div>
 
-                <div className="pt-4 border-t border-slate-100 space-y-1">
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Heaviest Material</p>
-                  {heaviestMaterials.length > 0 ? (
-                    <div>
-                      <p className="text-sm font-black text-slate-800 uppercase tracking-tight">{heaviestMaterials[0].name}</p>
-                      <p className="text-xs text-slate-500 font-bold uppercase tracking-wider">{heaviestMaterials[0].weight.toLocaleString()} {heaviestMaterials[0].unit} in stock</p>
-                    </div>
-                  ) : (
-                    <p className="text-xs text-slate-400 font-bold uppercase tracking-wider">N/A</p>
+              {/* Toggle: Since last count vs All-time */}
+              <div className="flex items-center gap-2 bg-slate-100 p-1.5 rounded-2xl self-start sm:self-auto">
+                <button
+                  type="button"
+                  onClick={() => setSinceLastCountToggle(true)}
+                  className={cn(
+                    "px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer",
+                    sinceLastCountToggle ? "bg-white text-blue-600 shadow-xs" : "text-slate-500 hover:text-slate-800"
                   )}
+                >
+                  Since Last Physical Count
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSinceLastCountToggle(false)}
+                  className={cn(
+                    "px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer",
+                    !sinceLastCountToggle ? "bg-white text-blue-600 shadow-xs" : "text-slate-500 hover:text-slate-800"
+                  )}
+                >
+                  All-Time Ledger
+                </button>
+              </div>
+            </div>
+
+            {flaggedVariances.length === 0 ? (
+              <div className="p-6 bg-emerald-50/80 border border-emerald-200 rounded-3xl flex items-center gap-4 text-emerald-950">
+                <div className="p-3 bg-emerald-100 rounded-2xl text-emerald-700 shrink-0">
+                  <CheckCircle2 className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="font-black text-sm uppercase tracking-wide text-emerald-950">
+                    All materials within tolerance ✓
+                  </h3>
+                  <p className="text-xs text-emerald-800 mt-0.5">
+                    Live inventory matches expected purchase and sales totals across all materials within ±5 lbs tolerance.
+                  </p>
                 </div>
               </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between text-xs text-slate-500 px-1 gap-1">
+                  <span className="font-bold uppercase tracking-wider">
+                    Flagged Discrepancies ({flaggedVariances.length} materials with &ge; 5 lbs variance)
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    Amber = Moderate Discrepancy • Red = Critical Deficit (&gt;50 lbs short)
+                  </span>
+                </div>
 
-              <div className="mt-6 pt-4 border-t border-slate-100">
-                <p className="text-[10px] text-slate-400 leading-relaxed font-bold uppercase tracking-wider">
-                  💡 Tip: Prioritize your first outbound load using these heaviest stock weights to optimize truck capacity.
-                </p>
-              </div>
-            </div>
-          </div>
-
-          {/* Grid Controls (Search, Sort, Category Filters) */}
-          <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 pt-4 border-t border-slate-100">
-            <div className="relative group w-full md:max-w-md">
-              <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-blue-600 transition-colors" />
-              <input
-                type="text"
-                className="w-full pl-10 pr-4 py-4 bg-white border border-slate-200 rounded-2xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all shadow-sm"
-                placeholder="Search materials in stock..."
-                value={stockSearch}
-                onChange={(e) => setStockSearch(e.target.value)}
-              />
-            </div>
-
-            <div className="flex flex-wrap items-center gap-4">
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Category:</span>
-                <select
-                  value={selectedCategory}
-                  onChange={(e) => setSelectedCategory(e.target.value)}
-                  className="bg-white border border-slate-200 px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-wider outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  {categories.map((cat) => (
-                    <option key={cat} value={cat}>
-                      {cat === 'all' ? 'All Categories' : cat.toUpperCase()}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Sort:</span>
-                <select
-                  value={stockSort}
-                  onChange={(e) => setStockSort(e.target.value as any)}
-                  className="bg-white border border-slate-200 px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-wider outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="weight-desc">Weight (High to Low)</option>
-                  <option value="weight-asc">Weight (Low to High)</option>
-                  <option value="code">Material Code</option>
-                  <option value="name">Material Name</option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8" aria-label="Material Inventory">
-            {filteredAndSortedStock.map((material) => {
-              const weight = material.weight;
-              const isLow = weight < 100;
-
-              return (
-                <article 
-                  key={material.id} 
-                  className="bg-white rounded-[2.5rem] border border-slate-200 p-8 shadow-sm hover:shadow-xl hover:shadow-slate-200/40 transition-all group relative flex flex-col justify-between min-h-[300px]"
-                  aria-labelledby={`material-title-${material.id}`}
-                >
-                  <div>
-                    <div className="flex items-start justify-between mb-6">
-                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 group-hover:bg-blue-50 group-hover:border-blue-100 transition-colors">
-                        <span className="font-mono text-sm font-black text-slate-500 group-hover:text-blue-600">{material.code}</span>
-                      </div>
-                      {isLow && (
-                        <span className="flex items-center gap-1.5 text-[10px] font-black text-amber-600 bg-amber-50 px-3.5 py-2 rounded-full uppercase tracking-widest border border-amber-100 animate-pulse" role="status">
-                          <AlertCircle className="w-3.5 h-3.5" aria-hidden="true" />
-                          Low Stock
-                        </span>
-                      )}
-                    </div>
-                    
-                    <h3 id={`material-title-${material.id}`} className="font-black text-slate-900 text-2xl uppercase tracking-tight leading-none">{material.name}</h3>
-                    <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest mt-2">{material.category}</p>
-                  </div>
-                  
-                  <div className="mt-8 space-y-4">
-                    <div>
-                      <p className="text-5xl font-black text-slate-900 tracking-tight">
-                        {weight.toLocaleString()} <span className="text-sm font-medium text-slate-400 uppercase tracking-widest ml-1">{material.unit}</span>
-                      </p>
-                      <div className="flex items-center gap-2 mt-4">
-                        <div className="flex-1 h-3.5 bg-slate-100 rounded-full overflow-hidden shadow-inner" role="progressbar" aria-valuenow={weight} aria-valuemin={0} aria-valuemax={2000} aria-label={`${material.name} stock level`}>
-                          <div 
-                            className={cn(
-                              "h-full rounded-full transition-all duration-1000 ease-out",
-                              isLow ? "bg-amber-500" : "bg-blue-600"
+                <div className="overflow-x-auto rounded-2xl border border-slate-200/80">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                        <th className="p-4">Material</th>
+                        <th className="p-4 text-right">Expected</th>
+                        <th className="p-4 text-right">Actual Live</th>
+                        <th className="p-4 text-right">Variance</th>
+                        <th className="p-4">Discrepancy Analysis</th>
+                        <th className="p-4 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 bg-white">
+                      {flaggedVariances.map(item => (
+                        <tr 
+                          key={item.material.id}
+                          className={cn(
+                            "transition-colors",
+                            item.severity === 'red' ? "bg-red-50/60 hover:bg-red-50" : "bg-amber-50/40 hover:bg-amber-50/70"
+                          )}
+                        >
+                          <td className="p-4 font-bold text-slate-900">
+                            <span className="font-mono bg-white px-2 py-0.5 rounded border border-slate-200 mr-2 text-[10px] font-black text-slate-600">
+                              {item.material.code}
+                            </span>
+                            {item.material.name}
+                          </td>
+                          <td className="p-4 text-right font-mono font-bold text-slate-600">
+                            {Math.round(item.expected).toLocaleString()} {item.material.unit}
+                          </td>
+                          <td className="p-4 text-right font-mono font-black text-slate-900">
+                            {Math.round(item.actual).toLocaleString()} {item.material.unit}
+                          </td>
+                          <td className="p-4 text-right font-mono font-black">
+                            <span className={cn(
+                              "px-2.5 py-1 rounded-full text-xs inline-block",
+                              item.variance < 0 
+                                ? (item.severity === 'red' ? "bg-red-200 text-red-950 font-black" : "bg-amber-200 text-amber-950")
+                                : "bg-blue-100 text-blue-950"
+                            )}>
+                              {item.variance > 0 ? `+${Math.round(item.variance).toLocaleString()}` : `${Math.round(item.variance).toLocaleString()}`} {item.material.unit}
+                            </span>
+                          </td>
+                          <td className="p-4">
+                            <div className="flex items-center gap-2">
+                              {item.severity === 'red' ? (
+                                <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                              ) : (
+                                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                              )}
+                              <span className={cn(
+                                "font-semibold text-xs",
+                                item.severity === 'red' ? "text-red-900" : "text-amber-900"
+                              )}>
+                                {item.message}
+                              </span>
+                            </div>
+                            {item.lastPhysicalCount && (
+                              <p className="text-[10px] text-slate-400 mt-0.5 ml-6">
+                                Last count: {new Date(item.lastPhysicalCount).toLocaleDateString()} {item.lastPhysicalCountBy ? `by ${item.lastPhysicalCountBy}` : ''}
+                              </p>
                             )}
-                            style={{ width: `${Math.min((weight / 2000) * 100, 100)}%` }}
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="pt-6 border-t border-slate-50 flex items-center justify-between text-slate-400 text-[10px] font-black uppercase tracking-widest">
-                      <span>
-                        Updated: {material.lastUpdated ? new Date(material.lastUpdated).toLocaleDateString() : 'Never'}
-                      </span>
-                      <div className="flex items-center gap-2">
-                        <button 
-                          onClick={() => handleOpenAdjustmentModal(material.id)}
-                          className="flex items-center gap-1.5 text-slate-700 font-black hover:text-amber-600 transition-colors bg-slate-100 hover:bg-amber-50 rounded-xl px-3 py-2 active:scale-95 cursor-pointer"
-                          aria-label={`Adjust stock for ${material.name}`}
-                          title="Manual inventory adjustment (addition or loss deduction)"
-                        >
-                          <SlidersHorizontal className="w-3.5 h-3.5 text-amber-600" />
-                          Adjust
-                        </button>
-                        <button 
-                          onClick={() => handleOpenConversionModal(material.id)}
-                          className="flex items-center gap-1.5 text-slate-700 font-black hover:text-blue-600 transition-colors bg-slate-100 hover:bg-blue-50 rounded-xl px-3 py-2 active:scale-95 cursor-pointer"
-                          aria-label={`Convert ${material.name}`}
-                          title="Process or convert material"
-                        >
-                          <Repeat className="w-3.5 h-3.5 text-blue-600" />
-                          Convert
-                        </button>
-                        <button 
-                          onClick={() => handleOpenRecordSale(material.id)}
-                          className="flex items-center gap-2 text-blue-600 font-black hover:text-blue-700 transition-colors bg-blue-50/50 hover:bg-blue-50 rounded-xl px-3.5 py-2 active:scale-95 cursor-pointer"
-                          aria-label={`Record external sale for ${material.name}`}
-                        >
-                          Record Sale
-                          <ArrowUpRight className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </article>
-              );
-            })}
-            {filteredAndSortedStock.length === 0 && (
-              <div className="col-span-full py-16 text-center">
-                <div className="max-w-xs mx-auto space-y-3">
-                  <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto">
-                    <Package className="w-8 h-8 text-slate-300" />
-                  </div>
-                  <p className="text-slate-900 font-bold">No stock matches found</p>
-                  <p className="text-sm text-slate-500">No materials matched your filters or search query.</p>
+                          </td>
+                          <td className="p-4 text-right">
+                            <button
+                              onClick={() => handleStartPhysicalCount(item.material.id)}
+                              className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-[11px] font-black uppercase tracking-wider transition-all cursor-pointer inline-flex items-center gap-1.5 shadow-sm active:scale-95"
+                            >
+                              <ClipboardCheck className="w-3.5 h-3.5 text-blue-400" />
+                              Count Now
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
             )}
-          </section>
+          </div>
+
+          {/* If in Count Mode, show Count Table & Sticky Footer; else show Normal Grid */}
+          {isCountMode ? (
+            <div className="space-y-6">
+              <div className="bg-indigo-900 text-white rounded-[2.5rem] p-8 shadow-xl relative overflow-hidden">
+                <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
+                  <div className="space-y-2">
+                    <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-800 text-indigo-200 text-xs font-black uppercase tracking-widest border border-indigo-700">
+                      <ClipboardCheck className="w-4 h-4 text-emerald-400" />
+                      Physical Inventory Count Active
+                    </div>
+                    <h2 className="text-2xl font-black uppercase tracking-tight text-white">
+                      Direct Yard Physical Count
+                    </h2>
+                    <p className="text-xs text-indigo-200 font-medium max-w-xl">
+                      Enter measured physical weights for materials in yard. Leave fields blank to retain current system weights.
+                      Cashiers and staff can enter counts — only Managers can apply overwrites to live inventory.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <div className="text-right">
+                      <p className="text-[10px] font-black uppercase tracking-widest text-indigo-300">Progress</p>
+                      <p className="text-2xl font-black font-mono text-white">
+                        {countedCount} / {materials.length}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Search filter in count mode */}
+              <div className="relative group w-full max-w-md">
+                <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-blue-600 transition-colors" />
+                <input
+                  type="text"
+                  className="w-full pl-10 pr-4 py-3 bg-white border border-slate-200 rounded-2xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all shadow-sm"
+                  placeholder="Filter materials to count..."
+                  value={stockSearch}
+                  onChange={(e) => setStockSearch(e.target.value)}
+                />
+              </div>
+
+              {/* 3-Column Counting Table */}
+              <div className="bg-white rounded-[2.5rem] border border-slate-200 shadow-sm overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                        <th className="p-5">Material Name & Code</th>
+                        <th className="p-5 text-right w-48">App Weight (Read-Only)</th>
+                        <th className="p-5 text-right w-64">Physical Count (lbs)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {filteredAndSortedStock.map((mat) => {
+                        const isTargetFocused = focusedMaterialId === mat.id;
+                        const currentWeight = mat.weight;
+                        const enteredVal = countEntries[mat.id] ?? '';
+                        const hasEntry = enteredVal.trim() !== '' && !isNaN(Number(enteredVal));
+
+                        return (
+                          <tr 
+                            key={mat.id}
+                            className={cn(
+                              "transition-colors",
+                              isTargetFocused ? "bg-indigo-50/70" : (hasEntry ? "bg-emerald-50/30 hover:bg-emerald-50/50" : "hover:bg-slate-50/70")
+                            )}
+                          >
+                            <td className="p-5">
+                              <div className="flex items-center gap-3">
+                                <span className="font-mono bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200 text-xs font-black text-slate-600">
+                                  {mat.code}
+                                </span>
+                                <div>
+                                  <h4 className="font-black text-slate-900 text-sm uppercase tracking-tight">{mat.name}</h4>
+                                  <p className="text-[10px] text-slate-400 uppercase tracking-widest font-black">{mat.category}</p>
+                                </div>
+                              </div>
+                            </td>
+                            <td className="p-5 text-right">
+                              <span className="px-3 py-1.5 bg-slate-100 text-slate-500 font-mono text-xs font-bold rounded-xl border border-slate-200/80 inline-block">
+                                {currentWeight.toLocaleString()} {mat.unit}
+                              </span>
+                            </td>
+                            <td className="p-5 text-right">
+                              <div className="flex items-center justify-end gap-2">
+                                <input
+                                  ref={el => { countInputRefs.current[mat.id] = el; }}
+                                  type="number"
+                                  min="0"
+                                  step="any"
+                                  placeholder="Enter count..."
+                                  value={enteredVal}
+                                  onChange={(e) => {
+                                    setCountEntries(prev => ({
+                                      ...prev,
+                                      [mat.id]: e.target.value
+                                    }));
+                                  }}
+                                  className={cn(
+                                    "w-44 px-4 py-2.5 bg-white border rounded-xl text-xs font-mono font-bold text-right outline-none focus:ring-2 focus:ring-indigo-500 transition-all shadow-inner",
+                                    hasEntry ? "border-emerald-500 text-emerald-950 bg-emerald-50/40" : "border-slate-300 text-slate-900"
+                                  )}
+                                />
+                                <span className="text-slate-400 text-xs font-bold uppercase w-6 text-left">{mat.unit}</span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Sticky Footer for Count Mode */}
+              <div className="sticky bottom-4 z-40 bg-slate-900/95 backdrop-blur-md text-white p-4 sm:p-5 rounded-3xl shadow-2xl border border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4 animate-in slide-in-from-bottom-3 duration-300">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 bg-indigo-600 rounded-2xl text-white">
+                    <ClipboardCheck className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-wider text-white">
+                      <span className="text-emerald-400 font-mono text-sm">{countedCount}</span> of {materials.length} materials counted
+                    </p>
+                    <p className="text-[11px] text-slate-400">
+                      Unentered materials will retain their current app weights unchanged.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    onClick={handleCancelPhysicalCount}
+                    className="flex-1 sm:flex-none px-6 py-3.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-2xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer active:scale-95"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={processing || countedCount === 0}
+                    onClick={() => {
+                      if (!isManager) {
+                        alert("Manager role is required to apply physical inventory counts.");
+                        return;
+                      }
+                      setShowConfirmApplyCount(true);
+                    }}
+                    className="flex-1 sm:flex-none px-8 py-3.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-2xl text-xs font-black uppercase tracking-wider flex items-center justify-center gap-2 transition-all shadow-lg shadow-emerald-900/40 cursor-pointer active:scale-95"
+                  >
+                    <Check className="w-4 h-4" />
+                    Apply Count {countedCount > 0 ? `(${countedCount})` : ''}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* Load Dispatch & Ready-to-Ship Leaderboard */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 bg-slate-50 border border-slate-200/60 rounded-[2.5rem] p-8">
+                {/* Column 1 & 2: Leaderboard progress */}
+                <div className="lg:col-span-2 space-y-4">
+                  <div className="flex items-center gap-2">
+                    <BarChart3 className="w-5 h-5 text-blue-600" />
+                    <h2 className="text-lg font-black text-slate-900 uppercase tracking-tight">Load Ready Leaderboard</h2>
+                  </div>
+                  <p className="text-xs text-slate-400 font-bold uppercase tracking-widest leading-none">Your materials ranked from heaviest to lightest weight</p>
+                  
+                  <div className="space-y-4 mt-6">
+                    {heaviestMaterials.length > 0 ? (
+                      heaviestMaterials.map((item) => {
+                        const maxWeight = heaviestMaterials[0]?.weight || 1;
+                        const percent = Math.min((item.weight / maxWeight) * 100, 100);
+                        return (
+                          <div key={item.id} className="space-y-1.5">
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="font-bold text-slate-700 uppercase tracking-tight">
+                                <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200 mr-2 text-[10px] font-black text-slate-500">{item.code}</span>
+                                {item.name}
+                              </span>
+                              <span className="font-black text-slate-900">{item.weight.toLocaleString()} {item.unit}</span>
+                            </div>
+                            <div className="h-3 bg-white border border-slate-200/60 rounded-full overflow-hidden p-[2px]">
+                              <div 
+                                className="h-full bg-blue-600 rounded-full transition-all duration-1000"
+                                style={{ width: `${percent}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <p className="text-sm text-slate-400 font-bold py-6 uppercase tracking-wider">No stock recorded in yard yet. Buy tickets will automatically increase real-time stock levels.</p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Column 3: Quick Insights */}
+                <div className="bg-white border border-slate-200/85 rounded-3xl p-6 flex flex-col justify-between shadow-sm">
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-2 text-slate-400">
+                      <TrendingUp className="w-4 h-4 text-emerald-600" />
+                      <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">Dispatch Insights</span>
+                    </div>
+                    
+                    <div className="space-y-1">
+                      <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Yard Weight</p>
+                      <p className="text-4xl font-black text-slate-900 tracking-tight">
+                        {totalYardWeight.toLocaleString()} <span className="text-sm font-medium text-slate-400 uppercase tracking-widest">lbs</span>
+                      </p>
+                    </div>
+
+                    <div className="pt-4 border-t border-slate-100 space-y-1">
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Heaviest Material</p>
+                      {heaviestMaterials.length > 0 ? (
+                        <div>
+                          <p className="text-sm font-black text-slate-800 uppercase tracking-tight">{heaviestMaterials[0].name}</p>
+                          <p className="text-xs text-slate-500 font-bold uppercase tracking-wider">{heaviestMaterials[0].weight.toLocaleString()} {heaviestMaterials[0].unit} in stock</p>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-400 font-bold uppercase tracking-wider">N/A</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-6 pt-4 border-t border-slate-100">
+                    <p className="text-[10px] text-slate-400 leading-relaxed font-bold uppercase tracking-wider">
+                      💡 Tip: Prioritize your first outbound load using these heaviest stock weights to optimize truck capacity.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Grid Controls (Search, Sort, Category Filters) */}
+              <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 pt-4 border-t border-slate-100">
+                <div className="relative group w-full md:max-w-md">
+                  <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-blue-600 transition-colors" />
+                  <input
+                    type="text"
+                    className="w-full pl-10 pr-4 py-4 bg-white border border-slate-200 rounded-2xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all shadow-sm"
+                    placeholder="Search materials in stock..."
+                    value={stockSearch}
+                    onChange={(e) => setStockSearch(e.target.value)}
+                  />
+                </div>
+
+                <div className="flex flex-wrap items-center gap-4">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Category:</span>
+                    <select
+                      value={selectedCategory}
+                      onChange={(e) => setSelectedCategory(e.target.value)}
+                      className="bg-white border border-slate-200 px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-wider outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      {categories.map((cat) => (
+                        <option key={cat} value={cat}>
+                          {cat === 'all' ? 'All Categories' : cat.toUpperCase()}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Sort:</span>
+                    <select
+                      value={stockSort}
+                      onChange={(e) => setStockSort(e.target.value as any)}
+                      className="bg-white border border-slate-200 px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-wider outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="weight-desc">Weight (High to Low)</option>
+                      <option value="weight-asc">Weight (Low to High)</option>
+                      <option value="code">Material Code</option>
+                      <option value="name">Material Name</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8" aria-label="Material Inventory">
+                {filteredAndSortedStock.map((material) => {
+                  const weight = material.weight;
+                  const isLow = weight < 100;
+
+                  return (
+                    <article 
+                      key={material.id} 
+                      className="bg-white rounded-[2.5rem] border border-slate-200 p-8 shadow-sm hover:shadow-xl hover:shadow-slate-200/40 transition-all group relative flex flex-col justify-between min-h-[300px]"
+                      aria-labelledby={`material-title-${material.id}`}
+                    >
+                      <div>
+                        <div className="flex items-start justify-between mb-6">
+                          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 group-hover:bg-blue-50 group-hover:border-blue-100 transition-colors">
+                            <span className="font-mono text-sm font-black text-slate-500 group-hover:text-blue-600">{material.code}</span>
+                          </div>
+                          {isLow && (
+                            <span className="flex items-center gap-1.5 text-[10px] font-black text-amber-600 bg-amber-50 px-3.5 py-2 rounded-full uppercase tracking-widest border border-amber-100 animate-pulse" role="status">
+                              <AlertCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                              Low Stock
+                            </span>
+                          )}
+                        </div>
+                        
+                        <h3 id={`material-title-${material.id}`} className="font-black text-slate-900 text-2xl uppercase tracking-tight leading-none">{material.name}</h3>
+                        <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest mt-2">{material.category}</p>
+                      </div>
+                      
+                      <div className="mt-8 space-y-4">
+                        <div>
+                          <p className="text-5xl font-black text-slate-900 tracking-tight">
+                            {weight.toLocaleString()} <span className="text-sm font-medium text-slate-400 uppercase tracking-widest ml-1">{material.unit}</span>
+                          </p>
+                          <div className="flex items-center gap-2 mt-4">
+                            <div className="flex-1 h-3.5 bg-slate-100 rounded-full overflow-hidden shadow-inner" role="progressbar" aria-valuenow={weight} aria-valuemin={0} aria-valuemax={2000} aria-label={`${material.name} stock level`}>
+                              <div 
+                                className={cn(
+                                  "h-full rounded-full transition-all duration-1000 ease-out",
+                                  isLow ? "bg-amber-500" : "bg-blue-600"
+                                )}
+                                style={{ width: `${Math.min((weight / 2000) * 100, 100)}%` }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="pt-6 border-t border-slate-50 flex items-center justify-between text-slate-400 text-[10px] font-black uppercase tracking-widest">
+                          <span>
+                            Updated: {material.lastUpdated ? new Date(material.lastUpdated).toLocaleDateString() : 'Never'}
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <button 
+                              onClick={() => handleOpenAdjustmentModal(material.id)}
+                              className="flex items-center gap-1.5 text-slate-700 font-black hover:text-amber-600 transition-colors bg-slate-100 hover:bg-amber-50 rounded-xl px-3 py-2 active:scale-95 cursor-pointer"
+                              aria-label={`Adjust stock for ${material.name}`}
+                              title="Manual inventory adjustment (addition or loss deduction)"
+                            >
+                              <SlidersHorizontal className="w-3.5 h-3.5 text-amber-600" />
+                              Adjust
+                            </button>
+                            <button 
+                              onClick={() => handleOpenConversionModal(material.id)}
+                              className="flex items-center gap-1.5 text-slate-700 font-black hover:text-blue-600 transition-colors bg-slate-100 hover:bg-blue-50 rounded-xl px-3 py-2 active:scale-95 cursor-pointer"
+                              aria-label={`Convert ${material.name}`}
+                              title="Process or convert material"
+                            >
+                              <Repeat className="w-3.5 h-3.5 text-blue-600" />
+                              Convert
+                            </button>
+                            <button 
+                              onClick={() => handleOpenRecordSale(material.id)}
+                              className="flex items-center gap-2 text-blue-600 font-black hover:text-blue-700 transition-colors bg-blue-50/50 hover:bg-blue-50 rounded-xl px-3.5 py-2 active:scale-95 cursor-pointer"
+                              aria-label={`Record external sale for ${material.name}`}
+                            >
+                              Record Sale
+                              <ArrowUpRight className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </article>
+                  );
+                })}
+                {filteredAndSortedStock.length === 0 && (
+                  <div className="col-span-full py-16 text-center">
+                    <div className="max-w-xs mx-auto space-y-3">
+                      <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto">
+                        <Package className="w-8 h-8 text-slate-300" />
+                      </div>
+                      <p className="text-slate-900 font-bold">No stock matches found</p>
+                      <p className="text-sm text-slate-500">No materials matched your filters or search query.</p>
+                    </div>
+                  </div>
+                )}
+              </section>
+            </>
+          )}
         </div>
       )}
 
@@ -3943,6 +4762,304 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
                     <>
                       <SlidersHorizontal className="w-4 h-4" />
                       Confirm Adjustment
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* TOOL 1: Confirm Apply Physical Count Modal */}
+      {showConfirmApplyCount && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200" role="dialog" aria-modal="true">
+          <div className="bg-white rounded-[2.5rem] w-full max-w-lg p-8 border border-slate-100 shadow-2xl relative space-y-6 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center gap-3">
+              <div className="p-3 bg-amber-100 text-amber-800 rounded-2xl">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-xl font-black text-slate-900 uppercase tracking-tight">
+                  Confirm Physical Count Overwrite
+                </h3>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">
+                  Manager Authorization Required
+                </p>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-700 leading-relaxed font-medium">
+              This will overwrite live yard inventory for <strong className="text-slate-950 font-bold">{countedCount} materials</strong> with your verified physical counts. Uncounted materials will remain untouched.
+            </p>
+
+            <div className="p-4 bg-slate-50 border border-slate-200/80 rounded-2xl max-h-48 overflow-y-auto space-y-2">
+              {Object.entries(countEntries)
+                .filter(([_, val]) => val.trim() !== '' && !isNaN(Number(val)))
+                .map(([matId, val]) => {
+                  const m = materials.find(item => item.id === matId);
+                  const currentW = (inventory.find(i => i.materialId === matId)?.currentWeight || 0);
+                  const newW = Number(val);
+                  const diff = newW - currentW;
+
+                  return (
+                    <div key={matId} className="flex items-center justify-between text-xs py-1 border-b border-slate-200/50 last:border-0">
+                      <span className="font-bold text-slate-800">
+                        <span className="font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200 mr-1.5 text-[10px] text-slate-500 font-bold">
+                          {m?.code || '???'}
+                        </span>
+                        {m?.name || 'Material'}
+                      </span>
+                      <div className="flex items-center gap-2 font-mono">
+                        <span className="text-slate-400">{currentW.toLocaleString()}</span>
+                        <span className="text-slate-400">&rarr;</span>
+                        <span className="font-black text-slate-950">{newW.toLocaleString()} lbs</span>
+                        <span className={cn(
+                          "text-[10px] font-bold px-1.5 py-0.2 rounded",
+                          diff >= 0 ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-800"
+                        )}>
+                          {diff >= 0 ? `+${diff}` : diff}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowConfirmApplyCount(false)}
+                disabled={processing}
+                className="px-5 py-3 text-slate-600 hover:text-slate-800 rounded-xl text-xs font-bold transition-all cursor-pointer"
+              >
+                Go Back
+              </button>
+              <button
+                type="button"
+                disabled={processing}
+                onClick={handleApplyPhysicalCount}
+                className="px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center gap-2 transition-all shadow-md shadow-emerald-100 disabled:opacity-50 cursor-pointer"
+              >
+                {processing ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Applying...
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-4 h-4" />
+                    Confirm & Apply
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TOOL 3: Quick Conversion Entry Drawer / Modal */}
+      {showQuickConvPanel && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200" role="dialog" aria-modal="true">
+          <div className="bg-white rounded-[2.5rem] w-full max-w-2xl p-8 sm:p-10 border border-slate-100 shadow-2xl relative space-y-6 animate-in zoom-in-95 duration-200 max-h-[90vh] overflow-y-auto">
+            <button
+              onClick={() => setShowQuickConvPanel(false)}
+              className="absolute top-8 right-8 w-10 h-10 flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all cursor-pointer"
+              aria-label="Close panel"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-3">
+              <div className="p-3 bg-slate-900 text-white rounded-2xl">
+                <Repeat className="w-6 h-6 text-emerald-400" />
+              </div>
+              <div>
+                <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">
+                  Quick Material Conversion
+                </h2>
+                <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-0.5">
+                  Process wire, stripping, or sorting transformations
+                </p>
+              </div>
+            </div>
+
+            {quickConvError && (
+              <div className="p-4 bg-red-50 border border-red-200 rounded-2xl flex items-center gap-3 text-xs text-red-800 animate-in fade-in duration-200">
+                <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                <span className="font-semibold">{quickConvError}</span>
+              </div>
+            )}
+
+            {/* Conversion Presets */}
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block">
+                1-Click Presets:
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {CONVERSION_PRESETS.map((preset, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => handleApplyPreset(preset)}
+                    className="p-3 text-left bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 rounded-xl transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-black text-slate-800 group-hover:text-blue-600 uppercase tracking-tight">
+                        {preset.label}
+                      </span>
+                      <span className="text-[10px] font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-slate-200 text-slate-600">
+                        {preset.typicalYield}%
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 font-medium mt-0.5 truncate">
+                      {preset.notes}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <form onSubmit={handleSaveQuickConversion} className="space-y-5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+                {/* Source Material */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">
+                    Source Material (Consumed) *
+                  </label>
+                  <select
+                    required
+                    value={quickConvSourceMatId}
+                    onChange={(e) => {
+                      setQuickConvSourceMatId(e.target.value);
+                      setQuickConvError(null);
+                    }}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500 transition-all cursor-pointer"
+                  >
+                    <option value="">-- Select Source Material --</option>
+                    {materials.map(m => {
+                      const stock = inventory.find(i => i.materialId === m.id)?.currentWeight || 0;
+                      return (
+                        <option key={m.id} value={m.id}>
+                          {m.code} - {m.name} ({stock.toLocaleString()} lbs in stock)
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+
+                {/* Source Weight */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">
+                    Source Weight Consumed (lbs) *
+                  </label>
+                  <input
+                    required
+                    type="number"
+                    min="0.1"
+                    step="any"
+                    placeholder="e.g. 500"
+                    value={quickConvInputWeight}
+                    onChange={(e) => {
+                      setQuickConvInputWeight(e.target.value);
+                      setQuickConvError(null);
+                    }}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500 transition-all font-mono"
+                  />
+                </div>
+
+                {/* Destination Material */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">
+                    Destination Material (Produced) *
+                  </label>
+                  <select
+                    required
+                    value={quickConvOutputMatId}
+                    onChange={(e) => {
+                      setQuickConvOutputMatId(e.target.value);
+                      setQuickConvError(null);
+                    }}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500 transition-all cursor-pointer"
+                  >
+                    <option value="">-- Select Destination Material --</option>
+                    {materials.map(m => (
+                      <option key={m.id} value={m.id}>
+                        {m.code} - {m.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Destination Weight */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">
+                    Destination Weight Produced (lbs) *
+                  </label>
+                  <input
+                    required
+                    type="number"
+                    min="0"
+                    step="any"
+                    placeholder="e.g. 400"
+                    value={quickConvOutputWeight}
+                    onChange={(e) => {
+                      setQuickConvOutputWeight(e.target.value);
+                      setQuickConvError(null);
+                    }}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500 transition-all font-mono"
+                  />
+                </div>
+              </div>
+
+              {/* Recovery Rate preview */}
+              {quickConvInputWeight && quickConvOutputWeight && Number(quickConvInputWeight) > 0 && (
+                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs flex items-center justify-between font-mono">
+                  <span className="text-slate-500 font-sans text-[11px]">Calculated Yield Rate:</span>
+                  <span className="font-bold text-slate-900">
+                    {((Number(quickConvOutputWeight) / Number(quickConvInputWeight)) * 100).toFixed(1)}% recovery
+                  </span>
+                </div>
+              )}
+
+              {/* Notes */}
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">
+                  Conversion Notes (Optional)
+                </label>
+                <textarea
+                  rows={2}
+                  value={quickConvNotes}
+                  onChange={(e) => setQuickConvNotes(e.target.value)}
+                  placeholder="e.g. Stripped insulated wire batch #3 on line 2..."
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium outline-none focus:ring-2 focus:ring-blue-500 transition-all resize-none"
+                />
+              </div>
+
+              {/* Buttons */}
+              <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowQuickConvPanel(false)}
+                  disabled={processing}
+                  className="px-5 py-3 text-slate-600 hover:text-slate-800 rounded-xl text-xs font-bold transition-all cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={processing}
+                  className="px-6 py-3.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center gap-2 transition-all shadow-md cursor-pointer disabled:opacity-50"
+                >
+                  {processing ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Saving Conversion...
+                    </>
+                  ) : (
+                    <>
+                      <Repeat className="w-4 h-4 text-emerald-400" />
+                      Save Conversion
                     </>
                   )}
                 </button>

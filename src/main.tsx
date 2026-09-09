@@ -2,6 +2,10 @@ import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
+import { registerSW } from 'virtual:pwa-register';
+
+// Register service worker for offline app shell caching
+registerSW({ immediate: true });
 
 // Handle chunk load / dynamic import errors by auto-refreshing the page to get the latest build
 window.addEventListener('error', (e) => {

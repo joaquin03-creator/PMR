@@ -507,7 +507,7 @@ service cloud.firestore {
     match /inventory/{materialId} {
       allow read: if isStaff();
       allow create, update: if (canManageInventory() || isStaff()) && isValidInventory(request.resource.data);
-      allow delete: if canDeleteData();
+      allow delete: if canDeleteData() || isManager();
     }
 
     match /externalSales/{saleId} {
@@ -522,10 +522,16 @@ service cloud.firestore {
       allow delete: if canDeleteData() || isManager();
     }
 
+    match /conversions/{conversionId} {
+      allow read: if isStaff();
+      allow create, update: if (canManageInventory() || isStaff());
+      allow delete: if canDeleteData() || isManager();
+    }
+
     match /materialConversions/{conversionId} {
       allow read: if isStaff();
       allow create, update: if (canManageInventory() || isStaff()) && isValidMaterialConversion(request.resource.data);
-      allow delete: if false;
+      allow delete: if canDeleteData() || isManager();
     }
 
     match /inventoryAdjustments/{adjustmentId} {
@@ -575,6 +581,13 @@ service cloud.firestore {
       allow create: if isAuthenticated() && (isStaff() || request.resource.data.userId == request.auth.uid) && isValidTicketDraft(request.resource.data);
       allow update: if isAuthenticated() && (isStaff() || (resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid)) && isValidTicketDraft(request.resource.data);
       allow delete: if isAuthenticated() && (isStaff() || resource.data.userId == request.auth.uid);
+    }
+
+    match /problemReports/{reportId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update: if isManager() || canManageUsers();
+      allow delete: if isManager() || canDeleteData();
     }
   }
 }

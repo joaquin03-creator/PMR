@@ -92,13 +92,13 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
       material?.category,
       material?.name
     );
-    const itemTotal = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0)
+    const itemTotal = (item.totalAmount !== undefined && item.totalAmount !== null)
       ? item.totalAmount
       : line.totalAmount;
     return sum + itemTotal;
   }, 0);
 
-  const finalTotalAmount = (ticket.totalAmount !== undefined && ticket.totalAmount > 0)
+  const finalTotalAmount = (ticket.totalAmount !== undefined && ticket.totalAmount !== null)
     ? ticket.totalAmount
     : calculatedTotalAmount;
 
@@ -375,7 +375,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
               material?.name
             );
             const displayNetWeight = line.paidWeightLbs;
-            const itemTotalAmount = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0) 
+            const itemTotalAmount = (item.totalAmount !== undefined && item.totalAmount !== null) 
               ? item.totalAmount 
               : line.totalAmount;
             const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
@@ -390,7 +390,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
                 
                 <div style={itemLineStyle}>
                   <span>Gross Wt:</span>
-                  <span>{item.netWeight ?? line.netWeight} lb</span>
+                  <span>{item.netWeight !== undefined ? item.netWeight : line.netWeight} lb</span>
                 </div>
                 {(item.deductionWeight || 0) > 0 && (
                   <div style={itemLineStyle}>
@@ -455,7 +455,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
                 material?.name
               );
               const displayNetWeight = line.paidWeightLbs;
-              const itemTotalAmount = (item.totalAmount !== undefined && item.totalAmount !== null && item.totalAmount > 0) 
+              const itemTotalAmount = (item.totalAmount !== undefined && item.totalAmount !== null) 
                 ? item.totalAmount 
                 : line.totalAmount;
               const rateFormatted = formatUnitPrice(item.pricePerUnit || 0, item.unit || material?.unit, material?.category, material?.name);
@@ -468,7 +468,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
                     <div><strong>{material?.code ? `[${material.code}] ` : ''}{material?.name || 'N/A'}</strong></div>
                     {item.notes && <div style={{ fontSize: '10px', color: '#666666', fontStyle: 'italic' }}>Note: {item.notes}</div>}
                   </td>
-                  <td style={tdRightStyle}>{item.netWeight ?? line.netWeight}</td>
+                  <td style={tdRightStyle}>{item.netWeight !== undefined ? item.netWeight : line.netWeight}</td>
                   <td style={tdRightStyle}>{item.deductionWeight || '0'}</td>
                   <td style={tdRightStyle}>
                     <strong>{displayNetWeight.toLocaleString()} lb</strong>

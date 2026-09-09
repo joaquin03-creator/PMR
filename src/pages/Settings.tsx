@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { auth, db } from '../firebase';
-import { collection, getDocs, deleteDoc, doc, writeBatch, addDoc, onSnapshot, updateDoc, setDoc, query, where } from 'firebase/firestore';
-import { UserProfile, Material, Customer, UserRole, UserPermissions, UserSession, UserInvite, SystemConfig, BuyTicket } from '../types';
+import { collection, getDocs, deleteDoc, doc, writeBatch, addDoc, onSnapshot, updateDoc, setDoc, query, where, orderBy } from 'firebase/firestore';
+import { UserProfile, Material, Customer, UserRole, UserPermissions, UserSession, UserInvite, SystemConfig, BuyTicket, ProblemReport } from '../types';
 import { 
   Settings as SettingsIcon, 
   Trash2, 
@@ -46,9 +46,11 @@ import {
   ShieldCheck,
   AlertCircle,
   Printer,
-  User
+  User,
+  Bug
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { safeSetItem } from '../lib/safeStorage';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import { useToast } from '../context/ToastContext';
@@ -76,7 +78,7 @@ interface SettingsProps {
 export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
   const { firestore, local, success, error: toastError, info } = useToast();
   const { settings, updateSettings, resetToDefaults: resetUI } = useSettings();
-  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sessions' | 'system' | 'roles'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sessions' | 'system' | 'roles' | 'problem-reports'>('general');
   const [processing, setProcessing] = useState(false);
   const [status, setStatus] = useState<{ type: 'success' | 'error', message: string } | null>(null);
   const [importType, setImportType] = useState<'materials' | 'customers' | null>(null);
@@ -165,6 +167,47 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
     canRetroactivePriceAdjustments: true,
   });
   const [loadingRoles, setLoadingRoles] = useState(false);
+
+  // Problem Reports State
+  const [problemReports, setProblemReports] = useState<ProblemReport[]>([]);
+  const [loadingProblemReports, setLoadingProblemReports] = useState(false);
+  const [resolvingReportId, setResolvingReportId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (profile?.role !== 'manager') return;
+    setLoadingProblemReports(true);
+    const q = query(collection(db, 'problemReports'), orderBy('timestamp', 'desc'));
+    const unsub = onSnapshot(
+      q,
+      (snapshot) => {
+        const reports = snapshot.docs.map((d) => ({ id: d.id, ...d.data() })) as ProblemReport[];
+        setProblemReports(reports);
+        setLoadingProblemReports(false);
+      },
+      (err) => {
+        console.warn('Error listening to problem reports:', err);
+        setLoadingProblemReports(false);
+      }
+    );
+    return () => unsub();
+  }, [profile]);
+
+  const handleResolveProblemReport = async (reportId: string) => {
+    try {
+      setResolvingReportId(reportId);
+      await updateDoc(doc(db, 'problemReports', reportId), {
+        status: 'resolved',
+        resolvedAt: new Date().toISOString(),
+        resolvedBy: profile?.displayName || profile?.email || 'Manager',
+      });
+      success('Report Resolved', 'Problem report marked as resolved.');
+    } catch (err: any) {
+      console.error('Error resolving report:', err);
+      toastError('Error', err?.message || 'Failed to update report.');
+    } finally {
+      setResolvingReportId(null);
+    }
+  };
 
   // Create User State
   const [showInviteModal, setShowInviteModal] = useState(false);
@@ -1213,7 +1256,7 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
   };
 
   const handleLaptopIdChange = (id: string) => {
-    localStorage.setItem('pm_connected_laptop_id', id);
+    safeSetItem('pm_connected_laptop_id', id);
     setLocalLaptopId(id);
     setStatus({ type: 'success', message: `Laptop registered as: ${id}` });
   };
@@ -1610,6 +1653,23 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
             )}
           >
             Role Configurations
+          </button>
+        )}
+        {profile?.role === 'manager' && (
+          <button
+            onClick={() => setActiveTab('problem-reports')}
+            className={cn(
+              "px-6 py-3 text-[10px] font-black uppercase tracking-widest transition-all border-b-2 flex items-center gap-2",
+              activeTab === 'problem-reports' ? "border-rose-600 text-rose-600" : "border-transparent text-slate-400 hover:text-slate-600"
+            )}
+          >
+            <Bug className="w-3.5 h-3.5 text-rose-500" />
+            <span>Problem Reports</span>
+            {problemReports.filter(r => r.status === 'open').length > 0 && (
+              <span className="px-1.5 py-0.5 rounded-full text-[9px] font-black bg-rose-100 text-rose-800">
+                {problemReports.filter(r => r.status === 'open').length}
+              </span>
+            )}
           </button>
         )}
       </div>
@@ -4043,6 +4103,118 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
                 })}
               </div>
             </div>
+          </div>
+        </div>
+      )}
+      {activeTab === 'problem-reports' && profile?.role === 'manager' && (
+        <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
+          <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-6">
+            <div className="flex items-center justify-between flex-wrap gap-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-rose-50 rounded-2xl text-rose-600">
+                  <Bug className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-black text-slate-900 uppercase tracking-tight">Staff Problem Reports</h3>
+                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">
+                    Real-time field issues submitted by cashiers and staff
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-500">
+                  {problemReports.filter(r => r.status === 'open').length} Open / {problemReports.length} Total
+                </span>
+              </div>
+            </div>
+
+            {loadingProblemReports ? (
+              <div className="py-12 flex flex-col items-center justify-center text-slate-400 gap-2">
+                <Loader2 className="w-6 h-6 animate-spin text-slate-500" />
+                <span className="text-xs font-medium">Loading problem reports...</span>
+              </div>
+            ) : problemReports.filter(r => r.status === 'open').length === 0 ? (
+              <div className="py-12 text-center space-y-2 border border-dashed border-slate-200 rounded-2xl">
+                <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto" />
+                <p className="text-sm font-bold text-slate-800">No open problem reports</p>
+                <p className="text-xs text-slate-400">All submitted issues have been resolved. The floor is running smoothly.</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {problemReports
+                  .filter(r => r.status === 'open')
+                  .map((report) => (
+                    <div
+                      key={report.id}
+                      className="p-5 rounded-2xl border border-rose-100 bg-rose-50/20 hover:bg-white hover:border-rose-200 transition-all space-y-3"
+                    >
+                      <div className="flex items-start justify-between gap-4 flex-wrap">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-black text-slate-900">{report.userName}</span>
+                            <span className="px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider bg-slate-100 text-slate-600">
+                              {report.userRole}
+                            </span>
+                            <span className="text-xs text-slate-400">•</span>
+                            <span className="text-xs font-medium text-slate-500">{report.stationName || 'Main Station'}</span>
+                            <span className="text-xs text-slate-400">•</span>
+                            <span className="text-xs font-mono text-slate-400">
+                              {report.timestamp ? new Date(report.timestamp).toLocaleString() : ''}
+                            </span>
+                            <span
+                              className={cn(
+                                "px-2 py-0.5 rounded-full text-[9px] font-bold",
+                                report.isOnline
+                                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                  : "bg-amber-50 text-amber-800 border border-amber-200"
+                              )}
+                            >
+                              {report.isOnline ? "Online" : "Offline"}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                            <span>Route: <strong className="font-mono text-slate-700">{report.route}</strong></span>
+                            <span>•</span>
+                            <span>Version: <strong className="font-mono text-slate-700">v{report.appVersion}</strong></span>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          disabled={resolvingReportId === report.id}
+                          onClick={() => report.id && handleResolveProblemReport(report.id)}
+                          className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          {resolvingReportId === report.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                          )}
+                          <span>Mark resolved</span>
+                        </button>
+                      </div>
+
+                      <div className="p-3 bg-white rounded-xl border border-slate-200 text-xs text-slate-800 font-medium whitespace-pre-wrap leading-relaxed">
+                        {report.description}
+                      </div>
+
+                      {report.auditEvents && report.auditEvents.length > 0 && (
+                        <div className="pt-2 border-t border-slate-200/60 text-[10px] text-slate-500 space-y-1">
+                          <span className="font-bold text-slate-400 uppercase tracking-wider block">Contextual Audit Trail (Last 5)</span>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
+                            {report.auditEvents.map((evt, i) => (
+                              <div key={i} className="truncate flex items-center justify-between pr-2 text-slate-600">
+                                <span className="truncate">• {evt.title}</span>
+                                <span className="shrink-0 text-slate-400 font-mono text-[9px] ml-1">{evt.time}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+              </div>
+            )}
           </div>
         </div>
       )}

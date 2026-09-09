@@ -26,6 +26,7 @@ import ErrorBoundary from './components/ErrorBoundary';
 import { APP_VERSION, COMPANY_NAME } from './constants';
 import { ShieldAlert, Info, AlertTriangle, RefreshCw, Loader2, Monitor, Smartphone } from 'lucide-react';
 import { cn } from './lib/utils';
+import { safeSetItem } from './lib/safeStorage';
 
 import { SettingsProvider } from './context/SettingsContext';
 import { ToastProvider } from './context/ToastContext';
@@ -119,7 +120,7 @@ export default function App() {
     let hardwareId = localStorage.getItem('pmr_hardware_id');
     if (!hardwareId) {
       hardwareId = `hw_${Math.random().toString(36).substring(2, 15)}_${Date.now()}`;
-      localStorage.setItem('pmr_hardware_id', hardwareId);
+      safeSetItem('pmr_hardware_id', hardwareId);
     }
 
     const checkDemoBypass = (firebaseUser: User | null): boolean => {

@@ -37,6 +37,7 @@ import {
   Receipt
 } from 'lucide-react';
 import { cn, generateTicketId, getCustomerDataGaps } from '../lib/utils';
+import { safeSetItem } from '../lib/safeStorage';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArcGauge } from '../components/ArcGauge';
 import ManagerPinModal from '../components/ManagerPinModal';
@@ -57,6 +58,7 @@ import { printTicket } from '../lib/printTicket';
 import { BuyTicketPrint } from '../components/BuyTicketPrint';
 import { logAuditEvent } from '../lib/audit';
 import USBBarcodeScannerModal from '../components/USBBarcodeScannerModal';
+import { Hint } from '../components/Hint';
 
 import { useToast } from '../context/ToastContext';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
@@ -269,14 +271,14 @@ export default function Dashboard({ profile }: DashboardProps) {
   const dismissAmberCard = (cardId: string) => {
     const updated = { ...complianceDismissals, [cardId]: todayLocalDateString };
     setComplianceDismissals(updated);
-    localStorage.setItem('pmr_compliance_dismissals', JSON.stringify(updated));
+    safeSetItem('pmr_compliance_dismissals', JSON.stringify(updated));
   };
 
   const snoozeRedCard = (cardId: string) => {
     const snoozeUntil = Date.now() + 3600000; // 1 hour
     const updated = { ...complianceSnoozes, [cardId]: snoozeUntil };
     setComplianceSnoozes(updated);
-    localStorage.setItem('pmr_compliance_snoozes', JSON.stringify(updated));
+    safeSetItem('pmr_compliance_snoozes', JSON.stringify(updated));
   };
 
   // Quick Ticket State
@@ -1753,7 +1755,16 @@ export default function Dashboard({ profile }: DashboardProps) {
           </div>
           <div className="flex items-center">
             <button
-              onClick={() => openQuickTicket()}
+              onClick={() => {
+                openQuickTicket();
+                setTimeout(() => {
+                  const input = document.querySelector('[data-material-search]') as HTMLInputElement;
+                  if (input) {
+                    input.focus({ preventScroll: false });
+                    input.click();
+                  }
+                }, 350);
+              }}
               className="group flex items-center gap-3 px-4 sm:px-5 py-2.5 sm:py-3 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-slate-950 rounded-2xl shadow-lg shadow-amber-500/25 active:scale-95 transition-all text-left border border-amber-400/80 cursor-pointer"
               title="Create streamlined walk-in buy ticket"
               aria-label="Quick Ticket"
@@ -1780,6 +1791,12 @@ export default function Dashboard({ profile }: DashboardProps) {
       {/* Performance Gauges Row (MANAGERS ONLY) */}
       {profile?.role === 'manager' && (
         <section aria-label="Performance Gauges" className="space-y-3">
+          <div className="flex items-center justify-between px-1">
+            <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">
+              Performance Gauges
+            </span>
+            <Hint text="Today's numbers vs your targets. Click a gauge to open the detailed report. The pencil sets a target; without one, the app suggests last week's same day." />
+          </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <ArcGauge
               title="Material Spend"
@@ -1944,6 +1961,13 @@ export default function Dashboard({ profile }: DashboardProps) {
                     onClick={() => {
                       if (d.type === 'quick') {
                         openQuickTicket(d.id);
+                        setTimeout(() => {
+                          const input = document.querySelector('[data-material-search]') as HTMLInputElement;
+                          if (input) {
+                            input.focus({ preventScroll: false });
+                            input.click();
+                          }
+                        }, 350);
                       } else {
                         navigate('/buy-tickets');
                       }
@@ -2229,6 +2253,13 @@ export default function Dashboard({ profile }: DashboardProps) {
           aria-label="Compliance Notifications" 
           className="fixed bottom-6 right-6 z-40 max-w-sm w-full space-y-2.5 pointer-events-none"
         >
+          <div className="flex items-center justify-between px-3 py-1.5 bg-slate-900/90 text-white rounded-xl shadow-lg border border-slate-700 pointer-events-auto backdrop-blur-md">
+            <span className="text-[10px] font-black uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+              <ShieldAlert className="w-3.5 h-3.5" />
+              Compliance Stack
+            </span>
+            <Hint text="Green items are hidden. Amber can be dismissed for the day. Red cannot be dismissed — it means something is overdue with the state." />
+          </div>
           {(isComplianceStackExpanded ? activeComplianceCards : activeComplianceCards.slice(0, 2)).map((card) => (
             <div
               key={card.id}
@@ -2892,11 +2923,19 @@ export default function Dashboard({ profile }: DashboardProps) {
                                     )}
                                   </div>
                                   <input 
+                                    id={`qt-price-${item.id}`}
                                     type="number"
                                     step="0.01"
+                                    min="0"
                                     className="w-full px-4 py-3.5 bg-white border border-slate-200 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-sm font-black text-blue-600 shadow-sm"
                                     value={item.overridePrice !== undefined ? item.overridePrice : (item.material?.buyPrice || '')}
-                                    onChange={(e) => setQtItems(prev => prev.map(i => i.id === item.id ? { ...i, overridePrice: Number(e.target.value) } : i))}
+                                    onChange={(e) => setQtItems(prev => prev.map(i => i.id === item.id ? { ...i, overridePrice: e.target.value === '' ? undefined : Math.max(0, Number(e.target.value)) } : i))}
+                                    onBlur={(e) => {
+                                      if (e.target.value !== '') {
+                                        const num = Math.max(0, parseFloat(e.target.value) || 0);
+                                        setQtItems(prev => prev.map(i => i.id === item.id ? { ...i, overridePrice: parseFloat(num.toFixed(2)) } : i));
+                                      }
+                                    }}
                                     placeholder="0.00"
                                     onKeyDown={(e) => {
                                       if (e.key === 'Enter' && index === qtItems.length - 1 && qtItems.length < 15) {
@@ -3386,8 +3425,8 @@ export default function Dashboard({ profile }: DashboardProps) {
                       <div className="pt-8 w-full max-w-xs">
                         <button 
                           onClick={checkDoNotBuy}
-                          disabled={qtOhioDatabaseStatus === 'not_checked' || qtOhioDatabaseStatus === 'flagged'}
-                          className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 disabled:opacity-50 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-2"
+                          disabled={qtOhioDatabaseStatus === 'flagged'}
+                          className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-slate-800 disabled:opacity-50 transition-all outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-2 cursor-pointer"
                         >
                           Verify Identity
                           <ChevronRight className="w-5 h-5" />
@@ -3893,7 +3932,6 @@ export default function Dashboard({ profile }: DashboardProps) {
                             (step === 1 && (qtItems.length === 0 || qtItems.some(item => !item.material || (item.gross - item.tare) <= 0))) ||
                             (step === 2 && (
                               (!qtCustomer && !qtNewCustomer.name) ||
-                              qtOhioDatabaseStatus === 'not_checked' ||
                               qtOhioDatabaseStatus === 'flagged'
                             ))
                           }
@@ -3917,7 +3955,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                             </button>
                             <button 
                               onClick={handleQuickTicketSubmit}
-                              disabled={qtProcessing || qtItems.some(item => !item.material || (item.gross - item.tare) <= 0) || (!qtCustomer && !qtNewCustomer.name) || netWeight <= 0 || showQtIdConfirm || showQtVehicleConfirm || qtOhioDatabaseStatus === 'not_checked' || qtOhioDatabaseStatus === 'flagged'}
+                              disabled={qtProcessing || qtItems.some(item => !item.material || (item.gross - item.tare) <= 0) || (!qtCustomer && !qtNewCustomer.name) || netWeight <= 0 || showQtIdConfirm || showQtVehicleConfirm || qtOhioDatabaseStatus === 'flagged'}
                               className="px-8 py-4 bg-blue-600 text-white rounded-xl font-bold flex items-center gap-2 hover:bg-blue-700 shadow-lg shadow-blue-200 disabled:opacity-50 transition-all outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
                             >
                               {qtProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <CheckCircle2 className="w-5 h-5" />}

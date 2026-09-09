@@ -47,6 +47,7 @@ import { logAuditEvent } from '../lib/audit';
 import { roundNetWeight } from '../lib/weightUtils';
 import { isCatalyticConverterMat, checkCatalyticConverterLimit } from '../lib/catalyticUtils';
 import { calculateMaterialLineItem, isTonMaterial, formatUnitPrice, getRateUnitLabel } from '../lib/scrapPricing';
+import { trackOfflineWrite } from '../hooks/useNetworkStatus';
 import { PricingUnitBadge } from './PricingUnitBadge';
 
 const normalizeName = (name: string) =>
@@ -114,7 +115,7 @@ interface BuyTicketModalProps {
 }
 
 export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId }: BuyTicketModalProps) {
-  const { success: showToastSuccess } = useToast();
+  const { success: showToastSuccess, warning: showToastWarning } = useToast();
   const [step, setStep] = useState(1);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -730,13 +731,16 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       }
 
       let customerId = selectedCustomer?.id;
+      let newCustomerDocPromise: Promise<void> | null = null;
 
       if (isNewCustomer && !customerId) {
-        const custRef = await addDoc(collection(db, 'customers'), {
+        customerId = doc(collection(db, 'customers')).id;
+        const newCustomerData = {
           ...newCustomer,
           createdAt: new Date().toISOString()
-        });
-        customerId = custRef.id;
+        };
+        newCustomerDocPromise = setDoc(doc(db, 'customers', customerId), newCustomerData);
+        trackOfflineWrite(newCustomerDocPromise);
       }
 
       if (!customerId) throw new Error("Customer ID missing");
@@ -785,37 +789,106 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
         createdByName: profile?.displayName || profile?.email || 'System'
       };
 
+      // 1. Locally generated ticket ID
       const ticketId = generateTicketId('BUY');
       const docRef = doc(db, 'buyTickets', ticketId);
-      await setDoc(docRef, ticketData);
 
-      // Track action in Audit Log
-      await logAuditEvent(
-        'buyTicket',
-        docRef.id,
-        'create',
-        { after: ticketData },
-        `Buy Ticket created (Modal) for ${selectedCustomer?.name || 'Customer'}`
-      );
+      // 2. Fire ticket document write without awaiting for print
+      const ticketPromise = setDoc(docRef, ticketData);
+      trackOfflineWrite(ticketPromise);
 
-      // Check and log price overrides
-      for (const item of ticketMaterials) {
-        const mat = materials.find(m => m.id === item.materialId);
-        if (mat && item.pricePerUnit !== mat.buyPrice) {
-          await logAuditEvent(
-            'buyTicket',
-            docRef.id,
-            'override',
-            {
-              before: { price: mat.buyPrice },
-              after: { price: item.pricePerUnit }
-            },
-            `Price override approved for ${mat.name} in Buy Ticket #${docRef.id.toUpperCase()}: $${mat.buyPrice.toFixed(2)}/lb to $${item.pricePerUnit.toFixed(2)}/lb`
+      const customerName = selectedCustomer?.name || newCustomer.name || 'Unknown Customer';
+      const totalNetWeight = ticketMaterials.reduce((sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 0);
+
+      const ticketSnapshot = {
+        id: ticketId,
+        customerId,
+        customerName,
+        materials: ticketMaterials,
+        items: [...items],
+        totalAmount: calculatedFinalTotal,
+        netWeight: totalNetWeight,
+        timestamp: ticketData.timestamp,
+        paymentMethod: (ticketData.paymentMethod || 'cash') as 'cash' | 'check' | 'other' | 'eft',
+        vehiclePlate: ticketData.vehiclePlate || '',
+        vehicleType: ticketData.vehicleType || '',
+        signatureUrl: ticketData.signatureUrl || '',
+        customerPhotoUrl: ticketData.customerPhotoUrl || '',
+        vehiclePhotoUrl: ticketData.vehiclePhotoUrl || '',
+        loadPhotoUrl: ticketData.loadPhotoUrl || '',
+        idImageUrl: ticketData.idImageUrl || '',
+      };
+
+      // 3. Immediately set printedTicket snapshot, success state, and trigger auto-print if enabled
+      setPrintedTicket(ticketSnapshot);
+      setLastCreatedTicket({ id: ticketId, ...ticketData });
+      setQtSuccess(true);
+      setQtVerificationStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline-saved' : 'verified');
+
+      // Auto-print if enabled immediately without waiting on network
+      if (settings.autoPrint) {
+        try {
+          const tempTicket: BuyTicket = {
+            id: ticketId,
+            customerId,
+            materials: ticketMaterials,
+            totalAmount: calculatedFinalTotal,
+            status: 'completed',
+            timestamp: ticketData.timestamp,
+            paymentMethod: ticketData.paymentMethod as any,
+            customerPhotoUrl: ticketData.customerPhotoUrl || '',
+            vehiclePhotoUrl: ticketData.vehiclePhotoUrl || '',
+            loadPhotoUrl: ticketData.loadPhotoUrl || '',
+            idImageUrl: ticketData.idImageUrl || '',
+            vehiclePlate: ticketData.vehiclePlate || '',
+            vehicleType: ticketData.vehicleType || '',
+            signatureUrl: ticketData.signatureUrl || '',
+            sellerAffirmed: !!(ticketData.signatureUrl)
+          };
+
+          await printTicket(
+            <BuyTicketPrint
+              ticket={tempTicket}
+              customerName={customerName}
+              materials={materials}
+              format={settings.receiptFormat}
+            />,
+            { format: settings.receiptFormat, debugMode: settings.debugPrintMode }
           );
+        } catch (printErr) {
+          console.warn('Auto print failed:', printErr);
         }
       }
-      
-      // Update customer profile with any and all annotated data from this ticket (photos, vehicle info, and profile info)
+
+      // Open the Database confirmation popup dialogue!
+      setDbHistoryAlert({
+        isOpen: true,
+        ticketId: ticketId,
+        customerName,
+        totalAmount: calculatedFinalTotal,
+        timestamp: new Date().toISOString()
+      });
+
+      // 4. THEN await the remaining writes, each wrapped in its own try/catch
+      let hadOfflineSyncPending = typeof navigator !== 'undefined' && !navigator.onLine;
+
+      try {
+        await ticketPromise;
+      } catch (ticketErr) {
+        console.warn('Ticket write queued locally:', ticketErr);
+        hadOfflineSyncPending = true;
+      }
+
+      if (newCustomerDocPromise) {
+        try {
+          await newCustomerDocPromise;
+        } catch (custErr) {
+          console.warn('New customer doc write queued locally:', custErr);
+          hadOfflineSyncPending = true;
+        }
+      }
+
+      // Customer profile update
       const customerUpdate: any = {};
       if (ticketDetails.customerPhotoUrl) customerUpdate.photoUrl = ticketDetails.customerPhotoUrl;
       if (ticketDetails.idImageUrl) customerUpdate.idImageUrl = ticketDetails.idImageUrl;
@@ -835,156 +908,103 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
       }
 
       if (Object.keys(customerUpdate).length > 0) {
-        await updateDoc(doc(db, 'customers', customerId), {
-          ...customerUpdate,
-          updatedAt: new Date().toISOString()
-        });
+        try {
+          const custUpdatePromise = updateDoc(doc(db, 'customers', customerId), {
+            ...customerUpdate,
+            updatedAt: new Date().toISOString()
+          });
+          trackOfflineWrite(custUpdatePromise);
+          await custUpdatePromise;
 
-        if (selectedCustomer) {
-          const initialGaps = getCustomerDataGaps(selectedCustomer);
-          const updatedCustomerObj = {
-            ...selectedCustomer,
-            photoUrl: customerUpdate.photoUrl || selectedCustomer.photoUrl,
-            idImageUrl: customerUpdate.idImageUrl || selectedCustomer.idImageUrl
-          };
-          const remainingGaps = getCustomerDataGaps(updatedCustomerObj);
-          if (initialGaps.length > 0 && remainingGaps.length === 0) {
-            showToastSuccess('Profile Complete', `${selectedCustomer.name}'s file is now complete. Run Data Repair in Settings to update their older tickets.`);
+          if (selectedCustomer) {
+            const initialGaps = getCustomerDataGaps(selectedCustomer);
+            const updatedCustomerObj = {
+              ...selectedCustomer,
+              photoUrl: customerUpdate.photoUrl || selectedCustomer.photoUrl,
+              idImageUrl: customerUpdate.idImageUrl || selectedCustomer.idImageUrl
+            };
+            const remainingGaps = getCustomerDataGaps(updatedCustomerObj);
+            if (initialGaps.length > 0 && remainingGaps.length === 0) {
+              showToastSuccess('Profile Complete', `${selectedCustomer.name}'s file is now complete. Run Data Repair in Settings to update their older tickets.`);
+            }
           }
+        } catch (custErr) {
+          console.warn('Customer update queued locally:', custErr);
+          hadOfflineSyncPending = true;
         }
       }
-      const customerName = selectedCustomer?.name || newCustomer.name || 'Unknown Customer';
-      const totalNetWeight = ticketMaterials.reduce((sum, item) => sum + (item.netWeight - (item.deductionWeight || 0)), 0);
 
-      const ticketSnapshot = {
-        id: docRef.id,
-        customerId,
-        customerName,
-        materials: ticketMaterials,
-        items: [...items],
-        totalAmount: calculatedFinalTotal,
-        netWeight: totalNetWeight,
-        timestamp: ticketData.timestamp,
-        paymentMethod: (ticketData.paymentMethod || 'cash') as 'cash' | 'check' | 'other' | 'eft',
-        vehiclePlate: ticketData.vehiclePlate || '',
-        vehicleType: ticketData.vehicleType || '',
-        signatureUrl: ticketData.signatureUrl || '',
-        customerPhotoUrl: ticketData.customerPhotoUrl || '',
-        vehiclePhotoUrl: ticketData.vehiclePhotoUrl || '',
-        loadPhotoUrl: ticketData.loadPhotoUrl || '',
-        idImageUrl: ticketData.idImageUrl || '',
-      };
-
-      // 1. Capture snapshot FIRST
-      setPrintedTicket(ticketSnapshot);
-      setLastCreatedTicket({ id: docRef.id, ...ticketData });
-
-      // Update Inventory
+      // Atomic inventory increments with merge: true — no prior read required
       for (const item of ticketMaterials) {
-        const invRef = doc(db, 'inventory', item.materialId);
-        let exists = false;
-        let oldWeight = 0;
-
         try {
-          const fetchPromise = getDoc(invRef);
-          const timeoutPromise = new Promise<null>((_, reject) => setTimeout(() => reject(new Error('timeout')), 1200));
-          const invDoc = await Promise.race([fetchPromise, timeoutPromise]) as any;
-          if (invDoc && invDoc.exists()) {
-            exists = true;
-            oldWeight = invDoc.data().currentWeight || 0;
-          }
-        } catch (err) {
-          console.warn(`Could not fetch inventory from server, checking local cache:`, err);
-          try {
-            const cachedDoc = await getDocFromCache(invRef);
-            if (cachedDoc.exists()) {
-              exists = true;
-              oldWeight = cachedDoc.data().currentWeight || 0;
-            }
-          } catch (cacheErr) {
-            console.warn(`Inventory not found in local cache:`, cacheErr);
-          }
+          const invRef = doc(db, 'inventory', item.materialId);
+          const invPromise = setDoc(invRef, {
+            materialId: item.materialId,
+            currentWeight: increment(item.netWeight),
+            lastUpdated: new Date().toISOString()
+          }, { merge: true });
+          trackOfflineWrite(invPromise);
+          await invPromise;
+        } catch (invErr) {
+          console.warn(`Inventory update for ${item.materialId} queued locally:`, invErr);
+          hadOfflineSyncPending = true;
         }
+      }
 
-        // Perform write/merge locally - sets or merges currentWeight increment atomically
-        await setDoc(invRef, {
-          materialId: item.materialId,
-          currentWeight: increment(item.netWeight),
-          lastUpdated: new Date().toISOString()
-        }, { merge: true });
-
-        // Log the audit event with the available information
-        await logAuditEvent(
-          'inventory',
-          item.materialId,
-          exists ? 'update' : 'create',
-          { 
-            before: { weight: exists ? oldWeight : 0, isOfflineFallback: !exists },
-            after: { weight: oldWeight + item.netWeight }
-          },
-          exists 
-            ? `Inventory updated via Buy Ticket ${docRef.id}`
-            : `Initial inventory created via Buy Ticket ${docRef.id}`
+      // Audit logs
+      try {
+        const auditPromise = logAuditEvent(
+          'buyTicket',
+          ticketId,
+          'create',
+          { after: ticketData },
+          `Buy Ticket created (Modal) for ${customerName}`
         );
+        trackOfflineWrite(auditPromise);
+        await auditPromise;
+      } catch (auditErr) {
+        console.warn('Audit log write queued locally:', auditErr);
       }
 
-      setQtVerificationStatus('verifying');
-      
-      // Verification Step: read back the document to ensure it's in the DB/local cache
-      let isVerified = false;
-      let isOfflineMode = false;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          if (typeof navigator !== 'undefined' && !navigator.onLine) {
-            isOfflineMode = true;
-            const cachedSnap = await getDocFromCache(doc(db, 'buyTickets', docRef.id));
-            if (cachedSnap.exists()) {
-              isVerified = true;
-              break;
-            }
-          } else {
-            const fetchPromise = getDoc(doc(db, 'buyTickets', docRef.id));
-            const timeoutPromise = new Promise<null>((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000));
-            const docSnap = await Promise.race([fetchPromise, timeoutPromise]) as any;
-            if (docSnap && docSnap.exists()) {
-              isVerified = true;
-              break;
-            }
-          }
-        } catch (err) {
-          console.warn(`Firestore verification attempt ${attempt} failed, checking cache:`, err);
+      // Check and log price overrides
+      for (const item of ticketMaterials) {
+        const mat = materials.find(m => m.id === item.materialId);
+        if (mat && item.pricePerUnit !== mat.buyPrice) {
           try {
-            const cachedSnap = await getDocFromCache(doc(db, 'buyTickets', docRef.id));
-            if (cachedSnap.exists()) {
-              isVerified = true;
-              break;
-            }
-          } catch (cacheErr) {
-            // ignore
+            const overridePromise = logAuditEvent(
+              'buyTicket',
+              ticketId,
+              'override',
+              {
+                before: { price: mat.buyPrice },
+                after: { price: item.pricePerUnit }
+              },
+              `Price override approved for ${mat.name} in Buy Ticket #${ticketId.toUpperCase()}: $${mat.buyPrice.toFixed(2)}/lb to $${item.pricePerUnit.toFixed(2)}/lb`
+            );
+            trackOfflineWrite(overridePromise);
+            await overridePromise;
+          } catch (overrideErr) {
+            console.warn('Override audit log queued locally:', overrideErr);
           }
         }
-        await new Promise(resolve => setTimeout(resolve, 300));
       }
 
-      const statusValue = isVerified 
-        ? ((typeof navigator !== 'undefined' && !navigator.onLine) || isOfflineMode ? 'offline-saved' : 'verified')
-        : 'failed';
-
-      setQtVerificationStatus(statusValue);
+      // Clean draft
       if (activeDraftId) {
-        await deleteDoc(doc(db, 'ticketDrafts', activeDraftId));
-        setActiveDraftId(null);
+        try {
+          const draftDeletePromise = deleteDoc(doc(db, 'ticketDrafts', activeDraftId));
+          trackOfflineWrite(draftDeletePromise);
+          await draftDeletePromise;
+          setActiveDraftId(null);
+        } catch (draftErr) {
+          console.warn('Draft cleanup queued locally:', draftErr);
+        }
       }
-      setQtSuccess(true);
-      
-      // Open the Database confirmation popup dialogue!
-      setDbHistoryAlert({
-        isOpen: true,
-        ticketId: docRef.id,
-        customerName,
-        totalAmount: calculatedFinalTotal,
-        timestamp: new Date().toISOString()
-      });
+
+      // 5. If any write is still pending because the device is offline, show a non-blocking amber toast: "Saved on this device — will sync when back online." Do not show an error.
+      if (hadOfflineSyncPending || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+        showToastWarning('Offline Mode', 'Saved on this device — will sync when back online.');
+      }
     } catch (error) {
       console.error('Error creating ticket:', error);
       setQtVerificationStatus('failed');
@@ -1872,11 +1892,19 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
                             <div className="relative">
                               <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                               <input 
+                                id={`price-${item.id}`}
                                 type="number"
                                 step="0.01"
+                                min="0"
                                 className="w-full pl-9 pr-4 py-3 bg-white border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 font-bold"
                                 value={item.pricePerUnit || ''}
-                                onChange={e => updateItem(item.id, { pricePerUnit: Number(e.target.value) })}
+                                onChange={e => updateItem(item.id, { pricePerUnit: e.target.value === '' ? 0 : Math.max(0, Number(e.target.value)) })}
+                                onBlur={e => {
+                                  if (e.target.value !== '') {
+                                    const num = Math.max(0, parseFloat(e.target.value) || 0);
+                                    updateItem(item.id, { pricePerUnit: parseFloat(num.toFixed(2)) });
+                                  }
+                                }}
                               />
                             </div>
                           </div>

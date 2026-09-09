@@ -178,6 +178,8 @@ export interface Invoice {
   loadPlanId?: string;
   inventoryDeducted?: boolean;
   inventoryDeductedAt?: string;
+  shortfallResolution?: 'adjustment' | 'passthrough';
+  shortfallNote?: string;
 }
 
 export interface InventoryItem {
@@ -185,6 +187,23 @@ export interface InventoryItem {
   materialId: string;
   currentWeight: number;
   lastUpdated: string;
+  lastPhysicalCount?: string;
+  lastPhysicalCountBy?: string;
+  lastPhysicalCountWeight?: number;
+}
+
+export interface ConversionLog {
+  id?: string;
+  sourceMatId: string;
+  sourceName: string;
+  inputWeight: number;
+  outputMatId: string;
+  outputName: string;
+  outputWeight: number;
+  yieldPct: number;
+  notes?: string;
+  createdAt: string;
+  createdBy: string;
 }
 
 export interface ExternalSaleItem {
@@ -285,6 +304,7 @@ export interface AuditLog {
   performedBy: string; // user email
   timestamp: string;
   notes?: string;
+  requiresManagerReview?: boolean;
 }
 
 export interface DailySnapshot {
@@ -440,4 +460,20 @@ export interface SystemLog {
   timestamp: string;
   source: string;
   details?: any;
+}
+
+export interface ProblemReport {
+  id?: string;
+  description: string;
+  route: string;
+  userName: string;
+  userRole: string;
+  stationName: string;
+  timestamp: string;
+  isOnline: boolean;
+  appVersion: string;
+  auditEvents: { title: string; time: string }[];
+  status: 'open' | 'resolved';
+  resolvedAt?: string;
+  resolvedBy?: string;
 }

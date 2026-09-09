@@ -51,6 +51,7 @@ import { cn } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import { useToast } from '../context/ToastContext';
+import { safeSetItem, clearSessionDrafts, pruneDraftStorage } from '../lib/safeStorage';
 
 interface CashDrawerProps {
   profile: UserProfile | null;
@@ -355,6 +356,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const { firestore, local, success, error: toastError, info } = useToast();
   const [activeSession, setActiveSession] = useState<CashSession | null>(null);
   const [selectedSession, setSelectedSession] = useState<CashSession | null>(null);
+  const [userSelectedHistorical, setUserSelectedHistorical] = useState(false);
+  const userSelectedHistoricalRef = useRef(false);
+
+  useEffect(() => {
+    userSelectedHistoricalRef.current = userSelectedHistorical;
+  }, [userSelectedHistorical]);
   const [transactions, setTransactions] = useState<CashTransaction[]>([]);
   const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
@@ -496,6 +503,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [isSubmittingVerification, setIsSubmittingVerification] = useState(false);
   const [isEditingVerification, setIsEditingVerification] = useState(false);
 
+  // Prune orphaned/aged draft keys on initial component mount
+  useEffect(() => {
+    pruneDraftStorage(undefined, activeSession?.id);
+  }, []);
+
   // Sync state values when selectedSession changes
   useEffect(() => {
     if (selectedSession) {
@@ -508,6 +520,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       if (prevSessionIdRef.current !== selectedSession.id) {
         isInitialLoadRef.current = true;
         prevSessionIdRef.current = selectedSession.id;
+        if (autoSaveTimeoutRef.current) {
+          clearTimeout(autoSaveTimeoutRef.current);
+          autoSaveTimeoutRef.current = null;
+        }
       }
 
       // Load opening denominations
@@ -549,6 +565,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       setVerificationComment('');
       setVerificationStatus('unverified');
       prevSessionIdRef.current = null;
+      if (autoSaveTimeoutRef.current) {
+        clearTimeout(autoSaveTimeoutRef.current);
+        autoSaveTimeoutRef.current = null;
+      }
       setDenomEditTab('closing');
     }
   }, [selectedSession?.id, selectedSession?.status]);
@@ -559,9 +579,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
     // Save to localStorage immediately on every change!
     try {
-      localStorage.setItem(`cash_sheet_denoms_draft_${selectedSession.id}`, JSON.stringify(sheetDenoms));
-      localStorage.setItem(`cash_opening_denoms_draft_${selectedSession.id}`, JSON.stringify(editedOpeningDenoms));
-      localStorage.setItem(`cash_opening_cash_draft_${selectedSession.id}`, editedOpeningCash.toString());
+      safeSetItem(`cash_sheet_denoms_draft_${selectedSession.id}`, JSON.stringify(sheetDenoms));
+      safeSetItem(`cash_opening_denoms_draft_${selectedSession.id}`, JSON.stringify(editedOpeningDenoms));
+      safeSetItem(`cash_opening_cash_draft_${selectedSession.id}`, editedOpeningCash.toString());
     } catch (e) {
       console.error("Failed to save drafts to localStorage:", e);
     }
@@ -677,7 +697,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   useEffect(() => {
     if (activeSession) {
       try {
-        localStorage.setItem(`cash_close_denoms_draft_${activeSession.id}`, JSON.stringify(closingDenoms));
+        safeSetItem(`cash_close_denoms_draft_${activeSession.id}`, JSON.stringify(closingDenoms));
       } catch (e) {
         console.error("Failed to save close draft to localStorage:", e);
       }
@@ -703,7 +723,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   // Save openingDenoms to localStorage immediately on every change!
   useEffect(() => {
     try {
-      localStorage.setItem(`cash_open_denoms_draft`, JSON.stringify(openingDenoms));
+      safeSetItem(`cash_open_denoms_draft`, JSON.stringify(openingDenoms));
     } catch (e) {
       console.error("Failed to save open draft to localStorage:", e);
     }
@@ -774,6 +794,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         verifiedAt: now,
         verificationComment
       } : null);
+
+      clearSessionDrafts(selectedSession.id);
 
       setIsEditingVerification(false);
       firestore(
@@ -931,6 +953,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         closingDenominations: sheetDenoms
       } : null);
 
+      if (selectedSession.status === 'closed') {
+        clearSessionDrafts(selectedSession.id);
+      }
+
       firestore(
         selectedSession.status === 'closed' ? 'Audit Counts Saved' : 'Counts Committed',
         selectedSession.status === 'closed'
@@ -1030,6 +1056,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           const sess = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() } as CashSession;
           setActiveSession(sess);
           setSelectedSession(prev => {
+            if (userSelectedHistoricalRef.current) return prev; // user is viewing a past day — do not touch
             if (!prev || prev.id === sess.id || prev.date === todayStr) {
               return sess;
             }
@@ -1038,6 +1065,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         } else {
           setActiveSession(null);
           setSelectedSession(prev => {
+            if (userSelectedHistoricalRef.current) return prev; // preserve historical selection
             if (!prev || prev.date === todayStr) {
               return null;
             }
@@ -1053,7 +1081,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     const unsubHistory = onSnapshot(
       query(collection(db, 'cashSessions'), orderBy('date', 'desc'), limit(30)),
       (snapshot) => {
-        setHistory(snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as CashSession[]);
+        const loadedHistory = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as CashSession[];
+        setHistory(loadedHistory);
+        pruneDraftStorage(loadedHistory, activeSession?.id);
       }
     );
 
@@ -1074,18 +1104,26 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   // Keep selectedSession synchronized with history/activeSession updates
   useEffect(() => {
     if (selectedSession) {
-      if (activeSession && selectedSession.id === activeSession.id) {
-        if (JSON.stringify(selectedSession) !== JSON.stringify(activeSession)) {
-          setSelectedSession(activeSession);
-        }
-      } else {
+      if (userSelectedHistorical) {
+        // User deliberately selected a historical session: only re-sync from history array, never reassign to activeSession/today
         const updated = history.find(s => s.id === selectedSession.id);
         if (updated && JSON.stringify(updated) !== JSON.stringify(selectedSession)) {
           setSelectedSession(updated);
         }
+      } else {
+        if (activeSession && selectedSession.id === activeSession.id) {
+          if (JSON.stringify(selectedSession) !== JSON.stringify(activeSession)) {
+            setSelectedSession(activeSession);
+          }
+        } else {
+          const updated = history.find(s => s.id === selectedSession.id);
+          if (updated && JSON.stringify(updated) !== JSON.stringify(selectedSession)) {
+            setSelectedSession(updated);
+          }
+        }
       }
     }
-  }, [history, activeSession, selectedSession]);
+  }, [history, activeSession, selectedSession, userSelectedHistorical]);
 
   // Subscribe to audit logs for cash Drawer/Transaction activity
   useEffect(() => {
@@ -1479,6 +1517,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         `Opened cash drawer session for ${todayStr} with starting cash of $${openingCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
       );
 
+      userSelectedHistoricalRef.current = false;
+      setUserSelectedHistorical(false);
       setShowStartModal(false);
       firestore(
         'Shift Opened',
@@ -1614,6 +1654,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       setRetroClosingDenoms({ ...initialDenominations });
       
       const newSessionWithId = { id: docRef.id, ...sessionDoc } as CashSession;
+      const isHistorical = retroactiveDate !== todayStr;
+      userSelectedHistoricalRef.current = isHistorical;
+      setUserSelectedHistorical(isHistorical);
       setSelectedSession(newSessionWithId);
       setShowHistory(false);
       setViewMode('balance_sheet');
@@ -1657,6 +1700,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         `Retroactively closed session for ${session.date} from ledger history.`
       );
       
+      clearSessionDrafts(session.id);
       firestore('Session Closed', `Successfully finalized reconciliation for ${session.date}.`);
     } catch (err: any) {
       toastError('Failed to close session', err.message || err);
@@ -2032,6 +2076,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         setActiveSession(prev => prev ? { ...prev, ...closedData } : null);
       }
 
+      clearSessionDrafts(targetSession.id);
+
       setShowCloseModal(false);
       firestore(
         'Shift Closed',
@@ -2200,16 +2246,41 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           <h1 className="text-4xl font-black text-slate-900 tracking-tight font-display uppercase">Cash Reconciliation</h1>
           <p className="text-slate-500 font-medium mt-1">Manage Safe and Register liquidity for {todayStr}.</p>
         </div>
-        <button 
-          onClick={() => setShowHistory(!showHistory)}
-          className={cn(
-            "flex items-center gap-2 px-6 py-3 rounded-2xl font-black text-xs uppercase tracking-widest transition-all",
-            showHistory ? "bg-slate-900 text-white shadow-xl shadow-slate-900/20" : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+        <div className="flex items-center gap-2">
+          {userSelectedHistorical && !showHistory && (
+            <button
+              type="button"
+              onClick={() => {
+                userSelectedHistoricalRef.current = false;
+                setUserSelectedHistorical(false);
+                setSelectedSession(activeSession);
+              }}
+              className="flex items-center gap-2 px-5 py-3 rounded-2xl font-black text-xs uppercase tracking-widest transition-all bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-md cursor-pointer active:scale-95"
+            >
+              <RotateCcw className="w-4 h-4" />
+              Back to Today
+            </button>
           )}
-        >
-          <History className="w-4 h-4" />
-          {showHistory ? 'View Today' : 'Reconciliation History'}
-        </button>
+          <button 
+            onClick={() => {
+              if (showHistory) {
+                setShowHistory(false);
+                userSelectedHistoricalRef.current = false;
+                setUserSelectedHistorical(false);
+                setSelectedSession(activeSession);
+              } else {
+                setShowHistory(true);
+              }
+            }}
+            className={cn(
+              "flex items-center gap-2 px-6 py-3 rounded-2xl font-black text-xs uppercase tracking-widest transition-all cursor-pointer",
+              showHistory ? "bg-slate-900 text-white shadow-xl shadow-slate-900/20" : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+            )}
+          >
+            <History className="w-4 h-4" />
+            {showHistory ? 'View Today' : 'Reconciliation History'}
+          </button>
+        </div>
       </div>
 
       {showHistory ? (
@@ -2558,6 +2629,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           <button
                             type="button"
                             onClick={() => {
+                              const isHistorical = session.date !== todayStr;
+                              userSelectedHistoricalRef.current = isHistorical;
+                              setUserSelectedHistorical(isHistorical);
                               setSelectedSession(session);
                               setShowHistory(false);
                             }}
@@ -2684,6 +2758,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 <button
                   type="button"
                   onClick={() => {
+                    userSelectedHistoricalRef.current = false;
+                    setUserSelectedHistorical(false);
                     setSelectedSession(activeSession);
                     setShowHistory(false);
                   }}

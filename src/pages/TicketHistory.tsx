@@ -96,7 +96,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
 
   // Handle URL deep linking for selecting a ticket
   useEffect(() => {
-    const ticketId = searchParams.get('id');
+    const ticketId = searchParams.get('ticketId') || searchParams.get('id') || location.state?.ticketId;
     if (ticketId && buyTickets.length > 0) {
       const targetTicket = buyTickets.find(t => t.id === ticketId);
       if (targetTicket) {
@@ -104,11 +104,20 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
         
         // Clear search parameter so page behavior is normal after selecting
         const newParams = new URLSearchParams(searchParams);
+        newParams.delete('ticketId');
         newParams.delete('id');
         setSearchParams(newParams, { replace: true });
       }
     }
-  }, [searchParams, buyTickets, setSearchParams]);
+  }, [searchParams, buyTickets, location.state, setSearchParams]);
+
+  // Handle customer or search filter query param
+  useEffect(() => {
+    const customerFilter = searchParams.get('customer') || searchParams.get('search') || location.state?.customer || location.state?.search;
+    if (customerFilter) {
+      setSearchTerm(customerFilter);
+    }
+  }, [searchParams, location.state]);
 
   useEffect(() => {
     // Session tracking

@@ -5,10 +5,12 @@ import { useSettings } from '../context/SettingsContext';
 import { PHOTO_PLACEHOLDER_URL } from '../constants';
 
 interface ScaleCaptureButtonProps {
-  onCapture: (weight: number, photoUrl: string) => void;
+  onCapture: (weight: number, photoUrl?: string) => void;
+  compact?: boolean;
+  className?: string;
 }
 
-export const ScaleCaptureButton: React.FC<ScaleCaptureButtonProps> = ({ onCapture }) => {
+export const ScaleCaptureButton: React.FC<ScaleCaptureButtonProps> = ({ onCapture, compact = false, className }) => {
   const { settings } = useSettings();
   const brandLabel = settings.cameraBrand === 'reolink' ? 'Reolink' : settings.cameraBrand === 'swann' ? 'Swann' : 'Network';
   const [isCapturing, setIsCapturing] = useState(false);
@@ -173,6 +175,39 @@ export const ScaleCaptureButton: React.FC<ScaleCaptureButtonProps> = ({ onCaptur
   };
 
   const active = isCapturing || isNetworkPull;
+
+  if (compact) {
+    return (
+      <div className={cn("inline-flex items-center justify-center", className)}>
+        <button
+          type="button"
+          tabIndex={-1}
+          onClick={startCapture}
+          disabled={active}
+          title="Capture weight from digital scale"
+          className="p-1 text-slate-400 hover:text-amber-500 transition-colors rounded-lg focus:outline-none disabled:opacity-50 cursor-pointer"
+        >
+          {active ? (
+            <Loader2 className="w-4 h-4 animate-spin text-amber-500" />
+          ) : (
+            <Scale className="w-4 h-4" />
+          )}
+        </button>
+
+        {/* Hidden elements for capture process */}
+        <video 
+          ref={videoRef} 
+          className="hidden" 
+          playsInline 
+          muted 
+        />
+        <canvas 
+          ref={canvasRef} 
+          className="hidden" 
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="inline-block">

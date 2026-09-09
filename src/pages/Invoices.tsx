@@ -17,7 +17,8 @@ import {
   CheckCircle2, 
   Clock, 
   Trash2,
-  AlertCircle, 
+  AlertCircle,
+  AlertTriangle,
   Printer, 
   X, 
   Download,
@@ -34,7 +35,9 @@ import {
   Package
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { safeSetItem } from '../lib/safeStorage';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
+import { Hint } from '../components/Hint';
 import { useRef } from 'react';
 
 interface SearchableMaterialSelectorProps {
@@ -338,7 +341,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   });
 
   useEffect(() => {
-    localStorage.setItem('pm_invoices_active_tab', activeTab);
+    safeSetItem('pm_invoices_active_tab', activeTab);
   }, [activeTab]);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [tripTickets, setTripTickets] = useState<TripTicket[]>([]);
@@ -369,6 +372,11 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const [showInvoicePreview, setShowInvoicePreview] = useState(false);
   const [autoPrint, setAutoPrint] = useState(false);
   const [processing, setProcessing] = useState(false);
+
+  const [shortfallInvoiceId, setShortfallInvoiceId] = useState<string | null>(null);
+  const [shortfallLines, setShortfallLines] = useState<Array<{matId: string, matName: string, required: number, available: number, shortfall: number}>>([]);
+  const [shortfallResolution, setShortfallResolution] = useState<'A' | 'B' | null>(null);
+  const [shortfallConfirmed, setShortfallConfirmed] = useState(false);
 
   // Helper to calculate material bought and already invoiced weights
   const getMaterialPurchaseSummary = (materialId: string) => {
@@ -454,7 +462,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
 
     const isDirty = buyerName || buyerAddress || buyerPhone || selectedBuyerId || selectedMaterials.length > 0 || notes || paymentTerms !== 'Net 30' || selectedLoadPlanId;
     if (isDirty) {
-      localStorage.setItem('pm_draft_invoice', JSON.stringify(draft));
+      safeSetItem('pm_draft_invoice', JSON.stringify(draft));
     } else {
       localStorage.removeItem('pm_draft_invoice');
     }
@@ -465,7 +473,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
     if (!draftLoaded) return;
 
     if (showInvoicePreview && isEditing && selectedInvoice) {
-      localStorage.setItem('pm_editing_invoice', JSON.stringify({
+      safeSetItem('pm_editing_invoice', JSON.stringify({
         invoice: selectedInvoice,
         isEditing,
         showInvoicePreview
@@ -599,10 +607,25 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       }
 
       if (insufficientLines.length > 0) {
-        const msg = `Cannot mark invoice as Paid due to insufficient live inventory:\n• ${insufficientLines.join('\n• ')}`;
-        setActionError(msg);
-        alert(msg);
-        return;
+        // Build structured shortfall data for the resolution UI
+        const structured = Object.entries(requiredByMaterial)
+          .filter(([matId, reqWeight]) => (inventoryMap[matId] ?? 0) < reqWeight)
+          .map(([matId, reqWeight]) => {
+            const mat = materials.find(m => m.id === matId);
+            const available = inventoryMap[matId] ?? 0;
+            return {
+              matId,
+              matName: mat ? `[${mat.code}] ${mat.name}` : matId,
+              required: reqWeight,
+              available,
+              shortfall: reqWeight - available
+            };
+          });
+        setShortfallLines(structured);
+        setShortfallInvoiceId(invoiceId);
+        setShortfallResolution(null);
+        setShortfallConfirmed(false);
+        return; // stop here — resolution UI takes over
       }
 
       setProcessing(true);
@@ -669,6 +692,143 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       );
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `invoices/${invoiceId}`);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const handleResolveShortfall = async () => {
+    if (!shortfallInvoiceId || !shortfallResolution) return;
+    if (shortfallResolution === 'B' && !shortfallConfirmed) return;
+
+    const inv = invoices.find(i => i.id === shortfallInvoiceId) || (selectedInvoice?.id === shortfallInvoiceId ? selectedInvoice : null);
+    if (!inv) return;
+
+    setProcessing(true);
+    setActionError(null);
+    setActionSuccess(null);
+
+    try {
+      const requiredByMaterial: Record<string, number> = {};
+      inv.materials?.forEach(item => {
+        if (item.materialId) {
+          const w = Number(item.weight) || 0;
+          requiredByMaterial[item.materialId] = (requiredByMaterial[item.materialId] || 0) + w;
+        }
+      });
+
+      const batch = writeBatch(db);
+      const timestamp = new Date().toISOString();
+      const currentUserEmail = profile?.email || auth.currentUser?.email || 'Authorized User';
+      const isManager = profile?.role === 'manager';
+
+      if (shortfallResolution === 'A') {
+        // Option A: Add missing inventory and finalize
+        for (const [matId, reqWeight] of Object.entries(requiredByMaterial)) {
+          const sLine = shortfallLines.find(s => s.matId === matId);
+          const shortfallQty = sLine ? sLine.shortfall : 0;
+          const netIncrement = shortfallQty - reqWeight;
+
+          const invRef = doc(db, 'inventory', matId);
+          batch.set(invRef, {
+            materialId: matId,
+            currentWeight: increment(netIncrement),
+            lastUpdated: timestamp
+          }, { merge: true });
+        }
+
+        const addedListStr = shortfallLines
+          .map(s => `${s.shortfall.toLocaleString()} lb of ${s.matName}`)
+          .join(', ');
+
+        const shortfallNote = `Inventory adjusted at finalization: ${addedListStr}`;
+
+        const invRef = doc(db, 'invoices', shortfallInvoiceId);
+        batch.update(invRef, {
+          status: 'paid',
+          inventoryDeducted: true,
+          inventoryDeductedAt: timestamp,
+          shortfallResolution: 'adjustment',
+          shortfallNote
+        });
+
+        await batch.commit();
+
+        if (selectedInvoice && selectedInvoice.id === shortfallInvoiceId) {
+          setSelectedInvoice({
+            ...selectedInvoice,
+            status: 'paid',
+            inventoryDeducted: true,
+            inventoryDeductedAt: timestamp,
+            shortfallResolution: 'adjustment',
+            shortfallNote
+          });
+        }
+
+        await logAuditEvent(
+          'invoice',
+          shortfallInvoiceId,
+          'update',
+          { after: { status: 'paid', inventoryDeducted: true, shortfallResolution: 'adjustment' } },
+          `Invoice ${inv.invoiceNumber} finalized with inventory adjustment for shortfall — ${addedListStr}`
+        );
+
+        setActionSuccess(`Invoice ${inv.invoiceNumber} marked as Paid with inventory adjustment.`);
+      } else if (shortfallResolution === 'B') {
+        // Option B: Confirm pass-through and finalize
+        for (const [matId, reqWeight] of Object.entries(requiredByMaterial)) {
+          const invRef = doc(db, 'inventory', matId);
+          batch.set(invRef, {
+            materialId: matId,
+            currentWeight: increment(-reqWeight),
+            lastUpdated: timestamp
+          }, { merge: true });
+        }
+
+        const dateStr = new Date().toLocaleDateString();
+        const shortfallNote = `Pass-through confirmed by ${currentUserEmail} on ${dateStr} — material sourced from same-day buy tickets`;
+
+        const invRef = doc(db, 'invoices', shortfallInvoiceId);
+        batch.update(invRef, {
+          status: 'paid',
+          inventoryDeducted: true,
+          inventoryDeductedAt: timestamp,
+          shortfallResolution: 'passthrough',
+          shortfallNote
+        });
+
+        await batch.commit();
+
+        if (selectedInvoice && selectedInvoice.id === shortfallInvoiceId) {
+          setSelectedInvoice({
+            ...selectedInvoice,
+            status: 'paid',
+            inventoryDeducted: true,
+            inventoryDeductedAt: timestamp,
+            shortfallResolution: 'passthrough',
+            shortfallNote
+          });
+        }
+
+        await logAuditEvent(
+          'invoice',
+          shortfallInvoiceId,
+          'update',
+          { after: { status: 'paid', inventoryDeducted: true, shortfallResolution: 'passthrough' } },
+          `Invoice ${inv.invoiceNumber} finalized with pass-through confirmation by ${currentUserEmail}`,
+          !isManager // requiresManagerReview if not a manager
+        );
+
+        setActionSuccess(`Invoice ${inv.invoiceNumber} marked as Paid with pass-through confirmation.`);
+      }
+
+      // Clear shortfall state
+      setShortfallInvoiceId(null);
+      setShortfallLines([]);
+      setShortfallResolution(null);
+      setShortfallConfirmed(false);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `invoices/${shortfallInvoiceId}`);
     } finally {
       setProcessing(false);
     }
@@ -2260,6 +2420,222 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         </div>
       </div>
     )}
+
+      {/* Shortfall Resolution Modal */}
+      {shortfallInvoiceId && (
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShortfallInvoiceId(null);
+              setShortfallLines([]);
+              setShortfallResolution(null);
+              setShortfallConfirmed(false);
+            }
+          }}
+          className="fixed inset-0 z-[110] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="relative z-50 bg-white rounded-2xl max-w-2xl w-full mx-4 shadow-2xl border border-slate-200 overflow-hidden flex flex-col my-8"
+          >
+            {/* Header */}
+            <div className="p-6 border-b border-slate-100 flex items-start justify-between bg-amber-50/60">
+              <div className="flex items-start gap-4">
+                <div className="p-3 bg-amber-100 text-amber-700 rounded-2xl shrink-0">
+                  <AlertTriangle className="w-6 h-6" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-lg font-black text-slate-900">Inventory Shortfall — Choose How to Proceed</h3>
+                    <Hint text="The app thinks there isn't enough of this material in stock. Option A adds the missing amount then removes it (net zero) — use when material came through the yard. Option B records that it passed straight through from today's buy tickets. Both are logged." />
+                  </div>
+                  <p className="text-xs text-slate-600 font-medium mt-1">
+                    The following materials have insufficient inventory. These items have already been delivered to the buyer.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShortfallInvoiceId(null);
+                  setShortfallLines([]);
+                  setShortfallResolution(null);
+                  setShortfallConfirmed(false);
+                }}
+                className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
+              {/* Shortfall Table */}
+              <div className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold uppercase tracking-wider">
+                      <th className="py-3 px-4">Material</th>
+                      <th className="py-3 px-4 text-right">Required</th>
+                      <th className="py-3 px-4 text-right">In Stock</th>
+                      <th className="py-3 px-4 text-right">Short By</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {shortfallLines.map((line) => (
+                      <tr key={line.matId} className="hover:bg-slate-50/50">
+                        <td className="py-3 px-4 font-bold text-slate-900">{line.matName}</td>
+                        <td className="py-3 px-4 text-right font-mono font-medium text-slate-600">{line.required.toLocaleString()} lb</td>
+                        <td className="py-3 px-4 text-right font-mono font-medium text-slate-600">{line.available.toLocaleString()} lb</td>
+                        <td className="py-3 px-4 text-right font-mono font-bold text-red-600 bg-red-50/50">{line.shortfall.toLocaleString()} lb</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Resolution Options */}
+              <div className="space-y-3">
+                <p className="text-xs font-black uppercase tracking-wider text-slate-400">Select Resolution Method</p>
+                
+                {/* Option A Card */}
+                <div
+                  onClick={() => setShortfallResolution('A')}
+                  className={cn(
+                    "p-4 rounded-2xl border-2 transition-all cursor-pointer flex flex-col gap-3 text-left",
+                    shortfallResolution === 'A'
+                      ? "border-blue-600 bg-blue-50/30 shadow-sm"
+                      : "border-slate-200 hover:border-slate-300 bg-white"
+                  )}
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="radio"
+                      id="opt-a-radio"
+                      name="shortfall_opt"
+                      checked={shortfallResolution === 'A'}
+                      onChange={() => setShortfallResolution('A')}
+                      className="mt-1 w-4 h-4 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                    />
+                    <div className="flex-1">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-black text-slate-900">OPTION A — Add missing inventory and finalize</h4>
+                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">Net Zero</span>
+                      </div>
+                      <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                        Adds the exact shortfall quantity to inventory, then immediately deducts it for this invoice. Net inventory change: zero. Use when material came through your yard and was delivered.
+                      </p>
+                    </div>
+                  </div>
+
+                  {shortfallResolution === 'A' && (
+                    <div className="mt-1 pt-3 border-t border-blue-200/60 pl-7 space-y-1.5 bg-blue-50/60 p-3 rounded-xl">
+                      <p className="text-[11px] font-bold text-blue-900 uppercase tracking-wide">Confirmation Checklist:</p>
+                      {shortfallLines.map((s) => (
+                        <div key={s.matId} className="flex items-center gap-2 text-xs text-blue-800 font-medium">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                          <span>Will add <strong>{s.shortfall.toLocaleString()} lb</strong> of {s.matName}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Option B Card */}
+                <div
+                  onClick={() => setShortfallResolution('B')}
+                  className={cn(
+                    "p-4 rounded-2xl border-2 transition-all cursor-pointer flex flex-col gap-3 text-left",
+                    shortfallResolution === 'B'
+                      ? "border-amber-600 bg-amber-50/30 shadow-sm"
+                      : "border-slate-200 hover:border-slate-300 bg-white"
+                  )}
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="radio"
+                      id="opt-b-radio"
+                      name="shortfall_opt"
+                      checked={shortfallResolution === 'B'}
+                      onChange={() => setShortfallResolution('B')}
+                      className="mt-1 w-4 h-4 text-amber-600 focus:ring-amber-500 cursor-pointer"
+                    />
+                    <div className="flex-1">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-black text-slate-900">OPTION B — Confirm pass-through and finalize</h4>
+                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">Direct Pass</span>
+                      </div>
+                      <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                        Material was sourced directly from incoming buy tickets and passed through to the buyer the same day. Inventory may go negative temporarily.
+                      </p>
+                    </div>
+                  </div>
+
+                  {shortfallResolution === 'B' && (
+                    <div className="mt-1 pt-3 border-t border-amber-200/60 pl-7">
+                      <label 
+                        className="flex items-start gap-2.5 p-3 rounded-xl bg-amber-100/70 border border-amber-200 cursor-pointer"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <input
+                          type="checkbox"
+                          id="opt-b-checkbox"
+                          checked={shortfallConfirmed}
+                          onChange={(e) => setShortfallConfirmed(e.target.checked)}
+                          className="mt-0.5 w-4 h-4 rounded text-amber-600 focus:ring-amber-500 border-slate-300 cursor-pointer"
+                        />
+                        <span className="text-xs font-bold text-amber-900 leading-snug">
+                          I confirm this material was physically present and delivered from our yard
+                        </span>
+                      </label>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer actions */}
+            <div className="p-6 border-t border-slate-100 bg-slate-50 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                id="cancel-shortfall-btn"
+                onClick={() => {
+                  setShortfallInvoiceId(null);
+                  setShortfallLines([]);
+                  setShortfallResolution(null);
+                  setShortfallConfirmed(false);
+                }}
+                disabled={processing}
+                className="px-5 py-2.5 rounded-xl border border-slate-200 font-bold text-xs text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                id="confirm-shortfall-btn"
+                onClick={handleResolveShortfall}
+                disabled={
+                  processing ||
+                  !shortfallResolution ||
+                  (shortfallResolution === 'B' && !shortfallConfirmed)
+                }
+                className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed font-bold text-xs text-white shadow-sm flex items-center gap-2 transition-colors"
+              >
+                {processing ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 className="w-4 h-4" />
+                    Confirm & Mark as Paid
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

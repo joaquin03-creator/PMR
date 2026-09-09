@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
+import { safeSetItem } from '../lib/safeStorage';
 
 type Theme = 'light' | 'dark' | 'system';
 type FontSize = 'small' | 'medium' | 'large' | 'xl';
@@ -121,7 +122,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
   });
 
   useEffect(() => {
-    localStorage.setItem('app_settings', JSON.stringify(settings));
+    safeSetItem('app_settings', JSON.stringify(settings));
     
     // Apply theme
     const root = window.document.documentElement;

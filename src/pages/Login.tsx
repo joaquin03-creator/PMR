@@ -7,6 +7,7 @@ import { BrandLogo } from '../components/BrandLogo';
 import { useSearchParams } from 'react-router-dom';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { UserRole } from '../types';
+import { safeSetItem } from '../lib/safeStorage';
 
 export default function Login() {
   const [searchParams] = useSearchParams();
@@ -30,8 +31,8 @@ export default function Login() {
     setStatus('signing_in');
     
     // Store preferred demo role and active flag in localStorage immediately
-    localStorage.setItem('pm_demo_mode_active', 'true');
-    localStorage.setItem('pm_demo_role', role);
+    safeSetItem('pm_demo_mode_active', 'true');
+    safeSetItem('pm_demo_role', role);
     
     const email = `demo-${role}@preferredmetalsrecycling.com`;
     // Standard strong password conforming to standard password policies
@@ -100,7 +101,7 @@ If this is your administrator account, please check the "Create Account" option 
     // Capture invite token if present
     const invite = searchParams.get('invite');
     if (invite) {
-      localStorage.setItem('pm_invite_token', invite);
+      safeSetItem('pm_invite_token', invite);
     }
 
     return auth.onAuthStateChanged((user) => {
