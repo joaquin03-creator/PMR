@@ -37,6 +37,7 @@ export function clearSessionDrafts(sessionId: string): void {
   if (!sessionId) return;
   try {
     const knownKeys = [
+      `cash_physical_count_draft_${sessionId}`,
       `cash_sheet_denoms_draft_${sessionId}`,
       `cash_opening_denoms_draft_${sessionId}`,
       `cash_opening_cash_draft_${sessionId}`,

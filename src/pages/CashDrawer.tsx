@@ -1,7 +1,10 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, query, where, addDoc, doc, updateDoc, deleteDoc, getDocs, orderBy, limit, deleteField } from 'firebase/firestore';
-import { CashSession, CashTransaction, BuyTicket, UserProfile, Material, AuditLog } from '../types';
+import { CashSession, CashTransaction, BuyTicket, UserProfile, Material, AuditLog, AfterHoursDay, AfterHoursNote } from '../types';
+import { getAfterHoursActivity } from '../lib/afterHoursDetection';
+import { AfterHoursLineBadge } from '../components/AfterHoursLineBadge';
 import { 
   Wallet, 
   Banknote, 
@@ -43,8 +46,11 @@ import {
   Tag,
   Check,
   ChevronRight,
+  RefreshCw,
   Sparkles,
-  ArrowRight
+  ArrowRight,
+  Link2,
+  CalendarDays
 } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, Cell, XAxis, YAxis, Tooltip as RechartsTooltip, ReferenceLine, CartesianGrid } from 'recharts';
 import { cn } from '../lib/utils';
@@ -52,6 +58,11 @@ import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import { useToast } from '../context/ToastContext';
 import { safeSetItem, clearSessionDrafts, pruneDraftStorage } from '../lib/safeStorage';
+import { 
+  calculateExpectedCash, 
+  calculateOverShort, 
+  runCashLogicSelfTest 
+} from '../lib/cashLogicLock';
 
 interface CashDrawerProps {
   profile: UserProfile | null;
@@ -354,6 +365,9 @@ const getShortageStatus = (overShortVal: number, ticketCount: number) => {
 
 export default function CashDrawer({ profile }: CashDrawerProps) {
   const { firestore, local, success, error: toastError, info } = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [selectedDate, setSelectedDate] = useState<string>('');
+  const [afterHoursNotesMap, setAfterHoursNotesMap] = useState<Record<string, AfterHoursNote>>({});
   const [activeSession, setActiveSession] = useState<CashSession | null>(null);
   const [selectedSession, setSelectedSession] = useState<CashSession | null>(null);
   const [userSelectedHistorical, setUserSelectedHistorical] = useState(false);
@@ -444,7 +458,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [useOpeningDenoms, setUseOpeningDenoms] = useState(true);
   const [quickOpeningCash, setQuickOpeningCash] = useState<string>('');
 
-  const [closingDenoms, setClosingDenoms] = useState<DenominationCount>(initialDenominations);
+  // Single synchronized source of truth for physical cash count (Summary/Balance-Sheet and Finalize Modal)
+  const [physicalCountDenoms, setPhysicalCountDenoms] = useState<DenominationCount>(initialDenominations);
   const [useClosingDenoms, setUseClosingDenoms] = useState(true);
 
   // State to view a session's recorded denominations breakdown
@@ -472,8 +487,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       
     if (priorSessions.length === 0) return null;
 
-    // Find the most recent closed session
-    const lastClosed = priorSessions.find(s => s.status === 'closed');
+    // Find the most recent closed or provisional session
+    const lastClosedOrProvisional = priorSessions.find(s => s.status === 'closed' || s.status === 'provisional');
     const absoluteNewest = priorSessions[0];
 
     // If the absolute newest session prior to today was left open but has physical manual count entered, use it!
@@ -481,12 +496,78 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       return absoluteNewest;
     }
 
-    return lastClosed || absoluteNewest || null;
+    return lastClosedOrProvisional || absoluteNewest || null;
   }, [history, todayStr]);
+
+  // Outstanding provisional sessions needing physical count
+  const provisionalSessions = useMemo(() => {
+    return history.filter(s => s.status === 'provisional');
+  }, [history]);
+
+  // Catch-Up Reconciliation Modal States
+  const [showCatchUpModal, setShowCatchUpModal] = useState(false);
+  const [missedDaysDetails, setMissedDaysDetails] = useState<{
+    session: CashSession;
+    date: string;
+    openingCash: number;
+    ticketPayouts: number;
+    ticketCount: number;
+    replenishments: number;
+    expenses: number;
+    computedExpectedCash: number;
+  }[]>([]);
+  const [loadingCatchUp, setLoadingCatchUp] = useState(false);
+  const [processingCatchUp, setProcessingCatchUp] = useState(false);
+
+  // Finalize Provisional with Physical Count Modal States
+  const [showFinalizeProvisionalModal, setShowFinalizeProvisionalModal] = useState(false);
+  const [provisionalSessionToFinalize, setProvisionalSessionToFinalize] = useState<CashSession | null>(null);
+  const [finalizeDenoms, setFinalizeDenoms] = useState<DenominationCount>(initialDenominations);
+  const [useFinalizeDenoms, setUseFinalizeDenoms] = useState(true);
+  const [quickFinalizeCash, setQuickFinalizeCash] = useState<string>('');
+  const [processingFinalize, setProcessingFinalize] = useState(false);
+
+  // Move Transaction Modal States (manager-only)
+  const [movingTransaction, setMovingTransaction] = useState<CashTransaction | null>(null);
+  const [moveTargetSessionId, setMoveTargetSessionId] = useState<string>('');
+  const [processingMove, setProcessingMove] = useState(false);
+
+  const moveSourceSession = useMemo(() => {
+    if (!movingTransaction) return null;
+    return history.find(s => s.id === movingTransaction.sessionId) || selectedSession || null;
+  }, [history, movingTransaction, selectedSession]);
+
+  const moveOtherSessions = useMemo(() => {
+    if (!movingTransaction) return [];
+    const sourceId = moveSourceSession?.id || movingTransaction.sessionId;
+    return history
+      .filter(s => s.id !== sourceId)
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }, [history, movingTransaction, moveSourceSession]);
+
+  const moveTargetSession = useMemo(() => {
+    return history.find(s => s.id === moveTargetSessionId) || null;
+  }, [history, moveTargetSessionId]);
+
+  // Verification of financial invariant lock
+  useEffect(() => {
+    if (history.length > 0) {
+      let violationsCount = 0;
+      history.forEach(session => {
+        const violations = runCashLogicSelfTest(session);
+        if (violations.length > 0) {
+          console.warn(`[CashLogicSelfTest] Violations in session ${session.id} (${session.date}):`, violations);
+          violationsCount += violations.length;
+        }
+      });
+      if (violationsCount === 0) {
+        console.log(`[CashLogicSelfTest] All ${history.length} historical sessions passed cash logic self-test with 0 violations.`);
+      }
+    }
+  }, [history]);
 
   // Daily Balance Sheet view modes and physical counts
   const [viewMode, setViewMode] = useState<'dashboard' | 'balance_sheet' | 'daily_purchase_report'>('balance_sheet');
-  const [sheetDenoms, setSheetDenoms] = useState<DenominationCount>(initialDenominations);
   const [editedOpeningCash, setEditedOpeningCash] = useState<number>(0);
   const [editedOpeningDenoms, setEditedOpeningDenoms] = useState<DenominationCount>(initialDenominations);
   const [denomEditTab, setDenomEditTab] = useState<'closing' | 'opening'>('closing');
@@ -503,9 +584,35 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [isSubmittingVerification, setIsSubmittingVerification] = useState(false);
   const [isEditingVerification, setIsEditingVerification] = useState(false);
 
-  // Prune orphaned/aged draft keys on initial component mount
+  // Prune orphaned/aged draft keys on initial component mount and migrate legacy drafts
   useEffect(() => {
     pruneDraftStorage(undefined, activeSession?.id);
+    try {
+      const keysToPrune: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key) continue;
+        if (key.startsWith('cash_sheet_denoms_draft_') || key.startsWith('cash_close_denoms_draft_')) {
+          const match = key.match(/^cash_(?:sheet|close)_denoms_draft_(.+)$/);
+          if (match && match[1]) {
+            const sid = match[1];
+            const consolidatedKey = `cash_physical_count_draft_${sid}`;
+            if (!localStorage.getItem(consolidatedKey)) {
+              const val = localStorage.getItem(key);
+              if (val) {
+                localStorage.setItem(consolidatedKey, val);
+              }
+            }
+          }
+          keysToPrune.push(key);
+        }
+      }
+      keysToPrune.forEach(k => {
+        try { localStorage.removeItem(k); } catch {}
+      });
+    } catch (e) {
+      console.warn('[CashDrawer] Failed to migrate/prune legacy draft keys:', e);
+    }
   }, []);
 
   // Sync state values when selectedSession changes
@@ -542,26 +649,29 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         }
       }
 
-      // Load from Firestore first
-      if (selectedSession.closingDenominations) {
-        setSheetDenoms(ensureDenomTotals(selectedSession.closingDenominations));
+      // Load from Firestore first (single source of truth for physical count)
+      const targetClosing = selectedSession.closingDenominations || (selectedSession.id === activeSession?.id ? activeSession?.closingDenominations : undefined);
+      if (targetClosing) {
+        setPhysicalCountDenoms(ensureDenomTotals(targetClosing));
       } else {
         // Fallback: check localStorage for local unsaved progress
-        const savedDraft = localStorage.getItem(`cash_sheet_denoms_draft_${selectedSession.id}`);
+        const savedDraft = localStorage.getItem(`cash_physical_count_draft_${selectedSession.id}`)
+          || localStorage.getItem(`cash_sheet_denoms_draft_${selectedSession.id}`)
+          || localStorage.getItem(`cash_close_denoms_draft_${selectedSession.id}`);
         if (savedDraft) {
           try {
-            setSheetDenoms(JSON.parse(savedDraft));
+            setPhysicalCountDenoms(JSON.parse(savedDraft));
           } catch {
-            setSheetDenoms(initialDenominations);
+            setPhysicalCountDenoms(initialDenominations);
           }
         } else {
-          setSheetDenoms(initialDenominations);
+          setPhysicalCountDenoms(initialDenominations);
         }
       }
     } else {
       setEditedOpeningCash(0);
       setEditedOpeningDenoms(initialDenominations);
-      setSheetDenoms(initialDenominations);
+      setPhysicalCountDenoms(initialDenominations);
       setVerificationComment('');
       setVerificationStatus('unverified');
       prevSessionIdRef.current = null;
@@ -573,15 +683,17 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
   }, [selectedSession?.id, selectedSession?.status]);
 
-  // Auto-save sheetDenoms, editedOpeningCash, and editedOpeningDenoms to localStorage (immediately) and Firestore (debounced)
+  // Auto-save physicalCountDenoms, editedOpeningCash, and editedOpeningDenoms to localStorage (immediately) and Firestore (debounced)
   useEffect(() => {
     if (!selectedSession || !profile) return;
 
     // Save to localStorage immediately on every change!
     try {
-      safeSetItem(`cash_sheet_denoms_draft_${selectedSession.id}`, JSON.stringify(sheetDenoms));
+      safeSetItem(`cash_physical_count_draft_${selectedSession.id}`, JSON.stringify(physicalCountDenoms));
       safeSetItem(`cash_opening_denoms_draft_${selectedSession.id}`, JSON.stringify(editedOpeningDenoms));
       safeSetItem(`cash_opening_cash_draft_${selectedSession.id}`, editedOpeningCash.toString());
+      localStorage.removeItem(`cash_sheet_denoms_draft_${selectedSession.id}`);
+      localStorage.removeItem(`cash_close_denoms_draft_${selectedSession.id}`);
     } catch (e) {
       console.error("Failed to save drafts to localStorage:", e);
     }
@@ -607,7 +719,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     autoSaveTimeoutRef.current = setTimeout(async () => {
       const openingCash = Math.round(editedOpeningCash * 100) / 100;
       const expectedCashVal = Math.round((openingCash + totalReplenishments - totalPayouts - totalExpenses) * 100) / 100;
-      const actualCash = Math.round(calculateDenomTotal(sheetDenoms) * 100) / 100;
+      const actualCash = Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
       const overShort = Math.round((actualCash - expectedCashVal) * 100) / 100;
 
       const oldOpeningCash = selectedSession.openingCash;
@@ -617,7 +729,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
       // Check if anything actually changed
       const openingCashChanged = Math.abs(oldOpeningCash - openingCash) > 0.001;
-      const closingDenomsChanged = JSON.stringify(oldClosingDenoms) !== JSON.stringify(sheetDenoms);
+      const closingDenomsChanged = JSON.stringify(oldClosingDenoms) !== JSON.stringify(physicalCountDenoms);
       const openingDenomsChanged = JSON.stringify(oldOpeningDenoms) !== JSON.stringify(editedOpeningDenoms);
       const actualCashChanged = Math.abs((oldActualCash || 0) - actualCash) > 0.001;
 
@@ -632,7 +744,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           expectedCash: expectedCashVal,
           actualCash,
           overShort,
-          closingDenominations: sheetDenoms
+          closingDenominations: physicalCountDenoms
         };
 
         if (selectedSession.openingDenominations || openingDenomsChanged) {
@@ -675,7 +787,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
               openingCash,
               actualCash,
               openingDenominations: selectedSession.openingDenominations || openingDenomsChanged ? editedOpeningDenoms : null,
-              closingDenominations: sheetDenoms
+              closingDenominations: physicalCountDenoms
             }
           },
           `Live-edit update of session ${selectedSession.date} by ${profile.email || 'Manager'}: ${changes.join(', ')}`
@@ -691,34 +803,44 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         clearTimeout(autoSaveTimeoutRef.current);
       }
     };
-  }, [sheetDenoms, editedOpeningCash, editedOpeningDenoms, selectedSession?.id]);
+  }, [physicalCountDenoms, editedOpeningCash, editedOpeningDenoms, selectedSession?.id]);
 
-  // Save closingDenoms to localStorage immediately on every change!
+  // Immediate localStorage draft persistence for physicalCountDenoms across active/selected sessions
   useEffect(() => {
-    if (activeSession) {
-      try {
-        safeSetItem(`cash_close_denoms_draft_${activeSession.id}`, JSON.stringify(closingDenoms));
-      } catch (e) {
-        console.error("Failed to save close draft to localStorage:", e);
-      }
+    const target = selectedSession || activeSession;
+    if (!target) return;
+    try {
+      safeSetItem(`cash_physical_count_draft_${target.id}`, JSON.stringify(physicalCountDenoms));
+      localStorage.removeItem(`cash_sheet_denoms_draft_${target.id}`);
+      localStorage.removeItem(`cash_close_denoms_draft_${target.id}`);
+    } catch (e) {
+      console.error("Failed to save physical count draft to localStorage:", e);
     }
-  }, [closingDenoms, activeSession?.id]);
+  }, [physicalCountDenoms, selectedSession?.id, activeSession?.id]);
 
-  // Load closingDenoms from draft when modal opens
+  // Ensure physicalCountDenoms is populated from session or draft when close modal opens
   useEffect(() => {
-    if (showCloseModal && activeSession) {
-      const saved = localStorage.getItem(`cash_close_denoms_draft_${activeSession.id}`);
-      if (saved) {
-        try {
-          setClosingDenoms(JSON.parse(saved));
-        } catch {
-          setClosingDenoms(activeSession.closingDenominations ? ensureDenomTotals(activeSession.closingDenominations) : sheetDenoms);
+    const target = selectedSession || activeSession;
+    if (showCloseModal && target) {
+      const isCountEmpty = Object.values(physicalCountDenoms).every(v => !v || v === 0);
+      if (isCountEmpty) {
+        if (target.closingDenominations) {
+          setPhysicalCountDenoms(ensureDenomTotals(target.closingDenominations));
+        } else {
+          const saved = localStorage.getItem(`cash_physical_count_draft_${target.id}`)
+            || localStorage.getItem(`cash_sheet_denoms_draft_${target.id}`)
+            || localStorage.getItem(`cash_close_denoms_draft_${target.id}`);
+          if (saved) {
+            try {
+              setPhysicalCountDenoms(JSON.parse(saved));
+            } catch {
+              // ignore
+            }
+          }
         }
-      } else {
-        setClosingDenoms(activeSession.closingDenominations ? ensureDenomTotals(activeSession.closingDenominations) : sheetDenoms);
       }
     }
-  }, [showCloseModal, activeSession?.id]);
+  }, [showCloseModal, selectedSession?.id, activeSession?.id]);
 
   // Save openingDenoms to localStorage immediately on every change!
   useEffect(() => {
@@ -841,6 +963,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const sheetLedgerItems = useMemo(() => {
     const items: {
       id?: string;
+      isTicketPayoutLine?: boolean;
       cashIn: number | null;
       cashOut: number | null;
       description: string;
@@ -881,6 +1004,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       }, buyTickets[0]?.timestamp || '');
 
       items.push({
+        isTicketPayoutLine: true,
         cashIn: null,
         cashOut: totalTicketsAmount,
         description: `Material Purchases (${buyTickets.length} Ticket${buyTickets.length === 1 ? '' : 's'})`,
@@ -893,20 +1017,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     return items.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
   }, [transactions, buyTickets]);
 
-  const handleSheetDenomChange = (key: keyof DenominationCount, value: number) => {
-    if (!selectedSession) return;
-    setSheetDenoms(prev => ({
+  const handlePhysicalCountDenomChange = (key: keyof DenominationCount, value: number) => {
+    const target = selectedSession || activeSession;
+    if (!target) return;
+    setPhysicalCountDenoms(prev => ({
       ...prev,
       [key]: Math.max(0, value)
     }));
   };
+  const handleSheetDenomChange = handlePhysicalCountDenomChange;
 
   const handleSaveSheetCount = async () => {
     if (!selectedSession || !profile) return;
     setProcessing(true);
     const openingCash = Math.round(editedOpeningCash * 100) / 100;
     const expectedCashVal = Math.round((openingCash + totalReplenishments - totalPayouts - totalExpenses) * 100) / 100;
-    const actualCash = Math.round(calculateDenomTotal(sheetDenoms) * 100) / 100;
+    const actualCash = Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
     const overShort = Math.round((actualCash - expectedCashVal) * 100) / 100;
     try {
       await updateDoc(doc(db, 'cashSessions', selectedSession.id), {
@@ -914,7 +1040,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         expectedCash: expectedCashVal,
         actualCash,
         overShort,
-        closingDenominations: sheetDenoms
+        closingDenominations: physicalCountDenoms
       });
 
       // Track in Audit Log
@@ -935,7 +1061,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
             expectedCash: expectedCashVal,
             actualCash, 
             overShort,
-            closingDenominations: sheetDenoms
+            closingDenominations: physicalCountDenoms
           }
         },
         selectedSession.status === 'closed'
@@ -950,7 +1076,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         expectedCash: expectedCashVal,
         actualCash,
         overShort,
-        closingDenominations: sheetDenoms
+        closingDenominations: physicalCountDenoms
       } : null);
 
       if (selectedSession.status === 'closed') {
@@ -1000,7 +1126,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     
     csvContent += "\n";
      // Bottom left totals vs Bottom right denominations
-    const sDenoms = ensureDenomTotals(sheetDenoms);
+    const sDenoms = ensureDenomTotals(physicalCountDenoms);
     const onHand = selectedSession.actualCash !== undefined && selectedSession.actualCash !== null ? selectedSession.actualCash : calculateDenomTotal(sDenoms);
     const billsTotal = 
       (sDenoms.hundreds || 0) +
@@ -1056,7 +1182,21 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           const sess = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() } as CashSession;
           setActiveSession(sess);
           setSelectedSession(prev => {
-            if (userSelectedHistoricalRef.current) return prev; // user is viewing a past day — do not touch
+            const willKeepPrev = userSelectedHistoricalRef.current || (prev && prev.date !== todayStr);
+            const decision = willKeepPrev ? 'keep prev' : (!prev || prev.id === sess.id || prev.date === todayStr ? 'set sess' : 'keep prev');
+            console.log('[CASHDBG] today snapshot fired (non-empty)', {
+              incomingId: sess.id,
+              incomingDate: sess.date,
+              userSelectedHistoricalRef: userSelectedHistoricalRef.current,
+              prevId: prev?.id,
+              prevDate: prev?.date,
+              decision,
+              resultId: decision === 'set sess' ? sess.id : prev?.id
+            });
+            // Guard against overwriting any deliberate historical session selection
+            if (willKeepPrev) {
+              return prev;
+            }
             if (!prev || prev.id === sess.id || prev.date === todayStr) {
               return sess;
             }
@@ -1065,7 +1205,17 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         } else {
           setActiveSession(null);
           setSelectedSession(prev => {
-            if (userSelectedHistoricalRef.current) return prev; // preserve historical selection
+            const willKeepPrev = userSelectedHistoricalRef.current || (prev && prev.date !== todayStr);
+            console.log('[CASHDBG] today snapshot fired (empty)', {
+              userSelectedHistoricalRef: userSelectedHistoricalRef.current,
+              prevId: prev?.id,
+              prevDate: prev?.date,
+              decision: willKeepPrev ? 'keep prev' : (!prev || prev.date === todayStr ? 'set null' : 'keep prev')
+            });
+            // Guard against resetting any deliberate historical session selection
+            if (willKeepPrev) {
+              return prev;
+            }
             if (!prev || prev.date === todayStr) {
               return null;
             }
@@ -1104,13 +1254,28 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   // Keep selectedSession synchronized with history/activeSession updates
   useEffect(() => {
     if (selectedSession) {
-      if (userSelectedHistorical) {
+      if (userSelectedHistorical || selectedSession.date !== todayStr) {
         // User deliberately selected a historical session: only re-sync from history array, never reassign to activeSession/today
         const updated = history.find(s => s.id === selectedSession.id);
+        console.log('[CASHDBG] sync effect ran (historical branch)', {
+          userSelectedHistorical,
+          selectedSessionId: selectedSession.id,
+          selectedSessionDate: selectedSession.date,
+          foundUpdated: !!updated,
+          updatedId: updated?.id,
+          updatedDate: updated?.date
+        });
         if (updated && JSON.stringify(updated) !== JSON.stringify(selectedSession)) {
           setSelectedSession(updated);
         }
       } else {
+        console.log('[CASHDBG] sync effect ran (today branch)', {
+          userSelectedHistorical,
+          selectedSessionId: selectedSession.id,
+          selectedSessionDate: selectedSession.date,
+          activeSessionId: activeSession?.id,
+          activeSessionDate: activeSession?.date
+        });
         if (activeSession && selectedSession.id === activeSession.id) {
           if (JSON.stringify(selectedSession) !== JSON.stringify(activeSession)) {
             setSelectedSession(activeSession);
@@ -1123,7 +1288,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         }
       }
     }
-  }, [history, activeSession, selectedSession, userSelectedHistorical]);
+  }, [history, activeSession, selectedSession, userSelectedHistorical, todayStr]);
 
   // Subscribe to audit logs for cash Drawer/Transaction activity
   useEffect(() => {
@@ -1142,6 +1307,41 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     });
     return () => unsubAudit();
   }, [profile]);
+
+  // Subscribe to afterHoursNotes collection
+  useEffect(() => {
+    if (!auth.currentUser) return;
+    const unsubAfterHours = onSnapshot(
+      collection(db, 'afterHoursNotes'),
+      (snapshot) => {
+        const map: Record<string, AfterHoursNote> = {};
+        snapshot.docs.forEach(d => {
+          map[d.id] = { id: d.id, ...d.data() } as unknown as AfterHoursNote;
+        });
+        setAfterHoursNotesMap(map);
+      },
+      (error) => console.error('Error subscribing to afterHoursNotes:', error)
+    );
+    return () => unsubAfterHours();
+  }, [profile]);
+
+  // Listen to searchParams 'date' query parameter
+  useEffect(() => {
+    const paramDate = searchParams.get('date');
+    if (paramDate) {
+      setSelectedDate(paramDate);
+      const existingSession = history.find(s => s.date === paramDate);
+      if (existingSession) {
+        setSelectedSession(existingSession);
+      } else {
+        setSelectedSession(null);
+      }
+      const isHist = paramDate !== todayStr;
+      setUserSelectedHistorical(isHist);
+      userSelectedHistoricalRef.current = isHist;
+      setShowHistory(false);
+    }
+  }, [searchParams, history, todayStr]);
 
   // Subscribe to historical Buy Tickets for the last 14 days to identify missing days
   useEffect(() => {
@@ -1196,7 +1396,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   useEffect(() => {
     if (!auth.currentUser) return;
 
-    const targetDate = selectedSession ? selectedSession.date : todayStr;
+    const targetDate = selectedSession ? selectedSession.date : (selectedDate || todayStr);
     const startOfDay = new Date(`${targetDate}T00:00:00`);
     const endOfDay = new Date(`${targetDate}T23:59:59.999`);
 
@@ -1220,7 +1420,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         console.warn('unsubTickets error', e);
       }
     };
-  }, [selectedSession?.date, todayStr, profile]);
+  }, [selectedSession?.date, selectedDate, todayStr, profile]);
 
   // Subscribe to Materials
   useEffect(() => {
@@ -1288,6 +1488,24 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
     return missing.sort((a, b) => b.date.localeCompare(a.date));
   }, [recentTickets, history, todayStr, getTicketLocalDate]);
+
+  const allKnownTickets = useMemo(() => {
+    const map = new Map<string, BuyTicket>();
+    recentTickets.forEach(t => map.set(t.id, t));
+    buyTickets.forEach(t => map.set(t.id, t));
+    return Array.from(map.values());
+  }, [recentTickets, buyTickets]);
+
+  const afterHoursActivity = useMemo(() => {
+    return getAfterHoursActivity(allKnownTickets, history, afterHoursNotesMap);
+  }, [allKnownTickets, history, afterHoursNotesMap]);
+
+  const selectedDay = selectedSession ? selectedSession.date : (selectedDate || todayStr);
+
+  const currentAfterHoursDay = useMemo(() => {
+    if (selectedSession) return null; // Session exists, so not after-hours
+    return afterHoursActivity.find(d => d.date === selectedDay) || null;
+  }, [selectedSession, afterHoursActivity, selectedDay]);
 
   const chartData = useMemo(() => {
     const sortedClosed = [...closedSessions]
@@ -1483,10 +1701,293 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     return Math.round(sum * 100) / 100;
   };
 
+  // ─── PROVISIONAL & CATCH-UP RECONCILIATION ACTIONS ───────────────────
+
+  const handleInitiateOpen = async () => {
+    // 1. Detect any prior-dated session still status 'open' (uncounted)
+    const priorOpenSessions = history
+      .filter(s => s.date && s.date < todayStr && s.status === 'open')
+      .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+    if (priorOpenSessions.length === 0) {
+      setShowStartModal(true);
+      return;
+    }
+
+    // 2. Fetch data for missed days and present Catch-Up Reconciliation modal
+    setLoadingCatchUp(true);
+    setShowCatchUpModal(true);
+
+    try {
+      const details: {
+        session: CashSession;
+        date: string;
+        openingCash: number;
+        ticketPayouts: number;
+        ticketCount: number;
+        replenishments: number;
+        expenses: number;
+        computedExpectedCash: number;
+      }[] = [];
+
+      for (const session of priorOpenSessions) {
+        // Query buyTickets for this date
+        const startOfDay = new Date(`${session.date}T00:00:00`);
+        const endOfDay = new Date(`${session.date}T23:59:59.999`);
+        const ticketsSnap = await getDocs(
+          query(
+            collection(db, 'buyTickets'),
+            where('timestamp', '>=', startOfDay.toISOString()),
+            where('timestamp', '<=', endOfDay.toISOString())
+          )
+        );
+        const dayTickets = ticketsSnap.docs
+          .map(d => d.data() as BuyTicket)
+          .filter(t => t.status !== 'voided' && t.status !== 'cancelled');
+        const ticketPayouts = Math.round(dayTickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100) / 100;
+        const ticketCount = dayTickets.length;
+
+        // Query cashTransactions for this session
+        const txSnap = await getDocs(
+          query(
+            collection(db, 'cashTransactions'),
+            where('sessionId', '==', session.id)
+          )
+        );
+        const txs = txSnap.docs.map(d => d.data() as CashTransaction);
+        const replenishments = Math.round(txs.filter(t => t.type === 'inflow').reduce((sum, t) => sum + (t.amount || 0), 0) * 100) / 100;
+        const expenses = Math.round(txs.filter(t => t.type === 'expense').reduce((sum, t) => sum + (t.amount || 0), 0) * 100) / 100;
+
+        const computedExpected = calculateExpectedCash(
+          session.openingCash,
+          replenishments,
+          ticketPayouts,
+          expenses
+        );
+
+        details.push({
+          session,
+          date: session.date,
+          openingCash: session.openingCash,
+          ticketPayouts,
+          ticketCount,
+          replenishments,
+          expenses,
+          computedExpectedCash: computedExpected
+        });
+      }
+
+      setMissedDaysDetails(details);
+    } catch (err: any) {
+      console.error('Failed to load missed days data:', err);
+      toastError('Load Error', `Failed to scan prior uncounted sessions: ${err.message || err}`);
+    } finally {
+      setLoadingCatchUp(false);
+    }
+  };
+
+  const handleProvisionalClose = async (item: {
+    session: CashSession;
+    date: string;
+    openingCash: number;
+    ticketPayouts: number;
+    ticketCount: number;
+    replenishments: number;
+    expenses: number;
+    computedExpectedCash: number;
+  }) => {
+    if (profile?.role !== 'manager') {
+      toastError('Manager Required', 'Only managers can provisionally close cash sessions.');
+      return;
+    }
+    setProcessingCatchUp(true);
+    try {
+      const assumedCash = item.computedExpectedCash;
+      const now = new Date().toISOString();
+
+      await updateDoc(doc(db, 'cashSessions', item.session.id), {
+        status: 'provisional',
+        expectedCash: assumedCash,
+        actualCash: assumedCash,
+        overShort: 0,
+        provisionalClose: true,
+        provisionalClosedAt: now,
+        provisionalClosedBy: profile.email,
+        provisionalAssumedCash: assumedCash
+      });
+
+      await logAuditEvent(
+        'cashDrawer',
+        item.session.id,
+        'close',
+        {
+          before: { status: 'open', expectedCash: item.session.openingCash },
+          after: { status: 'provisional', actualCash: assumedCash, overShort: 0, provisionalClose: true }
+        },
+        `Provisional close for ${item.date}: assumed expected cash $${assumedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}, no physical count. Awaiting final reconciliation.`
+      );
+
+      const remaining = missedDaysDetails.filter(m => m.session.id !== item.session.id);
+      setMissedDaysDetails(remaining);
+      success('Session Provisionally Closed', `Session for ${item.date} marked provisional with assumed cash of $${assumedCash.toFixed(2)}.`);
+
+      if (remaining.length === 0) {
+        setShowCatchUpModal(false);
+        setShowStartModal(true);
+      }
+    } catch (err: any) {
+      toastError('Error', `Failed to provisionally close session: ${err.message || err}`);
+    } finally {
+      setProcessingCatchUp(false);
+    }
+  };
+
+  const handleProvisionalCloseAll = async () => {
+    if (profile?.role !== 'manager') {
+      toastError('Manager Required', 'Only managers can provisionally close cash sessions.');
+      return;
+    }
+    setProcessingCatchUp(true);
+    try {
+      const now = new Date().toISOString();
+      let prevAssumedClose: number | null = null;
+
+      for (let i = 0; i < missedDaysDetails.length; i++) {
+        const item = missedDaysDetails[i];
+        const dayOpening = (prevAssumedClose !== null) ? prevAssumedClose : item.openingCash;
+        const dayExpected = calculateExpectedCash(
+          dayOpening,
+          item.replenishments,
+          item.ticketPayouts,
+          item.expenses
+        );
+
+        await updateDoc(doc(db, 'cashSessions', item.session.id), {
+          openingCash: dayOpening,
+          status: 'provisional',
+          expectedCash: dayExpected,
+          actualCash: dayExpected,
+          overShort: 0,
+          provisionalClose: true,
+          provisionalClosedAt: now,
+          provisionalClosedBy: profile.email,
+          provisionalAssumedCash: dayExpected
+        });
+
+        await logAuditEvent(
+          'cashDrawer',
+          item.session.id,
+          'close',
+          {
+            before: { status: 'open', openingCash: item.session.openingCash },
+            after: { status: 'provisional', openingCash: dayOpening, actualCash: dayExpected, overShort: 0, provisionalClose: true }
+          },
+          `Provisional close for ${item.date}: assumed expected cash $${dayExpected.toLocaleString(undefined, { minimumFractionDigits: 2 })}, no physical count. Awaiting final reconciliation.`
+        );
+
+        prevAssumedClose = dayExpected;
+      }
+
+      setMissedDaysDetails([]);
+      setShowCatchUpModal(false);
+      success('Catch-Up Complete', 'All missed days provisionally closed. Ready to initialize today.');
+      setShowStartModal(true);
+    } catch (err: any) {
+      toastError('Error', `Failed to chain provisional close: ${err.message || err}`);
+    } finally {
+      setProcessingCatchUp(false);
+    }
+  };
+
+  const handleOpenFinalizeProvisional = (session: CashSession) => {
+    setProvisionalSessionToFinalize(session);
+    setFinalizeDenoms({ ...initialDenominations });
+    setQuickFinalizeCash('');
+    setUseFinalizeDenoms(true);
+    setShowFinalizeProvisionalModal(true);
+  };
+
+  const handleSubmitFinalizeProvisional = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!provisionalSessionToFinalize || profile?.role !== 'manager') {
+      toastError('Manager Required', 'Only managers can finalize provisional sessions.');
+      return;
+    }
+    setProcessingFinalize(true);
+    try {
+      let actualCash = 0;
+      if (useFinalizeDenoms) {
+        actualCash = calculateDenomTotal(finalizeDenoms);
+      } else {
+        actualCash = parseFloat(quickFinalizeCash) || 0;
+      }
+      actualCash = Math.round(actualCash * 100) / 100;
+
+      const expected = provisionalSessionToFinalize.expectedCash;
+      const diff = calculateOverShort(actualCash, expected);
+      const absDiff = Math.abs(diff);
+
+      let sessionNotes = provisionalSessionToFinalize.notes || '';
+      if (absDiff > 50) {
+        const overShortNote = `True count differed from assumed by $${absDiff.toFixed(2)}; later opening balances used the assumed amount.`;
+        sessionNotes = sessionNotes ? `${sessionNotes} | ${overShortNote}` : overShortNote;
+      }
+
+      const now = new Date().toISOString();
+      const updateData: any = {
+        status: 'closed',
+        actualCash,
+        overShort: diff,
+        closedAt: now,
+        closedBy: profile.email,
+        provisionalFinalizedAt: now,
+        provisionalFinalizedBy: profile.email,
+        ...(useFinalizeDenoms ? { closingDenominations: finalizeDenoms } : {}),
+        ...(sessionNotes ? { notes: sessionNotes } : {})
+      };
+
+      await updateDoc(doc(db, 'cashSessions', provisionalSessionToFinalize.id), updateData);
+
+      const assumedStr = (provisionalSessionToFinalize.provisionalAssumedCash ?? expected).toLocaleString(undefined, { minimumFractionDigits: 2 });
+      const actualStr = actualCash.toLocaleString(undefined, { minimumFractionDigits: 2 });
+      const diffStr = (diff > 0 ? '+' : '') + diff.toLocaleString(undefined, { minimumFractionDigits: 2 });
+
+      await logAuditEvent(
+        'cashDrawer',
+        provisionalSessionToFinalize.id,
+        'close',
+        {
+          before: { status: 'provisional', actualCash: provisionalSessionToFinalize.actualCash, overShort: 0 },
+          after: { status: 'closed', actualCash, overShort: diff, closingDenominations: finalizeDenoms }
+        },
+        `Provisional ${provisionalSessionToFinalize.date} finalized: assumed $${assumedStr}, actual $${actualStr}, true over/short $${diffStr}.`
+      );
+
+      success('Provisional Finalized', `Session for ${provisionalSessionToFinalize.date} finalized with true count of $${actualCash.toFixed(2)}.`);
+      setShowFinalizeProvisionalModal(false);
+      setProvisionalSessionToFinalize(null);
+    } catch (err: any) {
+      toastError('Error', `Failed to finalize provisional session: ${err.message || err}`);
+    } finally {
+      setProcessingFinalize(false);
+    }
+  };
+
   const handleStartDay = async (e: React.FormEvent<HTMLFormElement>) => {
     if (!profile) return;
     e.preventDefault();
     setProcessing(true);
+
+    // Guard: ensure no uncounted prior sessions exist
+    const priorOpenSessions = history
+      .filter(s => s.date && s.date < todayStr && s.status === 'open');
+    if (priorOpenSessions.length > 0) {
+      setProcessing(false);
+      setShowStartModal(false);
+      handleInitiateOpen();
+      toastError('Missed Day Detected', 'Please resolve prior uncounted days before opening today.');
+      return;
+    }
     
     const formData = new FormData(e.currentTarget);
     let openingCash = 0;
@@ -2036,7 +2537,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     const formData = new FormData(e.currentTarget);
     let actualCash = 0;
     if (useClosingDenoms) {
-      actualCash = calculateDenomTotal(closingDenoms);
+      actualCash = calculateDenomTotal(physicalCountDenoms);
     } else {
       actualCash = parseFloat(formData.get('actualCash') as string) || 0;
     }
@@ -2054,7 +2555,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         closedAt: new Date().toISOString(),
         closedBy: profile.email,
         notes: notes || targetSession.notes || '',
-        ...(useClosingDenoms ? { closingDenominations: closingDenoms } : {})
+        ...(useClosingDenoms ? { closingDenominations: physicalCountDenoms } : {})
       };
 
       await updateDoc(doc(db, 'cashSessions', targetSession.id), closedData);
@@ -2218,6 +2719,157 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
   };
 
+  const handleOpenMoveTransactionModal = (tx: CashTransaction) => {
+    if (profile?.role !== 'manager') return;
+    setMovingTransaction(tx);
+    const sourceId = tx.sessionId;
+    const available = history
+      .filter(s => s.id !== sourceId)
+      .sort((a, b) => b.date.localeCompare(a.date));
+    setMoveTargetSessionId(available[0]?.id || '');
+  };
+
+  const handleConfirmMove = async () => {
+    if (profile?.role !== 'manager') {
+      toastError('Unauthorized', 'Only managers can move cash transactions to another day.');
+      return;
+    }
+    if (!movingTransaction || !moveSourceSession || !moveTargetSession) {
+      toastError('Invalid Selection', 'Please select a valid destination session.');
+      return;
+    }
+    if (moveSourceSession.id === moveTargetSession.id) {
+      toastError('Invalid Destination', 'Target day cannot be the same as the current day.');
+      return;
+    }
+
+    setProcessingMove(true);
+    try {
+      // 1. updateDoc the transaction's sessionId to the target session id.
+      // Change ONLY sessionId, preserving original logged timestamp for audit.
+      await updateDoc(doc(db, 'cashTransactions', movingTransaction.id), {
+        sessionId: moveTargetSession.id
+      });
+
+      // 2. Recompute and write ONLY the two affected sessions' expectedCash using existing calculateExpectedCash
+      const recomputeSession = async (sess: CashSession) => {
+        // Fetch all transactions for this session after the move
+        const txSnap = await getDocs(
+          query(collection(db, 'cashTransactions'), where('sessionId', '==', sess.id))
+        );
+        const sessTxs = txSnap.docs.map(d => d.data() as CashTransaction);
+        const totalReplenishments = Math.round(
+          sessTxs.filter(t => t.type === 'inflow').reduce((sum, t) => sum + (t.amount || 0), 0) * 100
+        ) / 100;
+        const totalExpenses = Math.round(
+          sessTxs.filter(t => t.type === 'expense').reduce((sum, t) => sum + (t.amount || 0), 0) * 100
+        ) / 100;
+
+        // Fetch non-voided/cancelled buyTickets for this session's date
+        const startOfDay = new Date(`${sess.date}T00:00:00.000`);
+        const endOfDay = new Date(`${sess.date}T23:59:59.999`);
+        const ticketSnap = await getDocs(
+          query(
+            collection(db, 'buyTickets'),
+            where('timestamp', '>=', startOfDay.toISOString()),
+            where('timestamp', '<=', endOfDay.toISOString())
+          )
+        );
+        const tickets = ticketSnap.docs
+          .map(d => d.data() as BuyTicket)
+          .filter(t => t.status !== 'voided' && t.status !== 'cancelled');
+        const totalPayouts = Math.round(
+          tickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100
+        ) / 100;
+
+        // Calculate expectedCash using locked calculateExpectedCash formula
+        const newExpectedCash = calculateExpectedCash(
+          sess.openingCash,
+          totalReplenishments,
+          totalPayouts,
+          totalExpenses
+        );
+
+        let newOverShort: number | undefined = undefined;
+        if (sess.actualCash !== undefined && sess.actualCash !== null) {
+          newOverShort = calculateOverShort(sess.actualCash, newExpectedCash);
+        }
+
+        const sessionUpdates: any = {
+          expectedCash: newExpectedCash
+        };
+        if (newOverShort !== undefined) {
+          sessionUpdates.overShort = newOverShort;
+        }
+
+        await updateDoc(doc(db, 'cashSessions', sess.id), sessionUpdates);
+
+        // Run cash logic self test to verify integrity for affected session
+        const testSession = {
+          ...sess,
+          expectedCash: newExpectedCash,
+          ...(newOverShort !== undefined ? { overShort: newOverShort } : {})
+        };
+        const violations = runCashLogicSelfTest(testSession, {
+          totalReplenishments,
+          totalPayouts,
+          totalExpenses
+        });
+        if (violations.length > 0) {
+          console.warn(`[MoveCashTransaction] Self-test violations for session ${sess.id} (${sess.date}):`, violations);
+        }
+
+        return { newExpectedCash, newOverShort };
+      };
+
+      // Recompute and update ONLY source and target sessions
+      const sourceResults = await recomputeSession(moveSourceSession);
+      const targetResults = await recomputeSession(moveTargetSession);
+
+      // Keep local selectedSession in sync if it was affected
+      if (selectedSession?.id === moveSourceSession.id) {
+        setSelectedSession(prev => prev ? {
+          ...prev,
+          expectedCash: sourceResults.newExpectedCash,
+          ...(sourceResults.newOverShort !== undefined ? { overShort: sourceResults.newOverShort } : {})
+        } : null);
+      } else if (selectedSession?.id === moveTargetSession.id) {
+        setSelectedSession(prev => prev ? {
+          ...prev,
+          expectedCash: targetResults.newExpectedCash,
+          ...(targetResults.newOverShort !== undefined ? { overShort: targetResults.newOverShort } : {})
+        } : null);
+      }
+
+      // 3. Append-only audit event:
+      // "Cash transaction moved: $[amount] [category] [expense/inflow] from [source date] to [target date] by [user]. Reason: day-correction."
+      const formattedAmount = movingTransaction.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      await logAuditEvent(
+        'cashTransaction',
+        movingTransaction.id,
+        'adjustment',
+        {
+          before: { sessionId: moveSourceSession.id, sessionDate: moveSourceSession.date },
+          after: { sessionId: moveTargetSession.id, sessionDate: moveTargetSession.date }
+        },
+        `Cash transaction moved: $${formattedAmount} ${movingTransaction.category} ${movingTransaction.type} from ${moveSourceSession.date} to ${moveTargetSession.date} by ${profile?.email || 'manager'}. Reason: day-correction.`
+      );
+
+      firestore(
+        'Transaction Moved',
+        `Successfully moved $${formattedAmount} ${movingTransaction.type} from ${moveSourceSession.date} to ${moveTargetSession.date}.`
+      );
+
+      setMovingTransaction(null);
+    } catch (error: any) {
+      console.error('Error moving cash transaction:', error);
+      toastError('Move Failed', `Failed to move transaction: ${error.message || error}`);
+      handleFirestoreError(error, OperationType.UPDATE, 'cashTransactions');
+    } finally {
+      setProcessingMove(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -2238,13 +2890,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     );
   }
 
+  console.log('[CASHDBG] render', {
+    selectedSessionId: selectedSession?.id,
+    selectedSessionDate: selectedSession?.date,
+    activeSessionId: activeSession?.id,
+    activeSessionDate: activeSession?.date,
+    userSelectedHistorical,
+    userSelectedHistoricalRef: userSelectedHistoricalRef.current
+  });
+
   return (
     <main className="space-y-8 pb-20">
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 print:hidden">
         <div>
           <h1 className="text-4xl font-black text-slate-900 tracking-tight font-display uppercase">Cash Reconciliation</h1>
-          <p className="text-slate-500 font-medium mt-1">Manage Safe and Register liquidity for {todayStr}.</p>
+          <p className="text-slate-500 font-medium mt-1">Manage Safe and Register liquidity for {selectedDay}.</p>
         </div>
         <div className="flex items-center gap-2">
           {userSelectedHistorical && !showHistory && (
@@ -2253,7 +2914,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
               onClick={() => {
                 userSelectedHistoricalRef.current = false;
                 setUserSelectedHistorical(false);
+                setSelectedDate('');
                 setSelectedSession(activeSession);
+                setSearchParams({});
               }}
               className="flex items-center gap-2 px-5 py-3 rounded-2xl font-black text-xs uppercase tracking-widest transition-all bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-md cursor-pointer active:scale-95"
             >
@@ -2326,7 +2989,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           {historyTab === 'tracker' && (
             <div className="space-y-6 animate-in fade-in duration-200">
               {/* KPIs Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
                 <div className="bg-white rounded-[1.5rem] p-5 border border-slate-200 shadow-sm">
                   <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">Perfect Match Rate</span>
                   <div className="flex items-baseline gap-2">
@@ -2360,6 +3023,19 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 </div>
 
                 <div className="bg-white rounded-[1.5rem] p-5 border border-slate-200 shadow-sm">
+                  <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">Provisional Days</span>
+                  <div className="flex items-baseline gap-2">
+                    <span className={cn(
+                      "text-3xl font-black font-mono",
+                      provisionalSessions.length > 0 ? "text-amber-600" : "text-slate-900"
+                    )}>
+                      {provisionalSessions.length} Days
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-2">Closed on assumed balance; physical count still pending.</p>
+                </div>
+
+                <div className="bg-white rounded-[1.5rem] p-5 border border-slate-200 shadow-sm">
                   <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">Unresolved Gaps</span>
                   <div className="flex items-baseline gap-2">
                     <span className={cn(
@@ -2372,6 +3048,50 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   <p className="text-[10px] text-slate-500 mt-2">Active business days lacking cash reconciliation sessions.</p>
                 </div>
               </div>
+
+              {/* Provisional Sessions Awareness Banner */}
+              {provisionalSessions.length > 0 && (
+                <div className="bg-amber-50 border border-amber-200 rounded-3xl p-6 shadow-sm space-y-4">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 mt-0.5 shrink-0" />
+                    <div className="space-y-1">
+                      <h4 className="text-sm font-black text-amber-900 uppercase tracking-wide">
+                        {provisionalSessions.length} Provisional Day{provisionalSessions.length === 1 ? '' : 's'} Awaiting Physical Count
+                      </h4>
+                      <p className="text-xs text-amber-700 font-medium">
+                        These sessions were provisionally closed so that subsequent days could open without interruption. Enter the true physical count when known to complete the financial record.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {provisionalSessions.map(session => (
+                      <div key={session.id} className="bg-white/90 backdrop-blur-sm p-4 rounded-2xl border border-amber-200 flex items-center justify-between shadow-xs">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-slate-800 text-sm">{session.date}</span>
+                            <span className="text-[9px] font-black px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded uppercase tracking-wider">
+                              Provisional
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-500 mt-1">
+                            Assumed Cash: <span className="font-mono font-bold text-slate-800">${(session.actualCash ?? session.expectedCash).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                          </p>
+                        </div>
+                        {profile?.role === 'manager' && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenFinalizeProvisional(session)}
+                            className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer shrink-0"
+                          >
+                            Finalize Count
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Missing Gaps Alert & Quick Resolvers */}
               {missingReconciliationDays.length > 0 && (
@@ -2387,43 +3107,76 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {missingReconciliationDays.map(gap => (
-                      <div key={gap.date} className="bg-white/80 backdrop-blur-sm p-4 rounded-2xl border border-amber-100 flex items-center justify-between shadow-xs">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-slate-800 text-sm">{gap.date}</span>
-                            <span className="text-[9px] font-black px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded uppercase tracking-wider">
-                              Unreconciled
-                            </span>
+                    {missingReconciliationDays.map(gap => {
+                      const ahDay = afterHoursActivity.find(a => a.date === gap.date);
+                      return (
+                        <div key={gap.date} className="bg-white/80 backdrop-blur-sm p-4 rounded-2xl border border-amber-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-bold text-slate-800 text-sm">{gap.date}</span>
+                              <span className="text-[9px] font-black px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded uppercase tracking-wider">
+                                Unreconciled
+                              </span>
+                            </div>
+                            <div className="flex gap-4 mt-1 text-xs text-slate-500 font-semibold font-mono">
+                              <span>Tickets: {gap.ticketCount}</span>
+                              <span>Payouts: ${gap.totalPayout.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                            </div>
+                            <div className="flex items-center gap-2 mt-1.5">
+                              {ahDay?.hasNote && ahDay?.note ? (
+                                <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 truncate max-w-[240px]" title={ahDay.note}>
+                                  <Check className="w-3 h-3 text-emerald-600 shrink-0" />
+                                  <span className="truncate">"{ahDay.note}"</span>
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1.5 text-[10px] text-amber-700 font-bold bg-amber-50 px-2 py-0.5 rounded-md border border-amber-200">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />
+                                  Needs note / review
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <div className="flex gap-4 mt-1 text-xs text-slate-500 font-semibold font-mono">
-                            <span>Tickets: {gap.ticketCount}</span>
-                            <span>Payouts: ${gap.totalPayout.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedDate(gap.date);
+                                setSelectedSession(null);
+                                const isHist = gap.date !== todayStr;
+                                setUserSelectedHistorical(isHist);
+                                userSelectedHistoricalRef.current = isHist;
+                                setShowHistory(false);
+                                setSearchParams({ date: gap.date });
+                              }}
+                              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-xs"
+                            >
+                              Review Day
+                            </button>
+                            {profile?.role === 'manager' && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsManualRetro(false);
+                                  setRetroactiveDate(gap.date);
+                                  setRetroStatus('closed');
+                                  setRetroOpeningDenoms({ ...initialDenominations });
+                                  setRetroClosingDenoms({ ...initialDenominations });
+                                  setUseRetroOpeningDenoms(false);
+                                  setUseRetroClosingDenoms(false);
+                                  setQuickRetroOpeningCash('');
+                                  setQuickRetroClosingCash('');
+                                  setRetroNotes(`Retroactive resolution for missing day ${gap.date}`);
+                                  setShowRetroactiveModal(true);
+                                }}
+                                className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-xs"
+                              >
+                                Resolve Day
+                              </button>
+                            )}
                           </div>
                         </div>
-                        {profile?.role === 'manager' && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setIsManualRetro(false);
-                              setRetroactiveDate(gap.date);
-                              setRetroStatus('closed');
-                              setRetroOpeningDenoms({ ...initialDenominations });
-                              setRetroClosingDenoms({ ...initialDenominations });
-                              setUseRetroOpeningDenoms(false);
-                              setUseRetroClosingDenoms(false);
-                              setQuickRetroOpeningCash('');
-                              setQuickRetroClosingCash('');
-                              setRetroNotes(`Retroactive resolution for missing day ${gap.date}`);
-                              setShowRetroactiveModal(true);
-                            }}
-                            className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-xs"
-                          >
-                            Resolve Day
-                          </button>
-                        )}
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -2523,11 +3276,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
           {historyTab === 'ledgers' && (
             <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-sm animate-in fade-in duration-200 overflow-x-auto">
-              <table className="w-full text-left min-w-[700px]">
+              <table className="w-full text-left min-w-[820px]">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-100">
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Date</th>
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Status</th>
+                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Opening</th>
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Expected</th>
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Actual</th>
                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Diff</th>
@@ -2535,114 +3289,252 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-50">
-                  {history.map(session => (
-                    <tr key={session.id} className="hover:bg-slate-50/50 transition-colors">
+                  {afterHoursActivity.map(ahDay => (
+                    <tr key={`ah-${ahDay.date}`} className="bg-amber-50/40 hover:bg-amber-50/70 transition-colors border-l-4 border-l-amber-500">
                       <td className="px-6 py-4">
                         <div className="flex items-center gap-3">
-                          <div className="p-2 bg-slate-100 rounded-xl shrink-0">
-                            <Calendar className="w-4 h-4 text-slate-500" />
+                          <div className="p-2 bg-amber-100 rounded-xl shrink-0 text-amber-800">
+                            <Clock className="w-4 h-4" />
                           </div>
                           <div className="flex flex-col">
-                            <span className="font-bold text-slate-900">{session.date}</span>
-                            <div className="flex gap-1.5 mt-1">
-                              {session.openingDenominations && (
-                                <button
-                                  type="button"
-                                  onClick={() => setViewingDenoms({
-                                    title: `Opening Count Breakdown (${session.date})`,
-                                    denoms: session.openingDenominations!,
-                                    closedBy: session.closedBy
-                                  })}
-                                  className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
-                                >
-                                  Opening Breakdown
-                                </button>
-                              )}
-                              {session.closingDenominations && (
-                                <button
-                                  type="button"
-                                  onClick={() => setViewingDenoms({
-                                    title: `Closing Count Breakdown (${session.date})`,
-                                    denoms: session.closingDenominations!,
-                                    closedBy: session.closedBy
-                                  })}
-                                  className="px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
-                                >
-                                  Closing Breakdown
-                                </button>
-                              )}
-                            </div>
+                            <span className="font-bold text-slate-900">{ahDay.date}</span>
+                            <span className="text-[10px] text-amber-800 font-medium">
+                              {ahDay.ticketCount} ticket{ahDay.ticketCount === 1 ? '' : 's'} · ${ahDay.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                            </span>
                           </div>
                         </div>
                       </td>
                       <td className="px-6 py-4">
-                        <span className={cn(
-                          "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
-                          session.status === 'open' ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-600"
-                        )}>
-                          {session.status}
-                        </span>
+                        <div className="flex flex-col gap-1">
+                          <span className="inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 w-fit">
+                            <AlertTriangle className="w-2.5 h-2.5 text-amber-600" />
+                            After-hours
+                          </span>
+                          {ahDay.hasNote && ahDay.note ? (
+                            <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-semibold bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 truncate max-w-[200px]" title={ahDay.note}>
+                              <Check className="w-3 h-3 text-emerald-600 shrink-0" />
+                              <span className="truncate">"{ahDay.note}"</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[10px] text-slate-500 font-medium bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 w-fit">
+                              <span className="w-1.5 h-1.5 rounded-full bg-slate-400 shrink-0" />
+                              needs review
+                            </span>
+                          )}
+                        </div>
                       </td>
-                      <td className="px-6 py-4 text-right font-mono font-bold text-slate-900">
-                        ${session.expectedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                      </td>
-                      <td className="px-6 py-4 text-right font-mono font-bold text-slate-900">
-                        {session.actualCash ? `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '-'}
-                      </td>
-                      <td className="px-6 py-4 text-right">
-                        {session.overShort !== undefined ? (
-                          (() => {
-                            const tCount = recentTickets.filter(t => t.timestamp && getTicketLocalDate(t.timestamp) === session.date && t.status !== 'voided' && t.status !== 'cancelled').length;
-                            const status = getShortageStatus(session.overShort, tCount);
-                            return (
-                              <div className="flex flex-col items-end">
-                                <span className={cn("font-mono font-bold", status.textClass)}>
-                                  {session.overShort > 0 ? '+' : ''}{session.overShort.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                                </span>
-                                {status.isTolerance && (
-                                  <span className="text-[8px] font-black uppercase text-amber-500 tracking-wider">
-                                    Rounding Tol
-                                  </span>
-                                )}
-                              </div>
-                            );
-                          })()
-                        ) : (
-                          <span className="text-slate-400 font-bold">-</span>
-                        )}
-                      </td>
+                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
+                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
+                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
+                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
                       <td className="px-6 py-4 text-right">
                         <div className="flex items-center justify-end gap-2">
-                          {session.status === 'open' && session.date !== todayStr && session.actualCash !== undefined && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (window.confirm(`Are you sure you want to finalize and close the session for ${session.date}?`)) {
-                                  handleQuickCloseSession(session);
-                                }
-                              }}
-                              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-sm"
-                            >
-                              Close Day
-                            </button>
-                          )}
                           <button
                             type="button"
                             onClick={() => {
-                              const isHistorical = session.date !== todayStr;
-                              userSelectedHistoricalRef.current = isHistorical;
-                              setUserSelectedHistorical(isHistorical);
-                              setSelectedSession(session);
+                              setSelectedDate(ahDay.date);
+                              setSelectedSession(null);
+                              const isHist = ahDay.date !== todayStr;
+                              setUserSelectedHistorical(isHist);
+                              userSelectedHistoricalRef.current = isHist;
                               setShowHistory(false);
+                              setSearchParams({ date: ahDay.date });
                             }}
-                            className="px-3.5 py-2 bg-slate-900 hover:bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
+                            className="px-3 py-1.5 bg-slate-900 hover:bg-amber-600 text-white rounded-xl text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer shadow-xs"
                           >
-                            View Ledger
+                            Review Day
                           </button>
                         </div>
                       </td>
                     </tr>
                   ))}
+                  {history.map(session => {
+                    // Chronologically prior session to evaluate day-to-day cash continuity
+                    const priorSession = history
+                      .filter(s => s.date < session.date)
+                      .sort((a, b) => b.date.localeCompare(a.date))[0];
+
+                    let continuity: { type: 'match' | 'diff'; tooltip: string; diffAmount?: number } | null = null;
+                    if (priorSession) {
+                      const priorClosingCash = priorSession.actualCash !== undefined && priorSession.actualCash !== null
+                        ? priorSession.actualCash
+                        : priorSession.expectedCash;
+
+                      if (priorClosingCash !== undefined) {
+                        const diffVal = Math.round((session.openingCash - priorClosingCash) * 100) / 100;
+                        if (Math.abs(diffVal) <= 0.01) {
+                          continuity = {
+                            type: 'match',
+                            tooltip: `Carried from ${priorSession.date} close`
+                          };
+                        } else {
+                          continuity = {
+                            type: 'diff',
+                            tooltip: `Opening differs from prior day's close by $${Math.abs(diffVal).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+                            diffAmount: Math.abs(diffVal)
+                          };
+                        }
+                      }
+                    }
+
+                    const hasClosingCount = !!session.closingDenominations && Object.values(session.closingDenominations).some(v => (v || 0) > 0);
+
+                    return (
+                      <tr key={session.id} className="hover:bg-slate-50/50 transition-colors">
+                        <td className="px-6 py-4">
+                          <div className="flex items-center gap-3">
+                            <div className="p-2 bg-slate-100 rounded-xl shrink-0">
+                              <Calendar className="w-4 h-4 text-slate-500" />
+                            </div>
+                            <div className="flex flex-col">
+                              <span className="font-bold text-slate-900">{session.date}</span>
+                              <div className="flex gap-1.5 mt-1">
+                                {session.openingDenominations && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setViewingDenoms({
+                                      title: `Opening Count Breakdown (${session.date})`,
+                                      denoms: session.openingDenominations!,
+                                      closedBy: session.closedBy
+                                    })}
+                                    className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
+                                  >
+                                    Opening Breakdown
+                                  </button>
+                                )}
+                                {session.closingDenominations && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setViewingDenoms({
+                                      title: `Closing Count Breakdown (${session.date})`,
+                                      denoms: session.closingDenominations!,
+                                      closedBy: session.closedBy
+                                    })}
+                                    className="px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
+                                  >
+                                    Closing Breakdown
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4">
+                          <span className={cn(
+                            "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                            session.status === 'provisional' ? "bg-amber-100 text-amber-800 border border-amber-200" :
+                            session.status === 'open' ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-600"
+                          )}>
+                            {session.status === 'provisional' ? 'PROVISIONAL — needs count' : session.status}
+                          </span>
+                        </td>
+                        <td className="px-6 py-4 text-right">
+                          <div className="flex items-center justify-end gap-1.5">
+                            {continuity?.type === 'match' && (
+                              <span title={continuity.tooltip} className="cursor-help inline-flex items-center text-emerald-600">
+                                <Link2 className="w-3.5 h-3.5" />
+                              </span>
+                            )}
+                            {continuity?.type === 'diff' && (
+                              <span title={continuity.tooltip} className="cursor-help inline-flex items-center">
+                                <span className="w-2 h-2 rounded-full bg-amber-500 ring-2 ring-amber-200" />
+                              </span>
+                            )}
+                            <span className="font-mono font-bold text-slate-900">
+                              ${session.openingCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 text-right font-mono font-bold text-slate-900">
+                          ${session.expectedCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </td>
+                        <td className="px-6 py-4 text-right font-mono font-bold text-slate-900">
+                          {session.status === 'open' ? (
+                            hasClosingCount && session.actualCash !== undefined && session.actualCash !== null ? (
+                              `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                            ) : (
+                              <span className="text-slate-400 font-medium italic text-xs">— not counted</span>
+                            )
+                          ) : (
+                            session.actualCash !== undefined && session.actualCash !== null ? (
+                              `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                            ) : (
+                              '-'
+                            )
+                          )}
+                        </td>
+                        <td className="px-6 py-4 text-right">
+                          {session.status === 'open' ? (
+                            <span className="text-slate-400 font-medium italic text-xs">— pending count</span>
+                          ) : session.overShort !== undefined ? (
+                            (() => {
+                              const tCount = recentTickets.filter(t => t.timestamp && getTicketLocalDate(t.timestamp) === session.date && t.status !== 'voided' && t.status !== 'cancelled').length;
+                              const status = getShortageStatus(session.overShort, tCount);
+                              return (
+                                <div className="flex flex-col items-end">
+                                  <span className={cn("font-mono font-bold", status.textClass)}>
+                                    {session.overShort > 0 ? '+' : ''}${session.overShort.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                  </span>
+                                  {status.isTolerance && (
+                                    <span className="text-[8px] font-black uppercase text-amber-500 tracking-wider">
+                                      Rounding Tol
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            })()
+                          ) : (
+                            <span className="text-slate-400 font-bold">-</span>
+                          )}
+                        </td>
+                        <td className="px-6 py-4 text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            {session.status === 'provisional' && profile?.role === 'manager' && (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenFinalizeProvisional(session)}
+                                className="px-3.5 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-sm shrink-0"
+                              >
+                                Finalize Count
+                              </button>
+                            )}
+                            {session.status === 'open' && session.date !== todayStr && session.actualCash !== undefined && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (window.confirm(`Are you sure you want to finalize and close the session for ${session.date}?`)) {
+                                    handleQuickCloseSession(session);
+                                  }
+                                }}
+                                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-sm"
+                              >
+                                Close Day
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const isHistorical = session.date !== todayStr;
+                                console.log('[CASHDBG] View Ledger clicked', {
+                                  sessionId: session.id,
+                                  sessionDate: session.date,
+                                  isHistorical,
+                                  todayStr
+                                });
+                                userSelectedHistoricalRef.current = isHistorical;
+                                setUserSelectedHistorical(isHistorical);
+                                setSelectedSession(session);
+                                setShowHistory(false);
+                              }}
+                              className="px-3.5 py-2 bg-slate-900 hover:bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
+                            >
+                              View Ledger
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -2771,31 +3663,177 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
             </div>
           )}
 
-          {!selectedSession ? (
-            <div className="bg-white rounded-[2.5rem] p-12 border-2 border-dashed border-slate-200 flex flex-col items-center justify-center text-center space-y-6 max-w-2xl mx-auto shadow-sm">
-              <div className="p-8 bg-blue-50 rounded-[2rem] text-blue-600 shadow-inner">
-                <Wallet className="w-16 h-16" strokeWidth={1.5} />
-              </div>
-              <div className="space-y-2">
-                <h2 className="text-3xl font-black text-slate-900 uppercase tracking-tight font-display">Start Cash Session</h2>
-                <p className="text-slate-500 font-medium max-w-sm mx-auto uppercase text-xs tracking-widest leading-relaxed">
-                  Enter your combined opening cash from the safe and register to begin tracking for today.
+          {/* Awareness Banner for Outstanding Provisional Sessions */}
+          {provisionalSessions.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs mb-6">
+              <div className="flex items-center gap-3">
+                <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+                <p className="text-xs font-semibold text-amber-900">
+                  <span className="font-black uppercase tracking-wider">{provisionalSessions.length} day{provisionalSessions.length === 1 ? '' : 's'} provisionally closed</span> — finalize with a physical count when able.
                 </p>
               </div>
-              {profile?.role === 'cashier' && !profile?.permissions?.canOpenCloseSessions ? (
-                <div className="p-5 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-semibold max-w-sm mx-auto">
-                  You do not have permission to initialize or open new cash sessions. Please contact a manager.
-                </div>
-              ) : (
-                <button 
-                  onClick={() => setShowStartModal(true)}
-                  className="px-10 py-5 bg-blue-600 text-white rounded-3xl font-black text-sm uppercase tracking-widest hover:bg-blue-700 transition-all shadow-2xl shadow-blue-200 flex items-center gap-3 hover:-translate-y-1 active:scale-95"
-                >
-                  <Plus className="w-5 h-5" />
-                  Initialize Opening Cash
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setShowHistory(true);
+                  setHistoryTab('tracker');
+                }}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shrink-0 self-start sm:self-auto"
+              >
+                Review Provisional Days
+              </button>
             </div>
+          )}
+
+          {!selectedSession ? (
+            currentAfterHoursDay ? (
+              <div className="space-y-6 max-w-4xl mx-auto">
+                {/* After-Hours Day Banner */}
+                <div className="bg-amber-50 border-2 border-amber-300 rounded-[2.5rem] p-6 md:p-8 shadow-sm space-y-6">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                      <div className="p-3.5 bg-amber-500 text-slate-950 rounded-2xl shrink-0 shadow-md">
+                        <Clock className="w-6 h-6" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h2 className="text-xl md:text-2xl font-black text-slate-900 uppercase tracking-tight font-display">
+                            After-Hours Activity
+                          </h2>
+                          <span className="font-mono text-xs font-bold bg-amber-200 text-amber-900 px-2.5 py-0.5 rounded-lg">
+                            {currentAfterHoursDay.date}
+                          </span>
+                        </div>
+                        <p className="text-xs text-amber-800 font-medium mt-0.5">
+                          Tickets processed on this day with no cash drawer session opened.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      {profile?.role === 'manager' && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsManualRetro(false);
+                            setRetroactiveDate(currentAfterHoursDay.date);
+                            setRetroStatus('closed');
+                            setRetroOpeningDenoms({ ...initialDenominations });
+                            setRetroClosingDenoms({ ...initialDenominations });
+                            setUseRetroOpeningDenoms(false);
+                            setUseRetroClosingDenoms(false);
+                            setQuickRetroOpeningCash('');
+                            setQuickRetroClosingCash('');
+                            setRetroNotes(`Retroactive session for after-hours day ${currentAfterHoursDay.date}`);
+                            setShowRetroactiveModal(true);
+                          }}
+                          className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-xs"
+                        >
+                          Resolve Day
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="bg-white/90 backdrop-blur-sm p-4 rounded-2xl border border-amber-200/80 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">Context & Status</div>
+                      <AfterHoursLineBadge
+                        day={currentAfterHoursDay}
+                        isManager={profile?.role === 'manager'}
+                        currentUserEmail={profile?.email || auth.currentUser?.email || undefined}
+                      />
+                    </div>
+                    <div className="text-left sm:text-right">
+                      <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 block">Total Payouts</span>
+                      <span className="font-mono font-black text-base text-red-600">
+                        ${currentAfterHoursDay.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Tickets Breakdown Table */}
+                <div className="bg-white rounded-[2.5rem] border border-slate-200 p-6 md:p-8 shadow-sm">
+                  <div className="flex items-center justify-between pb-4 border-b border-slate-100 mb-4">
+                    <div>
+                      <h3 className="text-sm font-black text-slate-900 uppercase tracking-wider">
+                        Processed Buy Tickets ({buyTickets.length})
+                      </h3>
+                      <p className="text-xs text-slate-500 font-medium">Tickets created on {currentAfterHoursDay.date}</p>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 block">Ticket Count</span>
+                      <span className="font-mono font-black text-sm text-slate-900">
+                        {buyTickets.length} ticket{buyTickets.length === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {buyTickets.length === 0 ? (
+                    <div className="text-center py-8 text-slate-400 text-xs font-medium">
+                      Loading ticket details...
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-slate-100 overflow-x-auto">
+                      <table className="w-full text-left text-xs min-w-[500px]">
+                        <thead>
+                          <tr className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                            <th className="pb-3">Ticket ID</th>
+                            <th className="pb-3">Time</th>
+                            <th className="pb-3">Customer / Seller</th>
+                            <th className="pb-3 text-right">Cash Out</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {buyTickets.map(ticket => (
+                            <tr key={ticket.id} className="hover:bg-slate-50/60">
+                              <td className="py-3 font-mono font-bold text-slate-900">
+                                {ticket.id.slice(0, 8)}
+                              </td>
+                              <td className="py-3 font-mono text-slate-500">
+                                {ticket.timestamp ? new Date(ticket.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
+                              </td>
+                              <td className="py-3 text-slate-700 font-medium">
+                                {ticket.businessName || 'Walk-in Seller'}
+                              </td>
+                              <td className="py-3 text-right font-mono font-bold text-red-600">
+                                ${(ticket.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="bg-white rounded-[2.5rem] p-12 border-2 border-dashed border-slate-200 flex flex-col items-center justify-center text-center space-y-6 max-w-2xl mx-auto shadow-sm">
+                <div className="p-8 bg-blue-50 rounded-[2rem] text-blue-600 shadow-inner">
+                  <Wallet className="w-16 h-16" strokeWidth={1.5} />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-3xl font-black text-slate-900 uppercase tracking-tight font-display">Start Cash Session</h2>
+                  <p className="text-slate-500 font-medium max-w-sm mx-auto uppercase text-xs tracking-widest leading-relaxed">
+                    Enter your combined opening cash from the safe and register to begin tracking for today.
+                  </p>
+                </div>
+                {profile?.role === 'cashier' && !profile?.permissions?.canOpenCloseSessions ? (
+                  <div className="p-5 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-semibold max-w-sm mx-auto">
+                    You do not have permission to initialize or open new cash sessions. Please contact a manager.
+                  </div>
+                ) : (
+                  <button 
+                    onClick={handleInitiateOpen}
+                    className="px-10 py-5 bg-blue-600 text-white rounded-3xl font-black text-sm uppercase tracking-widest hover:bg-blue-700 transition-all shadow-2xl shadow-blue-200 flex items-center gap-3 hover:-translate-y-1 active:scale-95"
+                  >
+                    <Plus className="w-5 h-5" />
+                    Initialize Opening Cash
+                  </button>
+                )}
+              </div>
+            )
           ) : (
             <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4">
               {/* Segmented Control View Toggle */}
@@ -2843,7 +3881,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   </div>
                   <div>
                     <span className="text-xs font-black uppercase tracking-wider text-white">
-                      Active Session: {selectedSession.date}
+                      {selectedSession.id === activeSession?.id ? 'Active Session' : 'Historical Session'}: {selectedSession.date}
                     </span>
                     <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest block">
                       Status: {selectedSession.status.toUpperCase()}
@@ -2983,9 +4021,13 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   </h3>
                   <div className={cn(
                     "mt-4 inline-flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                    selectedSession.status === 'provisional' ? "bg-amber-500/20 text-amber-400 border border-amber-500/30" :
                     selectedSession.status === 'open' ? "bg-blue-500/20 text-blue-400" : "bg-emerald-500/20 text-emerald-400"
                   )}>
-                    <div className={cn("w-1.5 h-1.5 rounded-full", selectedSession.status === 'open' ? "bg-blue-400 animate-pulse" : "bg-emerald-400")} />
+                    <div className={cn("w-1.5 h-1.5 rounded-full",
+                      selectedSession.status === 'provisional' ? "bg-amber-400" :
+                      selectedSession.status === 'open' ? "bg-blue-400 animate-pulse" : "bg-emerald-400"
+                    )} />
                     Session {selectedSession.status}
                   </div>
                 </div>
@@ -3050,7 +4092,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           ${totalPayouts.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                         </p>
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mt-1">
-                          {totalPayouts + totalExpenses > 0 ? ((totalPayouts / (totalPayouts + totalExpenses)) * 100).toFixed(1) : '0.0'}% of today's spend
+                          {totalPayouts + totalExpenses > 0 ? ((totalPayouts / (totalPayouts + totalExpenses)) * 100).toFixed(1) : '0.0'}% of {selectedSession.id === activeSession?.id ? "today's" : "session"} spend
                         </span>
                       </div>
 
@@ -3063,7 +4105,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           ${totalExpenses.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                         </p>
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mt-1">
-                          {totalPayouts + totalExpenses > 0 ? ((totalExpenses / (totalPayouts + totalExpenses)) * 100).toFixed(1) : '0.0'}% of today's spend
+                          {totalPayouts + totalExpenses > 0 ? ((totalExpenses / (totalPayouts + totalExpenses)) * 100).toFixed(1) : '0.0'}% of {selectedSession.id === activeSession?.id ? "today's" : "session"} spend
                         </span>
                       </div>
                     </div>
@@ -3078,7 +4120,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
                     {Object.keys(expensesByCategory).length === 0 ? (
                       <div className="py-8 text-center text-slate-400 text-xs font-black uppercase tracking-widest bg-slate-50 rounded-2xl border border-dashed border-slate-200">
-                        No non-material expenses logged today.
+                        No non-material expenses logged {selectedSession.id === activeSession?.id ? "today" : "for this session"}.
                       </div>
                     ) : (
                       <div className="space-y-3">
@@ -3139,7 +4181,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto text-slate-300">
                           <Receipt className="w-8 h-8" />
                         </div>
-                        <p className="text-slate-400 font-bold uppercase text-xs tracking-widest">No manual transactions logged yet today.</p>
+                        <p className="text-slate-400 font-bold uppercase text-xs tracking-widest">No manual transactions logged {selectedSession.id === activeSession?.id ? "yet today" : "for this session"}.</p>
                       </div>
                     ) : (
                       <div className="divide-y divide-slate-50">
@@ -3188,6 +4230,16 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
                                 {(profile?.role === 'manager' || selectedSession) && (
                                   <div className="flex items-center gap-1">
+                                    {profile?.role === 'manager' && (
+                                      <button 
+                                        type="button"
+                                        onClick={() => handleOpenMoveTransactionModal(tx)}
+                                        className="p-2 text-slate-300 hover:text-amber-600 hover:bg-amber-50 rounded-xl transition-all"
+                                        title="Move to another day"
+                                      >
+                                        <CalendarDays className="w-4 h-4" />
+                                      </button>
+                                    )}
                                     <button 
                                       onClick={() => setEditingTransaction(tx)}
                                       className="p-2 text-slate-300 hover:text-blue-500 hover:bg-blue-50 rounded-xl transition-all"
@@ -3294,12 +4346,33 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             </button>
                           )}
                           <div className="flex flex-col gap-3 pt-4">
-                            <div className="flex items-center gap-3 p-4 bg-emerald-500/10 rounded-2xl border border-emerald-500/20">
-                              <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
-                              <p className="text-[10px] font-black text-emerald-400 uppercase tracking-widest">
-                                This session is finalized. Reconciliation record is archived.
-                              </p>
-                            </div>
+                            {selectedSession.status === 'provisional' ? (
+                              <div className="space-y-3">
+                                <div className="flex items-center gap-3 p-4 bg-amber-500/10 rounded-2xl border border-amber-500/20">
+                                  <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
+                                  <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest">
+                                    Provisionally closed on assumed balance (${(selectedSession.actualCash ?? selectedSession.expectedCash).toFixed(2)}). Physical count pending.
+                                  </p>
+                                </div>
+                                {profile?.role === 'manager' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenFinalizeProvisional(selectedSession)}
+                                    className="w-full py-4 bg-amber-600 hover:bg-amber-500 text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg flex items-center justify-center gap-2 cursor-pointer"
+                                  >
+                                    <CheckCircle2 className="w-4 h-4" />
+                                    Finalize with Physical Count
+                                  </button>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-3 p-4 bg-emerald-500/10 rounded-2xl border border-emerald-500/20">
+                                <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
+                                <p className="text-[10px] font-black text-emerald-400 uppercase tracking-widest">
+                                  This session is finalized. Reconciliation record is archived.
+                                </p>
+                              </div>
+                            )}
                             {(profile?.role === 'manager' || selectedSession) && (
                               <button 
                                 onClick={() => {
@@ -3330,7 +4403,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mt-0.5">Edit drawer denominations</p>
                       </div>
                       <span className="font-mono font-black text-xs text-slate-900 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200">
-                        ${calculateDenomTotal(sheetDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                        ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                       </span>
                     </div>
 
@@ -3345,10 +4418,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           { key: 'fives', label: "5's ($5)", value: 5 },
                           { key: 'ones', label: "1's ($1)", value: 1 }
                         ].map(denom => {
-                          const totalVal = sheetDenoms[denom.key as keyof DenominationCount] || 0;
+                          const totalVal = physicalCountDenoms[denom.key as keyof DenominationCount] || 0;
                           const updateSheetCount = (change: number) => {
                             const val = Math.max(0, Math.round((totalVal + (change * denom.value)) * 100) / 100);
-                            handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                            handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, val);
                           };
 
                           return (
@@ -3379,7 +4452,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                     min="0"
                                     disabled={false}
                                     value={totalVal || ''}
-                                    onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, Math.round((parseFloat(e.target.value) || 0) * 100) / 100)}
+                                    onChange={(e) => handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, Math.round((parseFloat(e.target.value) || 0) * 100) / 100)}
                                     onKeyDown={(e) => {
                                       if (e.key === 'ArrowUp') {
                                         e.preventDefault();
@@ -3416,10 +4489,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           { key: 'dimes', label: "Dimes (10¢)", value: 0.1 },
                           { key: 'nickels', label: "Nickels (5¢)", value: 0.05 }
                         ].map(denom => {
-                          const totalVal = sheetDenoms[denom.key as keyof DenominationCount] || 0;
+                          const totalVal = physicalCountDenoms[denom.key as keyof DenominationCount] || 0;
                           const updateSheetCount = (change: number) => {
                             const val = Math.max(0, Math.round((totalVal + (change * denom.value)) * 100) / 100);
-                            handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                            handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, val);
                           };
 
                           return (
@@ -3450,7 +4523,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                     min="0"
                                     disabled={false}
                                     value={totalVal || ''}
-                                    onChange={(e) => handleSheetDenomChange(denom.key as keyof DenominationCount, Math.round((parseFloat(e.target.value) || 0) * 100) / 100)}
+                                    onChange={(e) => handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, Math.round((parseFloat(e.target.value) || 0) * 100) / 100)}
                                     onKeyDown={(e) => {
                                       if (e.key === 'ArrowUp') {
                                         e.preventDefault();
@@ -3483,21 +4556,34 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                       <div className="flex justify-between items-center text-xs">
                         <span className="font-bold text-slate-400 uppercase">Coin & Bill Total</span>
                         <span className="font-mono font-black text-slate-900">
-                          ${calculateDenomTotal(sheetDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                          ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                         </span>
                       </div>
-                      <div className="flex justify-between items-center text-xs pb-2">
-                        <span className="font-bold text-slate-400 uppercase">Over / Short</span>
-                        <span className={cn(
-                          "font-mono font-black px-2 py-0.5 rounded",
-                          (calculateDenomTotal(sheetDenoms) - expectedCash) < 0 
-                            ? "bg-red-50 text-red-700 border border-red-100" 
-                            : "bg-emerald-50 text-emerald-700 border border-emerald-100"
-                        )}>
-                          {calculateDenomTotal(sheetDenoms) - expectedCash >= 0 ? '+' : ''}
-                          {(calculateDenomTotal(sheetDenoms) - expectedCash).toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                        </span>
-                      </div>
+                      {(() => {
+                        const totalCount = calculateDenomTotal(physicalCountDenoms);
+                        const diff = Math.round((totalCount - expectedCash) * 100) / 100;
+                        const status = getShortageStatus(diff, buyTickets.length);
+                        return (
+                          <div className="flex justify-between items-center text-xs pb-2">
+                            <span className="font-bold text-slate-400 uppercase">Over / Short</span>
+                            <div className="flex items-center gap-1.5">
+                              <span className={cn(
+                                "font-mono font-black px-2 py-0.5 rounded",
+                                status.badgeClass
+                              )}>
+                                {diff >= 0 ? '+' : ''}
+                                {diff.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                              </span>
+                              <span className={cn(
+                                "text-[9px] font-black uppercase px-2 py-0.5 rounded-full border",
+                                status.badgeClass
+                              )}>
+                                {status.type === 'over' ? (diff === 0 ? 'BALANCED' : 'OVER') : (status.isTolerance ? 'TOLERANCE' : 'SHORT')}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })()}
 
                       {(selectedSession || profile?.role === 'manager') && (
                         <button
@@ -3640,13 +4726,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                     <td className="px-4 py-2 text-right font-mono font-black text-xs text-red-600 bg-red-50/10 border-r border-slate-200">
                                       {item.cashOut !== null ? `$${item.cashOut.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ''}
                                     </td>
-                                    <td className="px-4 py-2 text-slate-700 text-[11px] font-medium truncate max-w-[200px] border-r border-slate-200">
-                                      <div className="flex items-center gap-1.5">
-                                        <span>{item.description || <span className="text-slate-200">----------------------------</span>}</span>
-                                        {isRowHighlighted && (
-                                          <span className="px-1.5 py-0.5 bg-amber-500 text-white rounded text-[8px] font-black uppercase tracking-wider animate-pulse">
-                                            NEW
-                                          </span>
+                                    <td className="px-4 py-2 text-slate-700 text-[11px] font-medium border-r border-slate-200">
+                                      <div className="flex flex-col gap-1">
+                                        <div className="flex items-center gap-1.5">
+                                          <span>{item.description || <span className="text-slate-200">----------------------------</span>}</span>
+                                          {isRowHighlighted && (
+                                            <span className="px-1.5 py-0.5 bg-amber-500 text-white rounded text-[8px] font-black uppercase tracking-wider animate-pulse">
+                                              NEW
+                                            </span>
+                                          )}
+                                        </div>
+                                        {item.isTicketPayoutLine && currentAfterHoursDay && (
+                                          <AfterHoursLineBadge
+                                            day={currentAfterHoursDay}
+                                            isManager={profile?.role === 'manager'}
+                                            currentUserEmail={profile?.email || auth.currentUser?.email || undefined}
+                                          />
                                         )}
                                       </div>
                                     </td>
@@ -3708,21 +4803,34 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         <div className="flex justify-between items-center py-1.5 border-t border-dashed border-slate-200 col-span-2">
                           <span className="font-bold text-slate-500 uppercase">Total Cash On-Hand (Physical)</span>
                           <span className="font-mono font-black text-slate-900 text-sm">
-                            ${calculateDenomTotal(sheetDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                            ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                           </span>
                         </div>
-                        <div className="flex justify-between items-center py-2.5 border-t-2 border-slate-300 col-span-2 bg-white rounded-xl px-4 border border-slate-200">
-                          <span className="font-black text-slate-800 uppercase text-xs">Over / Short</span>
-                          <span className={cn(
-                            "font-mono font-black text-sm px-2.5 py-1 rounded-lg",
-                            (calculateDenomTotal(sheetDenoms) - sheetExpectedCash) < 0 
-                              ? "bg-red-50 text-red-700 border border-red-100" 
-                              : "bg-emerald-50 text-emerald-700 border border-emerald-100"
-                          )}>
-                            {calculateDenomTotal(sheetDenoms) - sheetExpectedCash >= 0 ? '+' : ''}
-                            {(calculateDenomTotal(sheetDenoms) - sheetExpectedCash).toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                          </span>
-                        </div>
+                        {(() => {
+                          const totalCount = calculateDenomTotal(physicalCountDenoms);
+                          const diff = Math.round((totalCount - sheetExpectedCash) * 100) / 100;
+                          const status = getShortageStatus(diff, buyTickets.length);
+                          return (
+                            <div className="flex justify-between items-center py-2.5 border-t-2 border-slate-300 col-span-2 bg-white rounded-xl px-4 border border-slate-200">
+                              <span className="font-black text-slate-800 uppercase text-xs">Over / Short</span>
+                              <div className="flex items-center gap-2">
+                                <span className={cn(
+                                  "font-mono font-black text-sm px-2.5 py-1 rounded-lg",
+                                  status.badgeClass
+                                )}>
+                                  {diff >= 0 ? '+' : ''}
+                                  {diff.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                </span>
+                                <span className={cn(
+                                  "text-[10px] font-black uppercase px-2 py-0.5 rounded-full border",
+                                  status.badgeClass
+                                )}>
+                                  {status.type === 'over' ? (diff === 0 ? 'BALANCED' : 'OVER') : (status.isTolerance ? 'TOLERANCE' : 'SHORT')}
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
 
@@ -3955,7 +5063,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                               { key: 'fives', label: "5's ($5)", value: 5 },
                               { key: 'ones', label: "1's ($1)", value: 1 }
                             ].map(denom => {
-                              const currentDenoms = denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms;
+                              const currentDenoms = denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms;
                               const totalVal = currentDenoms[denom.key as keyof DenominationCount] || 0;
 
                               const updateModalCount = (change: number) => {
@@ -3966,7 +5074,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   const newTotal = calculateDenomTotal(updatedOpening);
                                   setEditedOpeningCash(Math.round(newTotal * 100) / 100);
                                 } else {
-                                  handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                                  handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, val);
                                 }
                               };
 
@@ -4004,7 +5112,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                             const newTotal = calculateDenomTotal(updatedOpening);
                                             setEditedOpeningCash(Math.round(newTotal * 100) / 100);
                                           } else {
-                                            handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                                            handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, val);
                                           }
                                         }}
                                         onKeyDown={(e) => {
@@ -4046,7 +5154,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                               { key: 'dimes', label: "Dimes (10¢)", value: 0.1 },
                               { key: 'nickels', label: "Nickels (5¢)", value: 0.05 }
                             ].map(denom => {
-                              const currentDenoms = denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms;
+                              const currentDenoms = denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms;
                               const totalVal = currentDenoms[denom.key as keyof DenominationCount] || 0;
 
                               const updateModalCount = (change: number) => {
@@ -4057,7 +5165,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                   const newTotal = calculateDenomTotal(updatedOpening);
                                   setEditedOpeningCash(Math.round(newTotal * 100) / 100);
                                 } else {
-                                  handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                                  handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, val);
                                 }
                               };
 
@@ -4095,7 +5203,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                             const newTotal = calculateDenomTotal(updatedOpening);
                                             setEditedOpeningCash(Math.round(newTotal * 100) / 100);
                                           } else {
-                                            handleSheetDenomChange(denom.key as keyof DenominationCount, val);
+                                            handlePhysicalCountDenomChange(denom.key as keyof DenominationCount, val);
                                           }
                                         }}
                                         onKeyDown={(e) => {
@@ -4132,12 +5240,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             <span className="font-bold text-slate-500 uppercase">Total Bills</span>
                             <span className="font-mono font-black text-slate-900">
                               ${Math.round(
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).hundreds || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).fifties || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).twenties || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).tens || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).fives || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).ones || 0)
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).hundreds || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).fifties || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).twenties || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).tens || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).fives || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).ones || 0)
                               ).toLocaleString()}
                             </span>
                           </div>
@@ -4145,18 +5253,18 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             <span className="font-bold text-slate-500 uppercase">Total Coins</span>
                             <span className="font-mono font-black text-slate-900">
                               ${(
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).dollarCoins || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).halfDollars || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).quarters || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).dimes || 0) +
-                                ((denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).nickels || 0)
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).dollarCoins || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).halfDollars || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).quarters || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).dimes || 0) +
+                                ((denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).nickels || 0)
                               ).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                             </span>
                           </div>
                           <div className="flex justify-between items-center pt-2.5 border-t border-slate-300">
                             <span className="font-black text-slate-800 uppercase text-xs">Coin / Bill Total</span>
                             <span className="font-mono font-black text-slate-900 text-sm">
-                              ${calculateDenomTotal(denomEditTab === 'opening' ? editedOpeningDenoms : sheetDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                              ${calculateDenomTotal(denomEditTab === 'opening' ? editedOpeningDenoms : physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                             </span>
                           </div>
                         </div>
@@ -4458,6 +5566,326 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       )}
 
       {/* MODALS */}
+      {/* Catch-Up Reconciliation Modal */}
+      {showCatchUpModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
+          <div className="bg-white rounded-[2.5rem] p-6 md:p-10 max-w-4xl w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
+            <div className="flex items-start justify-between gap-4 mb-6">
+              <div className="space-y-2">
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-amber-100 text-amber-800 rounded-full text-[10px] font-black uppercase tracking-wider">
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                  Prior Missed Day{missedDaysDetails.length === 1 ? '' : 's'} Detected
+                </div>
+                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight font-display">
+                  Catch-Up Cash Reconciliation
+                </h3>
+                <p className="text-slate-500 font-medium text-xs uppercase tracking-widest">
+                  Uncounted prior drawer sessions must be closed or provisionally resolved before opening today.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowCatchUpModal(false)}
+                className="p-2.5 hover:bg-slate-100 rounded-2xl text-slate-400 hover:text-slate-700 transition-all cursor-pointer"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            {loadingCatchUp ? (
+              <div className="py-16 flex flex-col items-center justify-center gap-3 text-slate-500">
+                <RefreshCw className="w-8 h-8 animate-spin text-blue-600" />
+                <span className="text-xs font-bold uppercase tracking-wider">Scanning uncounted prior days...</span>
+              </div>
+            ) : missedDaysDetails.length === 0 ? (
+              <div className="py-12 text-center space-y-4">
+                <p className="text-sm font-semibold text-slate-700">All prior days have been resolved.</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowCatchUpModal(false);
+                    setShowStartModal(true);
+                  }}
+                  className="px-8 py-4 bg-blue-600 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-blue-700 transition-all cursor-pointer"
+                >
+                  Proceed to Open Today
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-6">
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl text-amber-900 text-xs leading-relaxed">
+                  <p className="font-bold">Why is this needed?</p>
+                  <p className="mt-1">
+                    Today’s starting balance depends on having a confirmed ending balance from prior days. You can provisionally close uncounted days based on their mathematical expected cash, allowing today’s ledger to open immediately. The true physical count can be finalized later at any time.
+                  </p>
+                </div>
+
+                <div className="space-y-4">
+                  {missedDaysDetails.map((item) => (
+                    <div
+                      key={item.session.id}
+                      className="p-5 bg-slate-50 rounded-2xl border border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-4"
+                    >
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-base font-black text-slate-900">{item.date}</span>
+                          <span className="text-[10px] font-black uppercase px-2 py-0.5 bg-red-100 text-red-700 rounded">
+                            Uncounted
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                          <div>
+                            <span className="text-[10px] uppercase font-bold text-slate-400 block">Opening Cash</span>
+                            <span className="font-mono font-bold text-slate-800">${item.openingCash.toFixed(2)}</span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] uppercase font-bold text-slate-400 block">Buy Tickets ({item.ticketCount})</span>
+                            <span className="font-mono font-bold text-red-600">-${item.ticketPayouts.toFixed(2)}</span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] uppercase font-bold text-slate-400 block">Inflows / Expenses</span>
+                            <span className="font-mono font-bold text-slate-800">
+                              +${item.replenishments.toFixed(2)} / -${item.expenses.toFixed(2)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] uppercase font-bold text-blue-600 block">Expected Cash</span>
+                            <span className="font-mono font-black text-blue-700 text-sm">
+                              ${item.computedExpectedCash.toFixed(2)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        {profile?.role === 'manager' ? (
+                          <button
+                            type="button"
+                            disabled={processingCatchUp}
+                            onClick={() => handleProvisionalClose(item)}
+                            className="w-full md:w-auto px-5 py-3 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all disabled:opacity-50 cursor-pointer shadow-sm"
+                          >
+                            {processingCatchUp ? 'Processing...' : 'Provisionally Close'}
+                          </button>
+                        ) : (
+                          <span className="text-[11px] text-slate-400 italic">Manager required to provisionally close</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Batch Actions & Footer */}
+                <div className="pt-4 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3">
+                  <p className="text-xs text-slate-500 font-medium">
+                    {missedDaysDetails.length} uncounted day{missedDaysDetails.length === 1 ? '' : 's'} remaining
+                  </p>
+                  <div className="flex items-center gap-3 w-full sm:w-auto">
+                    <button
+                      type="button"
+                      onClick={() => setShowCatchUpModal(false)}
+                      className="flex-1 sm:flex-initial px-5 py-3 text-slate-600 hover:bg-slate-100 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    {profile?.role === 'manager' && missedDaysDetails.length > 1 && (
+                      <button
+                        type="button"
+                        disabled={processingCatchUp}
+                        onClick={handleProvisionalCloseAll}
+                        className="flex-1 sm:flex-initial px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all disabled:opacity-50 cursor-pointer shadow-md"
+                      >
+                        {processingCatchUp ? 'Processing...' : 'Provisionally Close All'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Finalize Provisional Session Modal */}
+      {showFinalizeProvisionalModal && provisionalSessionToFinalize && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
+          <div className="bg-white rounded-[2.5rem] p-6 md:p-10 max-w-2xl w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
+            <div className="flex items-start justify-between gap-4 mb-6">
+              <div className="space-y-1">
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-amber-100 text-amber-800 rounded-full text-[10px] font-black uppercase tracking-wider">
+                  Provisional Finalization
+                </div>
+                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight font-display">
+                  Finalize Physical Count ({provisionalSessionToFinalize.date})
+                </h3>
+                <p className="text-slate-500 font-medium text-xs uppercase tracking-widest">
+                  Enter the actual counted cash for this session to lock the permanent ledger.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowFinalizeProvisionalModal(false);
+                  setProvisionalSessionToFinalize(null);
+                }}
+                className="p-2.5 hover:bg-slate-100 rounded-2xl text-slate-400 hover:text-slate-700 transition-all cursor-pointer"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 mb-6 flex items-center justify-between">
+              <div>
+                <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider block">Assumed / Expected Cash</span>
+                <span className="text-xl font-mono font-black text-slate-900">
+                  ${provisionalSessionToFinalize.expectedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                </span>
+              </div>
+              <div className="text-right">
+                <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider block">Status</span>
+                <span className="text-xs font-black uppercase px-2 py-0.5 bg-amber-100 text-amber-800 rounded">
+                  Provisional
+                </span>
+              </div>
+            </div>
+
+            <form onSubmit={handleSubmitFinalizeProvisional} className="space-y-6">
+              <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+                <label className="text-xs font-black uppercase text-slate-600 tracking-wider">Entry Mode</label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setUseFinalizeDenoms(true)}
+                    className={cn(
+                      "px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer",
+                      useFinalizeDenoms ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600"
+                    )}
+                  >
+                    By Denomination
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setUseFinalizeDenoms(false)}
+                    className={cn(
+                      "px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer",
+                      !useFinalizeDenoms ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600"
+                    )}
+                  >
+                    Quick Total
+                  </button>
+                </div>
+              </div>
+
+              {useFinalizeDenoms ? (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {[
+                      { key: 'hundreds', label: '$100 Bill', val: 100 },
+                      { key: 'fifties', label: '$50 Bill', val: 50 },
+                      { key: 'twenties', label: '$20 Bill', val: 20 },
+                      { key: 'tens', label: '$10 Bill', val: 10 },
+                      { key: 'fives', label: '$5 Bill', val: 5 },
+                      { key: 'ones', label: '$1 Bill', val: 1 },
+                      { key: 'dollarCoins', label: '$1 Coin', val: 1 },
+                      { key: 'halfDollars', label: '50¢ Coin', val: 0.5 },
+                      { key: 'quarters', label: '25¢ Coin', val: 0.25 },
+                      { key: 'dimes', label: '10¢ Coin', val: 0.1 },
+                      { key: 'nickels', label: '5¢ Coin', val: 0.05 },
+                    ].map(({ key, label, val }) => (
+                      <div key={key} className="bg-slate-50 p-3 rounded-xl border border-slate-200 space-y-1">
+                        <label className="text-[10px] font-black uppercase text-slate-500 tracking-wider block">{label}</label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={finalizeDenoms[key as keyof DenominationCount] || ''}
+                            onChange={(e) => {
+                              const count = parseInt(e.target.value) || 0;
+                              setFinalizeDenoms(prev => ({ ...prev, [key]: count }));
+                            }}
+                            className="w-full bg-white border border-slate-200 rounded-lg px-2 py-1 text-sm font-mono font-bold text-slate-900"
+                            placeholder="0"
+                          />
+                        </div>
+                        <span className="text-[9px] font-mono font-bold text-slate-400 block text-right">
+                          ${((finalizeDenoms[key as keyof DenominationCount] || 0) * val).toFixed(2)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="p-4 bg-blue-50 rounded-2xl border border-blue-200 flex items-center justify-between">
+                    <span className="text-xs font-black uppercase text-blue-900 tracking-wider">Counted Total</span>
+                    <span className="text-2xl font-mono font-black text-blue-900">
+                      ${calculateDenomTotal(finalizeDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <label className="text-xs font-black uppercase text-slate-600 tracking-wider">Total Counted Cash ($)</label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 font-mono font-bold text-slate-400 text-lg">$</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      required
+                      value={quickFinalizeCash}
+                      onChange={(e) => setQuickFinalizeCash(e.target.value)}
+                      placeholder="0.00"
+                      className="w-full bg-slate-50 border border-slate-200 rounded-2xl pl-9 pr-4 py-4 text-xl font-mono font-bold text-slate-900 focus:bg-white transition-all"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Over/Short preview */}
+              {(() => {
+                const enteredCash = useFinalizeDenoms
+                  ? calculateDenomTotal(finalizeDenoms)
+                  : parseFloat(quickFinalizeCash) || 0;
+                const diff = calculateOverShort(enteredCash, provisionalSessionToFinalize.expectedCash);
+                return (
+                  <div className={cn(
+                    "p-4 rounded-2xl border flex items-center justify-between",
+                    diff === 0 ? "bg-emerald-50 border-emerald-200 text-emerald-900" :
+                    diff > 0 ? "bg-emerald-50 border-emerald-200 text-emerald-900" :
+                    "bg-red-50 border-red-200 text-red-900"
+                  )}>
+                    <span className="text-xs font-black uppercase tracking-wider">Calculated Over / Short</span>
+                    <span className="text-xl font-mono font-black">
+                      {diff > 0 ? '+' : ''}${diff.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                );
+              })()}
+
+              <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowFinalizeProvisionalModal(false);
+                    setProvisionalSessionToFinalize(null);
+                  }}
+                  className="px-6 py-3 text-slate-600 hover:bg-slate-100 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={processingFinalize}
+                  className="px-8 py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all disabled:opacity-50 cursor-pointer shadow-md"
+                >
+                  {processingFinalize ? 'Finalizing...' : 'Save & Lock Final Count'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Start Session Modal */}
       {showStartModal && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
@@ -5416,18 +6844,18 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
             <form onSubmit={handleCloseDay} className="space-y-8">
               {useClosingDenoms ? (
                 <div className="space-y-6">
-                  <DenominationEditor values={closingDenoms} onChange={setClosingDenoms} />
+                  <DenominationEditor values={physicalCountDenoms} onChange={setPhysicalCountDenoms} />
                   
                   {/* Live Reconcile Display */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="p-6 bg-blue-50 border border-blue-100 rounded-3xl text-center space-y-1">
                       <p className="text-[10px] font-black text-blue-400 uppercase tracking-widest">Calculated Actual Count</p>
                       <p className="text-2xl font-black text-blue-600 font-mono">
-                        ${calculateDenomTotal(closingDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                        ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                       </p>
                     </div>
                     {(() => {
-                      const calculatedActual = calculateDenomTotal(closingDenoms);
+                      const calculatedActual = calculateDenomTotal(physicalCountDenoms);
                       const diff = calculatedActual - expectedCash;
                       const status = getShortageStatus(diff, buyTickets.length);
                       
@@ -5819,6 +7247,167 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Move Cash Transaction to Another Day Modal (Manager-Only) */}
+      {movingTransaction && moveSourceSession && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
+          <div className="bg-white rounded-[2.5rem] p-6 sm:p-8 max-w-lg w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+              <div className="flex items-center gap-3">
+                <div className="p-3 bg-amber-50 text-amber-600 rounded-2xl">
+                  <CalendarDays className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-black text-slate-900 uppercase tracking-tight">Move to Another Day</h3>
+                  <p className="text-xs text-slate-500 font-medium">Manager correction: reassign transaction session</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMovingTransaction(null)}
+                className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all"
+                title="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="py-6 space-y-6">
+              {/* Transaction Details Card */}
+              <div className="p-5 bg-slate-50 border border-slate-200 rounded-2xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className={cn(
+                    "px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider",
+                    movingTransaction.type === 'inflow' ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-800"
+                  )}>
+                    {movingTransaction.type === 'inflow' ? 'Cash Inflow' : 'Cash Expense'}
+                  </span>
+                  <span className={cn(
+                    "font-mono font-black text-xl",
+                    movingTransaction.type === 'inflow' ? "text-emerald-700" : "text-red-700"
+                  )}>
+                    {movingTransaction.type === 'inflow' ? '+' : '-'}${movingTransaction.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 text-xs pt-1 border-t border-slate-200/60">
+                  <div>
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Category</span>
+                    <span className="font-bold text-slate-800">{movingTransaction.category}</span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Current Day</span>
+                    <span className="font-bold text-slate-800 font-mono">{moveSourceSession.date}</span>
+                  </div>
+                  {(() => {
+                    const payeeMatch = movingTransaction.notes?.match(/(?:Payee|Source):\s*([^|]+)/i);
+                    return payeeMatch ? (
+                      <div className="col-span-2">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Payee / Source</span>
+                        <span className="font-semibold text-slate-700">{payeeMatch[1].trim()}</span>
+                      </div>
+                    ) : null;
+                  })()}
+                  <div className="col-span-2">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Notes</span>
+                    <span className="font-medium text-slate-600">{movingTransaction.notes || 'No description'}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Target Session Selector */}
+              <div className="space-y-2">
+                <label className="block text-xs font-black uppercase tracking-wider text-slate-700">
+                  Target Cash Session (Destination Day)
+                </label>
+                {moveOtherSessions.length > 0 ? (
+                  <select
+                    value={moveTargetSessionId}
+                    onChange={(e) => setMoveTargetSessionId(e.target.value)}
+                    className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-800 outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500"
+                  >
+                    {moveOtherSessions.map(s => (
+                      <option key={s.id} value={s.id}>
+                        {s.date} — Status: {s.status.toUpperCase()} (Opening: ${s.openingCash.toFixed(2)}, Expected: ${s.expectedCash.toFixed(2)})
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="p-4 bg-slate-100 border border-slate-200 rounded-xl text-xs text-slate-600">
+                    No other cash sessions currently available.
+                  </div>
+                )}
+
+                {/* Note for no target session case pointing to Retroactive Session tool */}
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
+                  <p className="text-xs text-slate-500 flex items-center justify-between flex-wrap gap-2">
+                    <span>That day has no cash session. Create one first using Retroactive Session.</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMovingTransaction(null);
+                        setShowRetroactiveModal(true);
+                      }}
+                      className="text-xs font-bold text-amber-600 hover:text-amber-700 underline cursor-pointer shrink-0"
+                    >
+                      Open Retroactive Session
+                    </button>
+                  </p>
+                </div>
+              </div>
+
+              {/* Warnings Card */}
+              {moveTargetSession && (
+                <div className="p-4 bg-amber-50/90 border border-amber-200 rounded-2xl text-xs text-amber-950 space-y-2">
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div className="space-y-1.5">
+                      <p className="font-bold leading-relaxed">
+                        Moving this ${movingTransaction.amount.toFixed(2)} {movingTransaction.type} will remove it from {moveSourceSession.date}'s cash count and add it to {moveTargetSession.date}'s. Both days' expected cash and over/short will change accordingly. Recount both days if already reconciled.
+                      </p>
+                      {(moveTargetSession.status === 'closed' || moveTargetSession.status === 'provisional') && (
+                        <p className="font-black text-amber-900 pt-1.5 border-t border-amber-200">
+                          {moveTargetSession.date} is already finalized — its over/short will shift by ${movingTransaction.amount.toFixed(2)} until you recount it.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Dialog Actions */}
+            <div className="flex gap-3 pt-4 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setMovingTransaction(null)}
+                disabled={processingMove}
+                className="flex-1 px-6 py-3.5 border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-2xl font-black text-xs uppercase tracking-widest transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmMove}
+                disabled={!moveTargetSession || processingMove || moveOtherSessions.length === 0}
+                className="flex-[2] px-6 py-3.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg shadow-amber-600/10 flex items-center justify-center gap-2"
+              >
+                {processingMove ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Moving Transaction...</span>
+                  </>
+                ) : (
+                  <>
+                    <CalendarDays className="w-4 h-4" />
+                    <span>Confirm Move</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}

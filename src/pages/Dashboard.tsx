@@ -2,7 +2,8 @@ import { useState, useEffect, useMemo } from 'react';
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, query, where, limit, setDoc, orderBy, deleteDoc, getDocs } from 'firebase/firestore';
-import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, InventoryItem, UserProfile, DailySnapshot, PricingSnapshot, SystemConfig, ComplianceSubmission } from '../types';
+import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, InventoryItem, UserProfile, DailySnapshot, PricingSnapshot, SystemConfig, ComplianceSubmission, CashSession, AfterHoursNote } from '../types';
+import { getAfterHoursActivity } from '../lib/afterHoursDetection';
 import { 
   Plus, 
   Search, 
@@ -138,6 +139,16 @@ export default function Dashboard({ profile }: DashboardProps) {
   const [pricingSnapshots, setPricingSnapshots] = useState<PricingSnapshot[]>([]);
   const [complianceSubmissions, setComplianceSubmissions] = useState<ComplianceSubmission[]>([]);
   const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
+  const [cashSessions, setCashSessions] = useState<CashSession[]>([]);
+  const [afterHoursNotesMap, setAfterHoursNotesMap] = useState<Record<string, AfterHoursNote>>({});
+
+  const afterHoursDays = useMemo(() => {
+    return getAfterHoursActivity(buyTickets, cashSessions, afterHoursNotesMap);
+  }, [buyTickets, cashSessions, afterHoursNotesMap]);
+
+  const unnotedAfterHoursDays = useMemo(() => {
+    return afterHoursDays.filter(day => !day.hasNote);
+  }, [afterHoursDays]);
   const [chartMode, setChartMode] = useState<'financial' | 'volume'>('financial');
   const [loading, setLoading] = useState(true);
 
@@ -695,6 +706,26 @@ export default function Dashboard({ profile }: DashboardProps) {
       (error) => handleFirestoreError(error, OperationType.GET, 'system/config')
     );
 
+    const unsubCashSessions = onSnapshot(
+      collection(db, 'cashSessions'),
+      (snapshot) => {
+        setCashSessions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as CashSession[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'cashSessions')
+    );
+
+    const unsubAfterHoursNotes = onSnapshot(
+      collection(db, 'afterHoursNotes'),
+      (snapshot) => {
+        const map: Record<string, AfterHoursNote> = {};
+        snapshot.docs.forEach(doc => {
+          map[doc.id] = { id: doc.id, ...doc.data() } as unknown as AfterHoursNote;
+        });
+        setAfterHoursNotesMap(map);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'afterHoursNotes')
+    );
+
     return () => {
       try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
       try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
@@ -706,6 +737,8 @@ export default function Dashboard({ profile }: DashboardProps) {
       try { unsubDrafts(); } catch (e) { console.warn('unsubDrafts error', e); }
       try { unsubCompliance(); } catch (e) { console.warn('unsubCompliance error', e); }
       try { unsubSystemConfig(); } catch (e) { console.warn('unsubSystemConfig error', e); }
+      try { unsubCashSessions(); } catch (e) { console.warn('unsubCashSessions error', e); }
+      try { unsubAfterHoursNotes(); } catch (e) { console.warn('unsubAfterHoursNotes error', e); }
     };
   }, [profile]);
 
@@ -1717,8 +1750,33 @@ export default function Dashboard({ profile }: DashboardProps) {
       }
     }
 
+    // Card 5: After-Hours Ticket Activity (Informational Awareness)
+    if (unnotedAfterHoursDays.length > 0) {
+      const cardId = `after_hours_amber_${unnotedAfterHoursDays.map(d => d.date).sort().join('_')}`;
+      if (complianceDismissals[cardId] !== todayLocalDateString) {
+        const count = unnotedAfterHoursDays.length;
+        const firstDay = unnotedAfterHoursDays[0];
+        const title = count === 1
+          ? "1 day had tickets run without an open cash drawer — review."
+          : `${count} days had tickets run without an open cash drawer — review.`;
+        const description = count === 1
+          ? `${firstDay.date}: ${firstDay.ticketCount} ticket${firstDay.ticketCount === 1 ? '' : 's'}, $${firstDay.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}.`
+          : `${count} days with after-hours tickets need managerial acknowledgment or notes.`;
+
+        cards.push({
+          id: cardId,
+          severity: 'amber',
+          title,
+          description,
+          actionText: 'Review',
+          actionHref: `/cash-drawer?date=${firstDay.date}`,
+          canDismiss: true
+        });
+      }
+    }
+
     return cards;
-  }, [showCard1, yesterdaySubmissionState, isBeforeNoon, yesterdayCompletedTickets.length, countdownString, dnbDaysElapsed, systemConfig, incompleteCustomersWithTickets.length, complianceDismissals, complianceSnoozes, todayLocalDateString]);
+  }, [showCard1, yesterdaySubmissionState, isBeforeNoon, yesterdayCompletedTickets.length, countdownString, dnbDaysElapsed, systemConfig, incompleteCustomersWithTickets.length, unnotedAfterHoursDays, complianceDismissals, complianceSnoozes, todayLocalDateString]);
 
   if (loading) {
     return (

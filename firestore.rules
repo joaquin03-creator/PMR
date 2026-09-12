@@ -326,7 +326,7 @@ service cloud.firestore {
     function isValidCashSession(data) {
       return data.keys().hasAll(['date', 'status', 'openingCash', 'expectedCash', 'openedAt', 'openedBy']) &&
              data.date is string &&
-             data.status in ['open', 'closed'] &&
+             data.status in ['open', 'closed', 'provisional'] &&
              data.openingCash is number &&
              data.expectedCash is number &&
              (data.openedAt is string || data.openedAt is timestamp) &&
@@ -335,7 +335,13 @@ service cloud.firestore {
              (!('overShort' in data) || data.overShort is number) &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
              (!('closedAt' in data) || (data.closedAt is string || data.closedAt is timestamp)) &&
-             (!('closedBy' in data) || data.closedBy is string);
+             (!('closedBy' in data) || data.closedBy is string) &&
+             (!('provisionalClose' in data) || data.provisionalClose is bool) &&
+             (!('provisionalClosedAt' in data) || (data.provisionalClosedAt is string || data.provisionalClosedAt is timestamp)) &&
+             (!('provisionalClosedBy' in data) || data.provisionalClosedBy is string) &&
+             (!('provisionalAssumedCash' in data) || data.provisionalAssumedCash is number) &&
+             (!('provisionalFinalizedAt' in data) || (data.provisionalFinalizedAt is string || data.provisionalFinalizedAt is timestamp)) &&
+             (!('provisionalFinalizedBy' in data) || data.provisionalFinalizedBy is string);
     }
 
     function isValidCashTransaction(data) {
@@ -347,6 +353,15 @@ service cloud.firestore {
              (data.timestamp is string || data.timestamp is timestamp) &&
              data.performedBy is string &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000));
+    }
+
+    function isValidAfterHoursNote(data) {
+      return data.keys().hasAll(['date', 'note', 'createdBy', 'createdAt', 'updatedAt']) &&
+             data.date is string &&
+             data.note is string && data.note.size() <= 4000 &&
+             data.createdBy is string &&
+             (data.createdAt is string || data.createdAt is timestamp) &&
+             (data.updatedAt is string || data.updatedAt is timestamp);
     }
 
     function isValidTicketDraft(data) {
@@ -573,6 +588,13 @@ service cloud.firestore {
       allow read: if isStaff();
       allow create: if canManageCash() && isValidCashTransaction(request.resource.data);
       allow update: if canManageCash() && isValidCashTransaction(request.resource.data);
+      allow delete: if canDeleteData();
+    }
+
+    match /afterHoursNotes/{dateId} {
+      allow read: if isStaff();
+      allow create: if canManageCash() && isValidAfterHoursNote(request.resource.data);
+      allow update: if canManageCash() && isValidAfterHoursNote(request.resource.data);
       allow delete: if canDeleteData();
     }
 

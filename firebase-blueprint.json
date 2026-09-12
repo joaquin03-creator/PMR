@@ -169,7 +169,7 @@
       "type": "object",
       "properties": {
         "date": { "type": "string" },
-        "status": { "type": "string", "enum": ["open", "closed"] },
+        "status": { "type": "string", "enum": ["open", "closed", "provisional"] },
         "openingCash": { "type": "number" },
         "expectedCash": { "type": "number" },
         "actualCash": { "type": "number" },
@@ -178,7 +178,13 @@
         "openedBy": { "type": "string" },
         "closedAt": { "type": "string", "format": "date-time" },
         "closedBy": { "type": "string" },
-        "notes": { "type": "string" }
+        "notes": { "type": "string" },
+        "provisionalClose": { "type": "boolean" },
+        "provisionalClosedAt": { "type": "string", "format": "date-time" },
+        "provisionalClosedBy": { "type": "string" },
+        "provisionalAssumedCash": { "type": "number" },
+        "provisionalFinalizedAt": { "type": "string", "format": "date-time" },
+        "provisionalFinalizedBy": { "type": "string" }
       },
       "required": ["date", "status", "openingCash", "expectedCash", "openedAt", "openedBy"]
     },
@@ -398,6 +404,19 @@
         "ticketDetails": { "type": "object" }
       },
       "required": ["userId", "timestamp", "lastUpdated", "step", "type"]
+    },
+    "AfterHoursNote": {
+      "title": "After Hours Note",
+      "description": "Explanation and notes for tickets completed when no cash session existed.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "description": "YYYY-MM-DD date string matching the doc ID" },
+        "note": { "type": "string", "description": "Explanation of after-hours transactions" },
+        "createdBy": { "type": "string", "description": "Email or identifier of creator" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["date", "note", "createdBy", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -416,6 +435,7 @@
     "/userInvites/{inviteId}": { "schema": "UserInvite", "description": "Security tokens for inviting new users" },
     "/cashSessions/{sessionId}": { "schema": "CashSession", "description": "Daily cash reconciliation sessions" },
     "/cashTransactions/{transactionId}": { "schema": "CashTransaction", "description": "Manual cash transactions (bank runs, expenses)" },
+    "/afterHoursNotes/{dateId}": { "schema": "AfterHoursNote", "description": "Explanations for tickets processed on days without a cash session" },
     "/system/config": { "schema": "SystemConfig", "description": "Global system configuration document" },
     "/externalSales/{saleId}": { "schema": "ExternalSale", "description": "Manual external sales records for retroactive inventory tracking" },
     "/loadPlans/{loadId}": { "schema": "LoadPlan", "description": "Planned flatbed load blueprints" },

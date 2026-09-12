@@ -294,7 +294,7 @@ export interface DoNotBuyEntry {
 
 export interface AuditLog {
   id: string;
-  entityType: 'material' | 'customer' | 'buyTicket' | 'tripTicket' | 'invoice' | 'inventory' | 'settings' | 'cashDrawer' | 'cashTransaction' | 'externalSale' | 'loadPlan';
+  entityType: 'material' | 'customer' | 'buyTicket' | 'tripTicket' | 'invoice' | 'inventory' | 'settings' | 'cashDrawer' | 'cashTransaction' | 'externalSale' | 'loadPlan' | 'afterHoursNote';
   entityId: string;
   action: 'create' | 'update' | 'delete' | 'sync' | 'optimize' | 'void' | 'override' | 'adjustment' | 'open' | 'close';
   changes?: {
@@ -400,10 +400,10 @@ export interface SystemConfig {
 export interface CashSession {
   id: string;
   date: string; // YYYY-MM-DD
-  status: 'open' | 'closed';
+  status: 'open' | 'closed' | 'provisional';
   openingCash: number; // Combined Safe + Register
   expectedCash: number; // Calculated: Opening + Replenishments - Payouts - Expenses
-  actualCash?: number; // Physical count at end of day
+  actualCash?: number; // Physical count at end of day (or assumed expected cash for provisional)
   overShort?: number;
   openedAt: string;
   openedBy: string;
@@ -440,6 +440,12 @@ export interface CashSession {
   verifiedBy?: string;
   verifiedAt?: string;
   verificationComment?: string;
+  provisionalClose?: boolean;
+  provisionalClosedAt?: string;
+  provisionalClosedBy?: string;
+  provisionalAssumedCash?: number;
+  provisionalFinalizedAt?: string;
+  provisionalFinalizedBy?: string;
 }
 
 export interface CashTransaction {
@@ -477,3 +483,22 @@ export interface ProblemReport {
   resolvedAt?: string;
   resolvedBy?: string;
 }
+
+export interface AfterHoursDay {
+  date: string;              // YYYY-MM-DD (local)
+  ticketCount: number;
+  totalAmount: number;       // sum of those tickets' totalAmount, rounded via the locked roundMoney
+  ticketIds: string[];
+  hasNote: boolean;          // whether an after-hours note exists for this date
+  note?: string;
+  authorEmail?: string;
+}
+
+export interface AfterHoursNote {
+  date: string;              // YYYY-MM-DD (matches doc id)
+  note: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
