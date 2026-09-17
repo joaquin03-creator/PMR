@@ -106,3 +106,52 @@ If the original Firebase project is lost or you are deploying to a fresh project
 - **Point-in-Time Recovery (PITR)**: Enabled on the Firestore database instance, providing continuous backup with 7-day retention for instant sub-second rollback.
 - **Scheduled Automated Exports**: Daily automated exports of all Firestore collections are written to a Google Cloud Storage bucket (`gs://<project-id>-firestore-backups/`).
 - **Restoration**: Detailed recovery procedures for restoring Firestore snapshots from Cloud Storage can be found in the system administration cloud run playbooks.
+
+---
+
+## 6. Production Deployment (Cloud Run + Firebase Hosting)
+
+Until 2026-09-15 this app was only ever deployed via AI Studio's own managed pipeline (it auto-builds and pushes to a Cloud Run service, injecting `APP_URL`/`GEMINI_API_KEY` for you — see `.env.example`). This section documents the equivalent deploy path using the standard Firebase/Google Cloud CLIs, for deploying independently of AI Studio.
+
+**Architecture:** `server.ts` is one Express process that serves both the `/api/*` routes and the built frontend (`dist/`) — see its `NODE_ENV === 'production'` branch. It ships as a single container to **Cloud Run**. **Firebase Hosting** sits in front of it purely for TLS/custom-domain/CDN and rewrites all traffic (`source: "**"`) to that Cloud Run service — see `firebase.json`. Firestore/Storage security rules deploy through the same Firebase CLI call. None of this touches the AI Studio-managed service; `pmr-app` is a distinct Cloud Run service name, so the two deploy paths can't collide.
+
+### One-time setup (per machine you deploy from)
+
+```bash
+# 1. Install & authenticate the Google Cloud CLI
+#    https://cloud.google.com/sdk/docs/install
+gcloud auth login
+gcloud config set project gen-lang-client-0857392953
+
+# 2. Install & authenticate the Firebase CLI
+npm install -g firebase-tools
+firebase login
+```
+
+**Runtime secret:** `server.ts` requires `GEMINI_API_KEY` at runtime (AI/OCR endpoints). Cloud Run needs it set explicitly — AI Studio's auto-injection does not apply here. Recommended (Secret Manager, keeps the key out of shell history and deploy logs):
+
+```bash
+printf '%s' 'YOUR_GEMINI_KEY' | gcloud secrets create gemini-api-key --data-file=-
+# then add this flag to the deploy:backend command in package.json (one-time):
+#   --set-secrets=GEMINI_API_KEY=gemini-api-key:latest
+```
+
+Simpler but less secure alternative: append `--set-env-vars GEMINI_API_KEY=YOUR_GEMINI_KEY` to `deploy:backend` instead.
+
+### Ongoing deploy
+
+```bash
+npm run deploy
+```
+
+This runs, in order:
+1. `deploy:backend` — `gcloud run deploy pmr-app --source .` — builds the `Dockerfile` via Cloud Build and deploys/updates the Cloud Run service (creates it on first run; prints its own `*.run.app` URL, which you generally don't need to visit directly once Hosting is wired up).
+2. `deploy:hosting` — `firebase deploy --only hosting,firestore:rules,storage` — publishes the Hosting rewrite config (pointing at the Cloud Run service above) plus the current `firestore.rules`/`storage.rules`.
+
+Run them separately (`npm run deploy:backend`, `npm run deploy:hosting`) if you only need one half.
+
+### Verify after deploying
+
+- Open the Firebase Hosting URL (`https://gen-lang-client-0857392953.web.app` or your mapped custom domain) and confirm login works.
+- Complete one real Quick Ticket end-to-end (a cheap smoke test that exercises Firestore, Storage, and the OCR/AI endpoints together).
+- Check Cloud Run logs (`gcloud run services logs read pmr-app --region us-central1`) if anything looks wrong.

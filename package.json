@@ -9,7 +9,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "deploy:backend": "gcloud run deploy pmr-app --source . --region us-central1 --allow-unauthenticated --project gen-lang-client-0857392953",
+    "deploy:hosting": "firebase deploy --only hosting,firestore:rules,storage --project gen-lang-client-0857392953",
+    "deploy": "npm run deploy:backend && npm run deploy:hosting"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

@@ -1,0 +1,22 @@
+{
+  "hosting": {
+    "public": "dist",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [
+      {
+        "source": "**",
+        "run": {
+          "serviceId": "pmr-app",
+          "region": "us-central1"
+        }
+      }
+    ]
+  },
+  "firestore": {
+    "database": "ai-studio-661b304a-fc5e-4d72-a81e-fdbacdf1964c",
+    "rules": "firestore.rules"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  }
+}
