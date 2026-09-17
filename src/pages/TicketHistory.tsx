@@ -49,6 +49,7 @@ import {
 logAuditEvent } from '../lib/audit';
 import {
 isTonMaterial, formatUnitPrice, formatRateBreakdown } from '../lib/scrapPricing';
+import CustomerMaterialSearchPanel from '../components/CustomerMaterialSearchPanel';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
@@ -79,6 +80,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
   });
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
+  const [viewMode, setViewMode] = useState<'tickets' | 'customerSearch'>('tickets');
   const [dateFilter, setDateFilter] = useState<'all' | 'today'>(() => {
     const filter = searchParams.get('filter') || searchParams.get('date');
     if (filter === 'today' || filter === new Date().toLocaleDateString('en-CA')) {
@@ -457,15 +459,51 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
           <h1 className="text-4xl font-black text-slate-900 tracking-tight font-display">Ticket History</h1>
           <p className="text-slate-500 font-medium mt-1">Recall, reference, and re-print previous buy tickets.</p>
         </div>
-        <button 
-          onClick={exportToCSV}
-          className="flex items-center gap-2 px-6 py-3 bg-white border border-slate-200 rounded-2xl text-xs font-black uppercase tracking-widest text-slate-700 hover:bg-slate-50 transition-all shadow-sm active:scale-95 outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-        >
-          <Download className="w-5 h-5" />
-          Export Audit CSV
-        </button>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 bg-slate-100 p-1.5 rounded-2xl">
+            <button
+              onClick={() => setViewMode('tickets')}
+              className={cn(
+                "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all",
+                viewMode === 'tickets' ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-900"
+              )}
+            >
+              Tickets
+            </button>
+            <button
+              onClick={() => setViewMode('customerSearch')}
+              className={cn(
+                "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all",
+                viewMode === 'customerSearch' ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-900"
+              )}
+            >
+              Customer Search
+            </button>
+          </div>
+          {viewMode === 'tickets' && (
+            <button
+              onClick={exportToCSV}
+              className="flex items-center gap-2 px-6 py-3 bg-white border border-slate-200 rounded-2xl text-xs font-black uppercase tracking-widest text-slate-700 hover:bg-slate-50 transition-all shadow-sm active:scale-95 outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+            >
+              <Download className="w-5 h-5" />
+              Export Audit CSV
+            </button>
+          )}
+        </div>
       </header>
 
+      {viewMode === 'customerSearch' ? (
+        <CustomerMaterialSearchPanel
+          buyTickets={buyTickets}
+          customers={customers}
+          materials={materials}
+          onViewCustomerTickets={(name) => {
+            setSearchTerm(name);
+            setViewMode('tickets');
+          }}
+        />
+      ) : (
+        <>
       {/* Search and Filter Bar */}
       <div className="flex flex-col md:flex-row items-stretch md:items-center gap-4">
         <div className="relative group flex-1">
@@ -695,6 +733,8 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
           </table>
         </div>
       </section>
+        </>
+      )}
 
       {/* Ticket Details Modal */}
       {selectedTicket && !showPrintPreview && (
