@@ -78,6 +78,19 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Release the camera if this component unmounts while streaming (e.g. the
+  // user navigates to another wizard step without pressing Capture/Cancel).
+  // Without this, the orphaned stream keeps the device locked and the next
+  // capture attempt (often a different photo box) silently fails.
+  React.useEffect(() => {
+    return () => {
+      if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
+
   // Get list of available cameras based on brand
   const getAvailableNetworkCams = () => {
     if (settings.cameraBrand === 'reolink') {
@@ -224,15 +237,23 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         await videoRef.current.play();
       }
     } catch (err) {
+      setIsStreaming(false);
+
       if (err instanceof Error && (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError')) {
+        // No camera hardware at all on this machine — nothing the user can fix, keep the quiet fallback.
         console.warn("No camera device found, using placeholder photo.");
+        onCapture(PHOTO_PLACEHOLDER_URL);
+        setCapturedPhoto(PHOTO_PLACEHOLDER_URL);
+      } else if (err instanceof Error && (err.name === 'NotReadableError' || err.name === 'TrackStartError')) {
+        console.error("Camera error:", err);
+        alert("Camera is unavailable — it's likely still open in another photo box or browser tab on this page.\n\nClose or cancel any other open camera preview (or reload the page), then try again.");
+      } else if (err instanceof Error && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
+        console.error("Camera error:", err);
+        alert("Camera permission was denied. Click the camera icon in the browser's address bar, allow camera access for this site, then try again.");
       } else {
         console.error("Camera error:", err);
+        alert(`Could not start the camera: ${err instanceof Error ? err.message : 'Unknown error'}.`);
       }
-      setIsStreaming(false);
-      // Fallback
-      onCapture(PHOTO_PLACEHOLDER_URL);
-      setCapturedPhoto(PHOTO_PLACEHOLDER_URL);
     }
   };
 
