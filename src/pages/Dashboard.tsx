@@ -4,6 +4,7 @@ import { auth, db } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, query, where, limit, setDoc, orderBy, deleteDoc, getDocs } from 'firebase/firestore';
 import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, InventoryItem, UserProfile, DailySnapshot, PricingSnapshot, SystemConfig, ComplianceSubmission, CashSession, AfterHoursNote } from '../types';
 import { getAfterHoursActivity } from '../lib/afterHoursDetection';
+import { checkTicketOhioReadiness } from '../lib/ohioSchemaLock';
 import { 
   Plus, 
   Search, 
@@ -1775,8 +1776,37 @@ export default function Dashboard({ profile }: DashboardProps) {
       }
     }
 
+    // Card 6: Ohio Filing Data Readiness (soft, non-blocking — informational only,
+    // surfaced after the ticket is already committed; never gates ticket completion).
+    const ticketsNeedingReview = todayTickets
+      .map(ticket => ({
+        ticket,
+        warnings: checkTicketOhioReadiness(ticket, customers.find(c => c.id === ticket.customerId))
+      }))
+      .filter(entry => entry.warnings.length > 0);
+
+    if (ticketsNeedingReview.length > 0) {
+      const cardId = 'ohio_readiness_amber';
+      if (complianceDismissals[cardId] !== todayLocalDateString) {
+        const count = ticketsNeedingReview.length;
+        const description = count === 1
+          ? `Ticket ${ticketsNeedingReview[0].ticket.id}: ${ticketsNeedingReview[0].warnings[0]}`
+          : `${count} of today's tickets have data that may cause issues in the Ohio report (missing address, oversized plate, etc.).`;
+
+        cards.push({
+          id: cardId,
+          severity: 'amber',
+          title: count === 1 ? '1 Ticket Needs Data Review' : `${count} Tickets Need Data Review`,
+          description,
+          actionText: 'Review Tickets',
+          actionHref: '/buy-tickets',
+          canDismiss: true
+        });
+      }
+    }
+
     return cards;
-  }, [showCard1, yesterdaySubmissionState, isBeforeNoon, yesterdayCompletedTickets.length, countdownString, dnbDaysElapsed, systemConfig, incompleteCustomersWithTickets.length, unnotedAfterHoursDays, complianceDismissals, complianceSnoozes, todayLocalDateString]);
+  }, [showCard1, yesterdaySubmissionState, isBeforeNoon, yesterdayCompletedTickets.length, countdownString, dnbDaysElapsed, systemConfig, incompleteCustomersWithTickets.length, unnotedAfterHoursDays, todayTickets, customers, complianceDismissals, complianceSnoozes, todayLocalDateString]);
 
   if (loading) {
     return (
