@@ -201,7 +201,7 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
               const totalVal = values[denom.key] || 0;
               return (
                 <div key={denom.key} className="flex items-center justify-between p-2.5 bg-slate-50/60 rounded-2xl border border-slate-100 shadow-sm hover:border-slate-200 transition-all">
-                  <span className="text-xs font-bold text-slate-700 truncate w-32 shrink-0 pr-1">{denom.label}</span>
+                  <span className="text-xs font-bold text-slate-700 truncate min-w-0 flex-1 pr-1">{denom.label}</span>
                   <div className="flex items-center gap-1.5 shrink-0 flex-nowrap">
                     <button
                       type="button"
@@ -257,7 +257,7 @@ function DenominationEditor({ values, onChange }: DenominationEditorProps) {
               const totalVal = values[denom.key] || 0;
               return (
                 <div key={denom.key} className="flex items-center justify-between p-2.5 bg-slate-50/60 rounded-2xl border border-slate-100 shadow-sm hover:border-slate-200 transition-all">
-                  <span className="text-xs font-bold text-slate-700 truncate w-32 shrink-0 pr-1">{denom.label}</span>
+                  <span className="text-xs font-bold text-slate-700 truncate min-w-0 flex-1 pr-1">{denom.label}</span>
                   <div className="flex items-center gap-1.5 shrink-0 flex-nowrap">
                     <button
                       type="button"
@@ -5356,11 +5356,13 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
                               <p className="text-xs text-slate-700 font-medium leading-relaxed mb-2">{log.notes}</p>
 
-                              {/* Changes Breakdown */}
+                              {/* Changes Breakdown — collapsed by default; full diff stays in the DOM/storage, only the default display is compact */}
                               {log.changes && (log.changes.before || log.changes.after) && (
-                                <div className="mt-3 bg-white border border-slate-200/50 rounded-xl p-3 text-[10px] space-y-2">
-                                  <span className="font-black text-[9px] text-slate-400 uppercase tracking-wider block border-b border-slate-100 pb-1">Modified Parameters</span>
-                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px] font-mono">
+                                <details className="mt-3 bg-white border border-slate-200/50 rounded-xl p-3 text-[10px]">
+                                  <summary className="font-black text-[9px] text-slate-400 uppercase tracking-wider cursor-pointer select-none">
+                                    Modified Parameters — click to view full detail
+                                  </summary>
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px] font-mono mt-2 pt-2 border-t border-slate-100">
                                     {log.changes.before && Object.keys(log.changes.before).length > 0 && (
                                       <div className="bg-rose-50/50 p-2 rounded-lg border border-rose-100 text-rose-800">
                                         <span className="font-bold uppercase text-[8px] text-rose-500 block mb-1">Previous Values</span>
@@ -5378,7 +5380,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                       </div>
                                     )}
                                   </div>
-                                </div>
+                                </details>
                               )}
                             </div>
                           </div>
