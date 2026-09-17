@@ -17,6 +17,7 @@ import Customers from './pages/Customers';
 import TicketHistory from './pages/TicketHistory';
 import CashDrawer from './pages/CashDrawer';
 import Settings from './pages/Settings';
+import MobileDashboard from './pages/MobileDashboard';
 
 import { handleFirestoreError, OperationType } from './lib/firestore-errors';
 import { UserSession } from './types';
@@ -807,6 +808,14 @@ export default function App() {
 
             <Routes>
               <Route path="/login" element={!user ? <Login /> : <Navigate to="/" />} />
+
+              {/* Standalone, phone-first read-only snapshot. Deliberately OUTSIDE
+                  <Layout> -- no sidebar/nav chrome -- so it can never affect the
+                  desktop UI. Manager-only, same auth session as the main app. */}
+              <Route element={<ProtectedRoute profile={profile} allowedRoles={['manager']} />}>
+                <Route path="today" element={user ? <MobileDashboard profile={profile} /> : <Navigate to="/login" />} />
+              </Route>
+
               <Route
                 path="/"
                 element={user ? <Layout user={user} profile={profile} /> : <Navigate to="/login" />}
