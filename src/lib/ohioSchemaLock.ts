@@ -106,6 +106,21 @@ export function runOhioXmlSelfTest(xml: string, expectedTxnCount: number): strin
       }
     }
 
+    // facilityRegNumber must never be empty -- Ohio rejects the ENTIRE file
+    // (error 104) if it's missing, for every transaction in it.
+    const facilityRegNumber = getVal('facilityRegNumber');
+    if (!facilityRegNumber || facilityRegNumber.trim() === '') {
+      violations.push(`${label}: facilityRegNumber is empty (Ohio error 104).`);
+    } else if (facilityRegNumber.includes('@')) {
+      // Real-incident guard (2026-09-20): an email address ended up in this
+      // field via a Settings input with no autofill protection, and was
+      // submitted to Ohio's portal, rejected with error 104 for every
+      // transaction. A real registration number never contains "@".
+      violations.push(
+        `${label}: facilityRegNumber "${facilityRegNumber}" looks like an email address, not a registration number (Ohio error 104). Check Settings -> Ohio Scrap Dealer ID.`
+      );
+    }
+
     // Pair-format fields.
     const weightPairs = getVal('weightOfBulkContainers');
     if (weightPairs !== null && weightPairs !== '' && !PAIR_FORMAT_REGEX.test(weightPairs)) {

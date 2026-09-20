@@ -86,7 +86,12 @@ const defaultSettings: AppSettings = {
     { id: 'cam4', name: 'Yard Cam (Ch 4)', channel: 3, isEnabled: true },
   ],
   ohioScrapPortalUrl: 'https://services.dps.ohio.gov/ScrapDealer/DoNotBuyList',
-  ohioScrapDealerId: '',
+  // Real, confirmed Ohio DPS registration number (2026-09-20). This is
+  // localStorage-backed and per-browser-origin -- a new deployment domain
+  // that's never had Settings touched starts from this default instead of
+  // blank, which is what caused the 2026-09-17/18 error 104 incidents.
+  // Still fully overridable in Settings if it's ever reissued.
+  ohioScrapDealerId: 'SMBC-2025-0000710',
   dailySpendTarget: 5000,
   dailyCustomerTarget: 30,
 };

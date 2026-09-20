@@ -2304,11 +2304,17 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
               <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Scrap Dealer Registration ID</label>
               <input
                 type="text"
+                autoComplete="off"
                 className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-xs font-bold"
                 placeholder="e.g. SMD-OH-2026-89421"
                 value={settings.ohioScrapDealerId || ''}
                 onChange={(e) => updateSettings({ ohioScrapDealerId: e.target.value })}
               />
+              {settings.ohioScrapDealerId?.includes('@') && (
+                <p className="text-[10px] text-red-600 font-bold uppercase tracking-wider">
+                  This looks like an email address, not a registration number -- Ohio will reject reports with this value (error 104).
+                </p>
+              )}
             </div>
           </div>
         </div>
