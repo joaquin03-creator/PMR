@@ -111,6 +111,19 @@ export const calculateOverShort = (actualCash: number, expectedCash: number): nu
   return roundMoney(actualCash - expectedCash);
 };
 
+/**
+ * Whether a buy ticket's totalAmount counts as a cash payout from the
+ * drawer, for purposes of `totalPayouts` in calculateExpectedCash.
+ * Historically ALL completed tickets were cash-only (see AGENTS.md §2), so
+ * a ticket with no paymentMethod set is treated as cash for backward
+ * compatibility with every pre-existing ticket. Only a ticket EXPLICITLY
+ * marked as paid by another method (check/eft/other) is excluded -- a
+ * ticket paid by check or bank transfer never left the physical drawer.
+ */
+export const isCashPayoutTicket = (paymentMethod?: string | null): boolean => {
+  return !paymentMethod || paymentMethod === 'cash';
+};
+
 export interface CashLogicSelfTestSession {
   openingCash: number;
   expectedCash: number;

@@ -50,6 +50,7 @@ logAuditEvent } from '../lib/audit';
 import {
 isTonMaterial, formatUnitPrice, formatRateBreakdown } from '../lib/scrapPricing';
 import CustomerMaterialSearchPanel from '../components/CustomerMaterialSearchPanel';
+import { updateTicketPaymentMethod } from '../lib/ticketPaymentMethod';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
@@ -70,7 +71,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
   }, [settings.receiptFormat, showPrintPreview]);
 
   const [autoPrint, setAutoPrint] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<{ type: 'void' | 'delete', ticket: BuyTicket } | null>(null);
+  const [confirmAction, setConfirmAction] = useState<{ type: 'void' | 'delete' | 'paymentMethod', ticket: BuyTicket, newPaymentMethod?: 'cash' | 'check' | 'eft' | 'other' } | null>(null);
   const [notification, setNotification] = useState<{ type: 'success' | 'error', message: string } | null>(null);
   const [showPinModal, setShowPinModal] = useState(false);
   const [pendingAction, setPendingAction] = useState<{ type: 'void' | 'delete', ticket: BuyTicket } | null>(null);
@@ -324,6 +325,28 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     }
   };
 
+  const handleUpdatePaymentMethod = async (ticket: BuyTicket, newMethod: 'cash' | 'check' | 'eft' | 'other') => {
+    if (!profile || profile.role !== 'manager') return;
+    if ((ticket.paymentMethod || 'cash') === newMethod) {
+      setConfirmAction(null);
+      return;
+    }
+
+    setProcessing(true);
+    try {
+      await updateTicketPaymentMethod(ticket, newMethod);
+      setSelectedTicket(prev => (prev && prev.id === ticket.id ? { ...prev, paymentMethod: newMethod } : prev));
+      setConfirmAction(null);
+      setNotification({ type: 'success', message: `Payment method updated. That day's cash drawer expected total will reflect this on next view.` });
+    } catch (error) {
+      console.error('Error updating payment method:', error);
+      setNotification({ type: 'error', message: 'Failed to update payment method. Please check permissions.' });
+      handleFirestoreError(error, OperationType.UPDATE, 'buyTickets');
+    } finally {
+      setProcessing(false);
+    }
+  };
+
   const exportToCSV = () => {
     const headers = [
       'Ticket ID',
@@ -411,18 +434,28 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
           <div className="bg-white rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl p-8 space-y-6 animate-in zoom-in-95 duration-200">
             <div className={cn(
               "w-16 h-16 rounded-3xl flex items-center justify-center mx-auto",
-              confirmAction.type === 'void' ? "bg-amber-100 text-amber-600" : "bg-red-100 text-red-600"
+              confirmAction.type === 'void' ? "bg-amber-100 text-amber-600" :
+              confirmAction.type === 'paymentMethod' ? "bg-blue-100 text-blue-600" :
+              "bg-red-100 text-red-600"
             )}>
-              {confirmAction.type === 'void' ? <Ban className="w-8 h-8" /> : <Trash2 className="w-8 h-8" />}
+              {confirmAction.type === 'void' ? <Ban className="w-8 h-8" /> :
+               confirmAction.type === 'paymentMethod' ? <Edit2 className="w-8 h-8" /> :
+               <Trash2 className="w-8 h-8" />}
             </div>
-            
+
             <div className="text-center space-y-2">
               <h3 className="text-2xl font-black text-slate-900 font-display uppercase tracking-tight">
-                {confirmAction.type === 'void' ? 'Void Ticket?' : 'Delete Ticket?'}
+                {confirmAction.type === 'void' ? 'Void Ticket?' :
+                 confirmAction.type === 'paymentMethod' ? 'Change Payment Method?' :
+                 'Delete Ticket?'}
               </h3>
               <p className="text-sm text-slate-500 font-medium leading-relaxed px-4">
-                {confirmAction.type === 'void' 
-                  ? 'This will reverse inventory intake but keep a historical record. This action is permanent.' 
+                {confirmAction.type === 'void'
+                  ? 'This will reverse inventory intake but keep a historical record. This action is permanent.'
+                  : confirmAction.type === 'paymentMethod'
+                  ? (confirmAction.newPaymentMethod === 'cash'
+                      ? `This ticket's $${confirmAction.ticket.totalAmount.toFixed(2)} total will count toward its day's expected cash again.`
+                      : `This ticket's $${confirmAction.ticket.totalAmount.toFixed(2)} total will be excluded from its day's expected cash, since it wasn't paid out of the drawer.`)
                   : 'CRITICAL: This will reverse inventory AND permanently remove the record. This cannot be undone.'}
               </p>
             </div>
@@ -432,15 +465,21 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                 disabled={processing}
                 onClick={() => {
                   if (confirmAction.type === 'void') handleVoidTicket(confirmAction.ticket);
+                  else if (confirmAction.type === 'paymentMethod' && confirmAction.newPaymentMethod) handleUpdatePaymentMethod(confirmAction.ticket, confirmAction.newPaymentMethod);
                   else handleDeleteTicket(confirmAction.ticket);
                 }}
                 className={cn(
                   "w-full py-4 rounded-2xl font-black uppercase tracking-widest text-sm transition-all active:scale-95 flex items-center justify-center gap-2",
-                  confirmAction.type === 'void' ? "bg-amber-600 text-white hover:bg-amber-700" : "bg-red-600 text-white hover:bg-red-700",
+                  confirmAction.type === 'void' ? "bg-amber-600 text-white hover:bg-amber-700" :
+                  confirmAction.type === 'paymentMethod' ? "bg-blue-600 text-white hover:bg-blue-700" :
+                  "bg-red-600 text-white hover:bg-red-700",
                   processing && "opacity-50 cursor-not-allowed"
                 )}
               >
-                {processing ? <Loader2 className="w-5 h-5 animate-spin" /> : (confirmAction.type === 'void' ? 'Void Ticket' : 'Delete Permanently')}
+                {processing ? <Loader2 className="w-5 h-5 animate-spin" /> :
+                 confirmAction.type === 'void' ? 'Void Ticket' :
+                 confirmAction.type === 'paymentMethod' ? 'Confirm Change' :
+                 'Delete Permanently'}
               </button>
               <button
                 disabled={processing}
@@ -830,7 +869,26 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                 </div>
                 <div className="space-y-1 text-right">
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Payment Method</p>
-                  <p className="text-sm font-bold text-slate-900 capitalize">{selectedTicket.paymentMethod || 'N/A'}</p>
+                  {profile?.role === 'manager' && selectedTicket.status !== 'voided' && selectedTicket.status !== 'cancelled' ? (
+                    <select
+                      value={selectedTicket.paymentMethod || 'cash'}
+                      onChange={(e) => {
+                        const newMethod = e.target.value as 'cash' | 'check' | 'eft' | 'other';
+                        setConfirmAction({ type: 'paymentMethod', ticket: selectedTicket, newPaymentMethod: newMethod });
+                      }}
+                      className="text-sm font-bold text-slate-900 capitalize bg-white border border-slate-200 rounded-lg px-2 py-1.5 outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="cash">Cash</option>
+                      <option value="check">Check</option>
+                      <option value="eft">EFT / Transfer</option>
+                      <option value="other">Other</option>
+                    </select>
+                  ) : (
+                    <p className="text-sm font-bold text-slate-900 capitalize">{selectedTicket.paymentMethod || 'Cash'}</p>
+                  )}
+                  {selectedTicket.paymentMethod && selectedTicket.paymentMethod !== 'cash' && (
+                    <p className="text-[9px] text-amber-600 font-bold uppercase tracking-wider">Excluded from cash drawer total</p>
+                  )}
                 </div>
               </div>
 

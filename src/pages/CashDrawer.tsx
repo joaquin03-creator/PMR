@@ -58,11 +58,13 @@ import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import { useToast } from '../context/ToastContext';
 import { safeSetItem, clearSessionDrafts, pruneDraftStorage } from '../lib/safeStorage';
-import { 
-  calculateExpectedCash, 
-  calculateOverShort, 
-  runCashLogicSelfTest 
+import {
+  calculateExpectedCash,
+  calculateOverShort,
+  runCashLogicSelfTest,
+  isCashPayoutTicket
 } from '../lib/cashLogicLock';
+import { TicketPayoutExpander } from '../components/TicketPayoutExpander';
 
 interface CashDrawerProps {
   profile: UserProfile | null;
@@ -966,6 +968,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     const items: {
       id?: string;
       isTicketPayoutLine?: boolean;
+      payoutTickets?: BuyTicket[];
       cashIn: number | null;
       cashOut: number | null;
       description: string;
@@ -998,18 +1001,20 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     });
 
     // Add buy ticket cash payouts (aggregated into one total line item)
-    if (buyTickets.length > 0) {
-      const totalTicketsAmount = buyTickets.reduce((sum, t) => sum + t.totalAmount, 0);
-      const latestTimestamp = buyTickets.reduce((latest, t) => {
+    const cashPayoutTickets = buyTickets.filter(t => isCashPayoutTicket(t.paymentMethod));
+    if (cashPayoutTickets.length > 0) {
+      const totalTicketsAmount = cashPayoutTickets.reduce((sum, t) => sum + t.totalAmount, 0);
+      const latestTimestamp = cashPayoutTickets.reduce((latest, t) => {
         if (!latest) return t.timestamp;
         return new Date(t.timestamp).getTime() > new Date(latest).getTime() ? t.timestamp : latest;
-      }, buyTickets[0]?.timestamp || '');
+      }, cashPayoutTickets[0]?.timestamp || '');
 
       items.push({
         isTicketPayoutLine: true,
+        payoutTickets: cashPayoutTickets,
         cashIn: null,
         cashOut: totalTicketsAmount,
-        description: `Material Purchases (${buyTickets.length} Ticket${buyTickets.length === 1 ? '' : 's'})`,
+        description: `Material Purchases (${cashPayoutTickets.length} Ticket${cashPayoutTickets.length === 1 ? '' : 's'})`,
         initials: 'SYS',
         timestamp: latestTimestamp
       });
@@ -1479,10 +1484,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       if (!sessionDates.has(date) && date !== todayStr) {
         const dayTickets = recentTickets.filter(t => getTicketLocalDate(t.timestamp) === date && t.status !== 'voided' && t.status !== 'cancelled');
         if (dayTickets.length > 0) {
+          const dayCashTickets = dayTickets.filter(t => isCashPayoutTicket(t.paymentMethod));
           missing.push({
             date,
             ticketCount: dayTickets.length,
-            totalPayout: Math.round(dayTickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100) / 100
+            totalPayout: Math.round(dayCashTickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100) / 100
           });
         }
       }
@@ -1615,7 +1621,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   }, [buyTickets, materials]);
 
   const totalPayouts = useMemo(() => {
-    const val = buyTickets.reduce((sum, t) => sum + t.totalAmount, 0);
+    const val = buyTickets.filter(t => isCashPayoutTicket(t.paymentMethod)).reduce((sum, t) => sum + t.totalAmount, 0);
     return Math.round(val * 100) / 100;
   }, [buyTickets]);
 
@@ -1746,7 +1752,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         const dayTickets = ticketsSnap.docs
           .map(d => d.data() as BuyTicket)
           .filter(t => t.status !== 'voided' && t.status !== 'cancelled');
-        const ticketPayouts = Math.round(dayTickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100) / 100;
+        const ticketPayouts = Math.round(dayTickets.filter(t => isCashPayoutTicket(t.paymentMethod)).reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100) / 100;
         const ticketCount = dayTickets.length;
 
         // Query cashTransactions for this session
@@ -2088,7 +2094,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
         const dayTickets = ticketsSnap.docs.map(d => d.data() as BuyTicket)
           .filter(t => t.status !== 'voided' && t.status !== 'cancelled');
-        const dayPayouts = dayTickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0);
+        const dayPayouts = dayTickets.filter(t => isCashPayoutTicket(t.paymentMethod)).reduce((sum, t) => sum + (t.totalAmount || 0), 0);
         expectedCash = Math.round((openingCash + initialBankRunAmount - dayPayouts) * 100) / 100;
       }
 
@@ -2784,7 +2790,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           .map(d => d.data() as BuyTicket)
           .filter(t => t.status !== 'voided' && t.status !== 'cancelled');
         const totalPayouts = Math.round(
-          tickets.reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100
+          tickets.filter(t => isCashPayoutTicket(t.paymentMethod)).reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100
         ) / 100;
 
         // Calculate expectedCash using locked calculateExpectedCash formula
@@ -4746,6 +4752,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                             day={currentAfterHoursDay}
                                             isManager={profile?.role === 'manager'}
                                             currentUserEmail={profile?.email || auth.currentUser?.email || undefined}
+                                          />
+                                        )}
+                                        {item.isTicketPayoutLine && item.payoutTickets && (
+                                          <TicketPayoutExpander
+                                            tickets={item.payoutTickets}
+                                            profile={profile}
                                           />
                                         )}
                                       </div>
