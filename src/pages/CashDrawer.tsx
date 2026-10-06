@@ -384,6 +384,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [transactions, setTransactions] = useState<CashTransaction[]>([]);
   const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
+  // Which session / date the `transactions` and `buyTickets` currently on screen were loaded
+  // for. Right after switching days they still hold the PREVIOUS day's rows; nothing may be
+  // written to a session from on-screen totals until both match the selected session.
+  const [txLoadedForSessionId, setTxLoadedForSessionId] = useState<string | null>(null);
+  const [ticketsLoadedForDate, setTicketsLoadedForDate] = useState<string | null>(null);
+  const sessionTotalsReady = !!selectedSession
+    && txLoadedForSessionId === selectedSession.id
+    && ticketsLoadedForDate === selectedSession.date;
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   
@@ -497,11 +505,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     const absoluteNewest = priorSessions[0];
 
     // If the absolute newest session prior to today was left open but has physical manual count entered, use it!
-    if (absoluteNewest && absoluteNewest.status !== 'closed' && (absoluteNewest.closingDenominations || absoluteNewest.actualCash)) {
+    // (An all-zero auto-saved count is not a count -- it would prefill today's opening as $0.00.)
+    if (absoluteNewest && absoluteNewest.status === 'provisional') {
+      return absoluteNewest;
+    }
+    if (absoluteNewest && absoluteNewest.status === 'open' && (absoluteNewest.actualCash || 0) > 0) {
       return absoluteNewest;
     }
 
     return lastClosedOrProvisional || absoluteNewest || null;
+  }, [history, todayStr]);
+
+  // Earlier days still left open. Informational only -- never blocks opening today.
+  const priorOpenSessions = useMemo(() => {
+    return history
+      .filter(s => s.date && s.date < todayStr && s.status === 'open')
+      .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
   }, [history, todayStr]);
 
   // Outstanding provisional sessions needing physical count
@@ -582,6 +601,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const autoSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isInitialLoadRef = useRef(true);
   const prevSessionIdRef = useRef<string | null>(null);
+  // What Firestore held for the selected session when its values were loaded into the
+  // editable state (or last saved from this station). Auto-save compares against this so it
+  // only writes fields that were actually edited HERE -- never a whole field set from state
+  // that may be stale relative to another station.
+  const serverBaselineRef = useRef<{ sessionId: string; count: string; openingCash: number; openingDenoms: string } | null>(null);
+  const selectedSessionRef = useRef<CashSession | null>(null);
+  selectedSessionRef.current = selectedSession;
+  const liveTotalsRef = useRef({ replenishments: 0, payouts: 0, expenses: 0 });
 
   // States for Verification Form in Audit
   const [verificationComment, setVerificationComment] = useState('');
@@ -673,7 +700,15 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           setPhysicalCountDenoms(initialDenominations);
         }
       }
+
+      serverBaselineRef.current = {
+        sessionId: selectedSession.id,
+        count: JSON.stringify(targetClosing ? ensureDenomTotals(targetClosing) : initialDenominations),
+        openingCash: selectedSession.openingCash || 0,
+        openingDenoms: JSON.stringify(selectedSession.openingDenominations ? ensureDenomTotals(selectedSession.openingDenominations) : initialDenominations)
+      };
     } else {
+      serverBaselineRef.current = null;
       setEditedOpeningCash(0);
       setEditedOpeningDenoms(initialDenominations);
       setPhysicalCountDenoms(initialDenominations);
@@ -709,12 +744,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       return;
     }
 
-    const isTodayOpen = activeSession?.status === 'open' && selectedSession.id === activeSession.id;
-    const isManager = profile.role === 'manager';
     // STRICT SAFETY FIX: NEVER auto-save to Firestore for closed sessions!
     // Auto-save must ONLY run if the selected session is currently OPEN.
     if (!selectedSession || !profile || selectedSession.status !== 'open') return;
 
+    // Never compute expected/over-short from another day's tickets/transactions.
+    if (!sessionTotalsReady) return;
+
+    // Only write what was edited on THIS station since the values were loaded/saved.
+    const baseline = serverBaselineRef.current;
+    if (!baseline || baseline.sessionId !== selectedSession.id) return;
+    const countDirty = JSON.stringify(physicalCountDenoms) !== baseline.count;
+    const openingCashDirty = Math.abs(editedOpeningCash - baseline.openingCash) > 0.001;
+    const openingDenomsDirty = JSON.stringify(editedOpeningDenoms) !== baseline.openingDenoms;
+    if (!countDirty && !openingCashDirty && !openingDenomsDirty) return;
+
+    const sessionId = selectedSession.id;
     setAutoSaveStatus('saving');
 
     if (autoSaveTimeoutRef.current) {
@@ -722,80 +767,86 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
 
     autoSaveTimeoutRef.current = setTimeout(async () => {
-      const openingCash = Math.round(editedOpeningCash * 100) / 100;
-      const expectedCashVal = Math.round((openingCash + totalReplenishments - totalPayouts - totalExpenses) * 100) / 100;
-      const actualCash = Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
-      const overShort = Math.round((actualCash - expectedCashVal) * 100) / 100;
-
-      const oldOpeningCash = selectedSession.openingCash;
-      const oldActualCash = selectedSession.actualCash;
-      const oldOpeningDenoms = selectedSession.openingDenominations;
-      const oldClosingDenoms = selectedSession.closingDenominations;
-
-      // Check if anything actually changed
-      const openingCashChanged = Math.abs(oldOpeningCash - openingCash) > 0.001;
-      const closingDenomsChanged = JSON.stringify(oldClosingDenoms) !== JSON.stringify(physicalCountDenoms);
-      const openingDenomsChanged = JSON.stringify(oldOpeningDenoms) !== JSON.stringify(editedOpeningDenoms);
-      const actualCashChanged = Math.abs((oldActualCash || 0) - actualCash) > 0.001;
-
-      if (!openingCashChanged && !closingDenomsChanged && !openingDenomsChanged && !actualCashChanged) {
-        setAutoSaveStatus('saved');
+      // Use the freshest copy of the session (another station may have changed it).
+      const live = selectedSessionRef.current;
+      if (!live || live.id !== sessionId || live.status !== 'open') {
+        setAutoSaveStatus('idle');
         return;
+      }
+      const totals = liveTotalsRef.current;
+
+      const oldOpeningCash = live.openingCash;
+      const oldActualCash = live.actualCash;
+      const oldOpeningDenoms = live.openingDenominations;
+      const oldClosingDenoms = live.closingDenominations;
+
+      // Opening: this station's value only if it was edited here; otherwise the stored one.
+      const openingCash = openingCashDirty ? Math.round(editedOpeningCash * 100) / 100 : oldOpeningCash;
+      const expectedCashVal = Math.round((openingCash + totals.replenishments - totals.payouts - totals.expenses) * 100) / 100;
+
+      // expectedCash and overShort always travel together so the stored record stays consistent.
+      const updateData: any = { expectedCash: expectedCashVal };
+      if (openingCashDirty) updateData.openingCash = openingCash;
+      if (openingDenomsDirty) updateData.openingDenominations = editedOpeningDenoms;
+
+      let actualCash: number | null = oldActualCash ?? null;
+      if (countDirty) {
+        actualCash = Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
+        updateData.actualCash = actualCash;
+        updateData.closingDenominations = physicalCountDenoms;
+      }
+      if (actualCash !== null) {
+        updateData.overShort = Math.round((actualCash - expectedCashVal) * 100) / 100;
       }
 
       try {
-        const updateData: any = {
-          openingCash,
-          expectedCash: expectedCashVal,
-          actualCash,
-          overShort,
-          closingDenominations: physicalCountDenoms
-        };
-
-        if (selectedSession.openingDenominations || openingDenomsChanged) {
-          updateData.openingDenominations = editedOpeningDenoms;
-        }
-
-        await updateDoc(doc(db, 'cashSessions', selectedSession.id), updateData);
+        await updateDoc(doc(db, 'cashSessions', sessionId), updateData);
         setAutoSaveStatus('saved');
 
+        // What we just wrote is now the baseline for those fields.
+        if (serverBaselineRef.current && serverBaselineRef.current.sessionId === sessionId) {
+          if (countDirty) serverBaselineRef.current.count = JSON.stringify(physicalCountDenoms);
+          if (openingCashDirty) serverBaselineRef.current.openingCash = openingCash;
+          if (openingDenomsDirty) serverBaselineRef.current.openingDenoms = JSON.stringify(editedOpeningDenoms);
+        }
+
         // Update selectedSession in state silently so UI matches calculations
-        setSelectedSession(prev => prev ? {
+        setSelectedSession(prev => prev && prev.id === sessionId ? {
           ...prev,
           ...updateData
-        } : null);
+        } : prev);
 
         // Track in Audit Log with details
         const changes: string[] = [];
-        if (openingCashChanged) {
+        if (openingCashDirty) {
           changes.push(`Opening Cash: $${oldOpeningCash.toFixed(2)} → $${openingCash.toFixed(2)}`);
         }
-        if (openingDenomsChanged) {
+        if (openingDenomsDirty) {
           changes.push(`Opening Denoms adjusted`);
         }
-        if (closingDenomsChanged || actualCashChanged) {
-          changes.push(`Closing Cash: $${(oldActualCash || 0).toFixed(2)} → $${actualCash.toFixed(2)}`);
+        if (countDirty) {
+          changes.push(`Closing Cash: $${(oldActualCash || 0).toFixed(2)} → $${(actualCash || 0).toFixed(2)}`);
         }
 
         await logAuditEvent(
           'cashDrawer',
-          selectedSession.id,
+          sessionId,
           'adjustment',
           {
             before: {
               openingCash: oldOpeningCash,
-              actualCash: oldActualCash || null,
+              actualCash: oldActualCash ?? null,
               openingDenominations: oldOpeningDenoms || null,
               closingDenominations: oldClosingDenoms || null
             },
             after: {
               openingCash,
               actualCash,
-              openingDenominations: selectedSession.openingDenominations || openingDenomsChanged ? editedOpeningDenoms : null,
-              closingDenominations: physicalCountDenoms
+              openingDenominations: openingDenomsDirty ? editedOpeningDenoms : (oldOpeningDenoms || null),
+              closingDenominations: countDirty ? physicalCountDenoms : (oldClosingDenoms || null)
             }
           },
-          `Live-edit update of session ${selectedSession.date} by ${profile.email || 'Manager'}: ${changes.join(', ')}`
+          `Live-edit update of session ${live.date} by ${profile.email || 'Manager'}: ${changes.join(', ')}`
         );
       } catch (err) {
         console.error("Auto-save failed:", err);
@@ -808,7 +859,19 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         clearTimeout(autoSaveTimeoutRef.current);
       }
     };
-  }, [physicalCountDenoms, editedOpeningCash, editedOpeningDenoms, selectedSession?.id]);
+  }, [physicalCountDenoms, editedOpeningCash, editedOpeningDenoms, selectedSession?.id, sessionTotalsReady]);
+
+  // Another station changed this session's opening: follow it, unless the opening is being
+  // edited here. Keeps the sheet's expected figure from being built on a stale opening.
+  useEffect(() => {
+    const baseline = serverBaselineRef.current;
+    if (!selectedSession || !baseline || baseline.sessionId !== selectedSession.id) return;
+    const serverOpening = selectedSession.openingCash || 0;
+    if (Math.abs(serverOpening - baseline.openingCash) < 0.001) return;
+    const editedHere = Math.abs(editedOpeningCash - baseline.openingCash) > 0.001;
+    baseline.openingCash = serverOpening;
+    if (!editedHere) setEditedOpeningCash(serverOpening);
+  }, [selectedSession?.openingCash, selectedSession?.id]);
 
   // Immediate localStorage draft persistence for physicalCountDenoms across active/selected sessions
   useEffect(() => {
@@ -1050,6 +1113,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       } else {
         toastError('Manager Required', 'This day is provisionally closed. A manager must finalize it with a physical count.');
       }
+      return;
+    }
+    if (!sessionTotalsReady) {
+      info('Still Loading', `Tickets and transactions for ${selectedSession.date} are still loading. Try again in a moment.`);
       return;
     }
     setProcessing(true);
@@ -1404,6 +1471,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         query(collection(db, 'cashTransactions'), where('sessionId', '==', selectedSession.id), orderBy('timestamp', 'desc')),
         (snapshot) => {
           setTransactions(snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as CashTransaction[]);
+          setTxLoadedForSessionId(selectedSession.id);
         }
       );
       return () => {
@@ -1442,6 +1510,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       (snapshot) => {
         const tickets = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as BuyTicket[];
         setBuyTickets(tickets.filter(t => t.status !== 'voided' && t.status !== 'cancelled'));
+        setTicketsLoadedForDate(targetDate);
       },
       (error) => handleFirestoreError(error, OperationType.LIST, 'buyTickets')
     );
@@ -1708,14 +1777,24 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     return Math.round(val * 100) / 100;
   }, [selectedSession, editedOpeningCash, totalReplenishments, totalPayouts, totalExpenses]);
 
-  // Update expected cash in session document when calculated values change
+  liveTotalsRef.current = { replenishments: totalReplenishments, payouts: totalPayouts, expenses: totalExpenses };
+
+  // Update expected cash in session document when calculated values change.
+  // Waits until the tickets/transactions on screen are THIS session's (right after switching
+  // days they are still the previous day's), and moves the stored over/short with it so
+  // expectedCash / actualCash / overShort never disagree on the record.
   useEffect(() => {
+    if (!sessionTotalsReady) return;
     if (selectedSession?.id && Math.abs((selectedSession.expectedCash || 0) - expectedCash) > 0.01) {
-      updateDoc(doc(db, 'cashSessions', selectedSession.id), { expectedCash })
+      const patch: { expectedCash: number; overShort?: number } = { expectedCash };
+      if (!isProvisionalSession(selectedSession) && selectedSession.actualCash !== undefined && selectedSession.actualCash !== null) {
+        patch.overShort = calculateOverShort(selectedSession.actualCash, expectedCash);
+      }
+      updateDoc(doc(db, 'cashSessions', selectedSession.id), patch)
         .catch((err) => console.error('Failed to update expected cash in background:', err));
-      setSelectedSession(prev => prev && prev.id === selectedSession.id ? { ...prev, expectedCash } : prev);
+      setSelectedSession(prev => prev && prev.id === selectedSession.id ? { ...prev, ...patch } : prev);
     }
-  }, [expectedCash, selectedSession?.id, selectedSession?.expectedCash]);
+  }, [expectedCash, selectedSession?.id, selectedSession?.expectedCash, sessionTotalsReady]);
 
   const calculateDenomTotal = (denoms: DenominationCount) => {
     const d = ensureDenomTotals(denoms);
@@ -1737,18 +1816,19 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
   // ─── PROVISIONAL & CATCH-UP RECONCILIATION ACTIONS ───────────────────
 
-  const handleInitiateOpen = async () => {
-    // 1. Detect any prior-dated session still status 'open' (uncounted)
+  // Opening today is never blocked by earlier days that are still open. The Open Ledger
+  // form shows a notice naming them; Catch-Up is an optional tool reached from that notice.
+  const handleInitiateOpen = () => {
+    setShowStartModal(true);
+  };
+
+  // Optional: review earlier still-open days and provisionally close them in one pass.
+  const handleOpenCatchUp = async () => {
     const priorOpenSessions = history
       .filter(s => s.date && s.date < todayStr && s.status === 'open')
       .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
 
-    if (priorOpenSessions.length === 0) {
-      setShowStartModal(true);
-      return;
-    }
-
-    // 2. Fetch data for missed days and present Catch-Up Reconciliation modal
+    setShowStartModal(false);
     setLoadingCatchUp(true);
     setShowCatchUpModal(true);
 
@@ -2112,17 +2192,6 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     e.preventDefault();
     setProcessing(true);
 
-    // Guard: ensure no uncounted prior sessions exist
-    const priorOpenSessions = history
-      .filter(s => s.date && s.date < todayStr && s.status === 'open');
-    if (priorOpenSessions.length > 0) {
-      setProcessing(false);
-      setShowStartModal(false);
-      handleInitiateOpen();
-      toastError('Missed Day Detected', 'Please resolve prior uncounted days before opening today.');
-      return;
-    }
-    
     const formData = new FormData(e.currentTarget);
     let openingCash = 0;
     if (useOpeningDenoms) {
@@ -2734,13 +2803,15 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     if (!targetSession || !profile) return;
     setProcessing(true);
     try {
+      // Re-opening only changes the status. A real physical count (actualCash, overShort,
+      // closingDenominations) is KEPT so the day stays internally consistent while it is
+      // being corrected. Only a provisional day's figures are cleared: they were never a count.
+      const wasProvisional = isProvisionalSession(targetSession);
       await updateDoc(doc(db, 'cashSessions', targetSession.id), {
         status: 'open',
-        actualCash: deleteField(),
-        overShort: deleteField(),
         closedAt: deleteField(),
         closedBy: deleteField(),
-        closingDenominations: deleteField()
+        ...(wasProvisional ? { actualCash: deleteField(), overShort: deleteField() } : {})
       });
 
       // Track in Audit Log
@@ -2749,32 +2820,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         targetSession.id,
         'open',
         {
-          before: { status: 'closed' },
-          after: { status: 'open' }
+          before: { status: targetSession.status },
+          after: { status: 'open', physicalCount: wasProvisional ? 'none (was provisional)' : 'kept' }
         },
         `Re-opened cash drawer session for ${targetSession.date}`
       );
 
-      setSelectedSession(prev => prev && prev.id === targetSession.id ? {
-        ...prev,
-        status: 'open',
-        actualCash: undefined,
-        overShort: undefined,
+      const reopenedFields = {
+        status: 'open' as const,
         closedAt: undefined,
         closedBy: undefined,
-        closingDenominations: undefined
-      } : prev);
+        ...(wasProvisional ? { actualCash: undefined, overShort: undefined } : {})
+      };
+      setSelectedSession(prev => prev && prev.id === targetSession.id ? { ...prev, ...reopenedFields } : prev);
 
       if (activeSession && activeSession.id === targetSession.id) {
-        setActiveSession(prev => prev ? {
-          ...prev,
-          status: 'open',
-          actualCash: undefined,
-          overShort: undefined,
-          closedAt: undefined,
-          closedBy: undefined,
-          closingDenominations: undefined
-        } : null);
+        setActiveSession(prev => prev ? { ...prev, ...reopenedFields } : null);
       }
 
       firestore(
@@ -3956,6 +4017,39 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   )}
                 </div>
               </div>
+            ) : selectedDay !== todayStr ? (
+              <div className="bg-white rounded-[2.5rem] p-12 border-2 border-dashed border-slate-200 flex flex-col items-center justify-center text-center space-y-6 max-w-2xl mx-auto shadow-sm">
+                <div className="p-8 bg-slate-100 rounded-[2rem] text-slate-500 shadow-inner">
+                  <Calendar className="w-16 h-16" strokeWidth={1.5} />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight font-display">No Cash Session for {selectedDay}</h2>
+                  <p className="text-slate-500 font-medium max-w-sm mx-auto uppercase text-xs tracking-widest leading-relaxed">
+                    Nothing was recorded in the drawer for this date. Nothing needs to be done here.
+                  </p>
+                </div>
+                {profile?.role === 'manager' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsManualRetro(false);
+                      setRetroactiveDate(selectedDay);
+                      setRetroStatus('closed');
+                      setRetroOpeningDenoms({ ...initialDenominations });
+                      setRetroClosingDenoms({ ...initialDenominations });
+                      setUseRetroOpeningDenoms(false);
+                      setUseRetroClosingDenoms(false);
+                      setQuickRetroOpeningCash('');
+                      setQuickRetroClosingCash('');
+                      setRetroNotes(`Retroactive session for ${selectedDay}`);
+                      setShowRetroactiveModal(true);
+                    }}
+                    className="px-6 py-3 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-2xl font-black text-[11px] uppercase tracking-widest transition-all cursor-pointer"
+                  >
+                    Create Session for This Day (Optional)
+                  </button>
+                )}
+              </div>
             ) : (
               <div className="bg-white rounded-[2.5rem] p-12 border-2 border-dashed border-slate-200 flex flex-col items-center justify-center text-center space-y-6 max-w-2xl mx-auto shadow-sm">
                 <div className="p-8 bg-blue-50 rounded-[2rem] text-blue-600 shadow-inner">
@@ -4559,7 +4653,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             {(profile?.role === 'manager' || selectedSession) && (
                               <button 
                                 onClick={() => {
-                                  if (window.confirm('Are you sure you want to re-open this session? This will remove the final actual count and over/short calculation.')) {
+                                  if (window.confirm('Re-open this session for changes? The existing count and over/short are kept.')) {
                                     handleReOpenSession();
                                   }
                                 }}
@@ -5781,13 +5875,13 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
               <div className="space-y-2">
                 <div className="inline-flex items-center gap-2 px-3 py-1 bg-amber-100 text-amber-800 rounded-full text-[10px] font-black uppercase tracking-wider">
                   <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-                  Prior Missed Day{missedDaysDetails.length === 1 ? '' : 's'} Detected
+                  Earlier Day{missedDaysDetails.length === 1 ? '' : 's'} Still Open
                 </div>
                 <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight font-display">
                   Catch-Up Cash Reconciliation
                 </h3>
                 <p className="text-slate-500 font-medium text-xs uppercase tracking-widest">
-                  Uncounted prior drawer sessions must be closed or provisionally resolved before opening today.
+                  Optional: provisionally close earlier days that were left open. You can also leave them open and correct them later.
                 </p>
               </div>
               <button
@@ -5821,9 +5915,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
             ) : (
               <div className="space-y-6">
                 <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl text-amber-900 text-xs leading-relaxed">
-                  <p className="font-bold">Why is this needed?</p>
+                  <p className="font-bold">What this does</p>
                   <p className="mt-1">
-                    Today’s starting balance depends on having a confirmed ending balance from prior days. You can provisionally close uncounted days based on their mathematical expected cash, allowing today’s ledger to open immediately. The true physical count can be finalized later at any time.
+                    These days are still open. You can provisionally close them on their mathematical expected cash and finalize the true physical count later, or cancel and leave them open — nothing here is required to open today.
                   </p>
                 </div>
 
@@ -6101,6 +6195,26 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
               <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Open Ledger</h3>
               <p className="text-slate-500 font-medium text-xs uppercase tracking-widest">Combined Safe + Register Total</p>
             </div>
+
+            {priorOpenSessions.length > 0 && (
+              <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <p className="text-amber-900 font-semibold leading-relaxed">
+                    {priorOpenSessions.length === 1 ? 'An earlier day is' : `${priorOpenSessions.length} earlier days are`} still open: <span className="font-mono font-black">{priorOpenSessions.map(s => s.date).join(', ')}</span>. You can open today anyway — check the opening amount below, since it is not linked to an uncounted day.
+                  </p>
+                </div>
+                {profile?.role === 'manager' && (
+                  <button
+                    type="button"
+                    onClick={handleOpenCatchUp}
+                    className="px-3.5 py-2 bg-white hover:bg-amber-100 text-amber-800 border border-amber-300 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shrink-0 self-start sm:self-auto"
+                  >
+                    Review Open Days
+                  </button>
+                )}
+              </div>
+            )}
 
             {profile?.role === 'cashier' && (
               <div className="mb-6 p-5 bg-amber-50 border border-amber-200 rounded-[1.5rem] flex gap-3.5 items-start text-xs shadow-sm">
