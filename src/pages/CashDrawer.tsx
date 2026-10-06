@@ -64,6 +64,7 @@ import {
   runCashLogicSelfTest,
   isCashPayoutTicket
 } from '../lib/cashLogicLock';
+import { isProvisionalSession, getClosingBasis } from '../lib/provisionalCash';
 import { TicketPayoutExpander } from '../components/TicketPayoutExpander';
 
 interface CashDrawerProps {
@@ -870,15 +871,18 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   // Pre-populate opening count from previous closed day's manual closing count breakdown when modal opens
   useEffect(() => {
     if (showStartModal && mostRecentClosedSession) {
-      if (mostRecentClosedSession.closingDenominations) {
+      // Provisional prior day: carry the ASSUMED figure, and ignore any leftover
+      // partial denomination count on it (it was never a completed physical count).
+      const priorBasis = getClosingBasis(mostRecentClosedSession) || 0;
+      if (!isProvisionalSession(mostRecentClosedSession) && mostRecentClosedSession.closingDenominations) {
         setOpeningDenoms(ensureDenomTotals(mostRecentClosedSession.closingDenominations));
       } else {
         setOpeningDenoms({
           ...initialDenominations,
-          ones: mostRecentClosedSession.actualCash || 0
+          ones: priorBasis
         });
       }
-      setQuickOpeningCash((mostRecentClosedSession.actualCash || 0).toFixed(2));
+      setQuickOpeningCash(priorBasis.toFixed(2));
     }
   }, [showStartModal, mostRecentClosedSession]);
 
@@ -1036,6 +1040,18 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
   const handleSaveSheetCount = async () => {
     if (!selectedSession || !profile) return;
+    // A provisional session has no physical count. Saving the sheet here would write
+    // actualCash/overShort onto it while it stays 'provisional' -- the only way a count
+    // gets onto a provisional day is the Finalize flow, which also closes it.
+    if (isProvisionalSession(selectedSession)) {
+      if (profile.role === 'manager') {
+        info('Provisional Day', `${selectedSession.date} was closed without a count. Enter the physical count in Finalize to complete it.`);
+        handleOpenFinalizeProvisional(selectedSession);
+      } else {
+        toastError('Manager Required', 'This day is provisionally closed. A manager must finalize it with a physical count.');
+      }
+      return;
+    }
     setProcessing(true);
     const openingCash = Math.round(editedOpeningCash * 100) / 100;
     const expectedCashVal = Math.round((openingCash + totalReplenishments - totalPayouts - totalExpenses) * 100) / 100;
@@ -1112,7 +1128,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     
     // Header
     csvContent += "PREFERRED METALS & RECYCLING,,DAILY BALANCE SHEET\n";
-    csvContent += `DATE: ${dateStr},,\n\n`;
+    csvContent += `DATE: ${dateStr},,\n`;
+    if (isProvisionalSession(selectedSession)) {
+      csvContent += "STATUS: PROVISIONAL - NOT PHYSICALLY COUNTED,,\n";
+    }
+    csvContent += "\n";
     
     // Table Headers
     csvContent += "CASH IN,CASH OUT,DESCRIPTION,INITIALS\n";
@@ -1134,7 +1154,13 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     csvContent += "\n";
      // Bottom left totals vs Bottom right denominations
     const sDenoms = ensureDenomTotals(physicalCountDenoms);
-    const onHand = selectedSession.actualCash !== undefined && selectedSession.actualCash !== null ? selectedSession.actualCash : calculateDenomTotal(sDenoms);
+    // Provisional = no physical count: never export the assumed figure as cash on hand.
+    const isProvisionalExport = isProvisionalSession(selectedSession);
+    const onHand = !isProvisionalExport && selectedSession.actualCash !== undefined && selectedSession.actualCash !== null ? selectedSession.actualCash : calculateDenomTotal(sDenoms);
+    const onHandCell = isProvisionalExport
+      ? `NOT COUNTED (assumed ${(getClosingBasis(selectedSession) ?? 0).toFixed(2)})`
+      : onHand.toFixed(2);
+    const overShortCell = isProvisionalExport ? 'PENDING COUNT' : (onHand - expectedCash).toFixed(2);
     const billsTotal = 
       (sDenoms.hundreds || 0) +
       (sDenoms.fifties || 0) +
@@ -1156,8 +1182,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     csvContent += `Total Cash OUT,${(totalPayouts + totalExpenses).toFixed(2)},,20's,${Math.round(sDenoms.twenties / 20)},${sDenoms.twenties.toFixed(2)}\n`;
     csvContent += `End Balance,${expectedCash.toFixed(2)},,10s,${Math.round(sDenoms.tens / 10)},${sDenoms.tens.toFixed(2)}\n`;
     csvContent += `,,,5's,${Math.round(sDenoms.fives / 5)},${sDenoms.fives.toFixed(2)}\n`;
-    csvContent += `Total Cash On-Hand,${onHand.toFixed(2)},,1's,${Math.round(sDenoms.ones / 1)},${sDenoms.ones.toFixed(2)}\n`;
-    csvContent += `Over/Short,${(onHand - expectedCash).toFixed(2)},,Dollar Coins,${Math.round(sDenoms.dollarCoins / 1)},${sDenoms.dollarCoins.toFixed(2)}\n`;
+    csvContent += `Total Cash On-Hand,${onHandCell},,1's,${Math.round(sDenoms.ones / 1)},${sDenoms.ones.toFixed(2)}\n`;
+    csvContent += `Over/Short,${overShortCell},,Dollar Coins,${Math.round(sDenoms.dollarCoins / 1)},${sDenoms.dollarCoins.toFixed(2)}\n`;
     csvContent += `,,,Halves,${Math.round(sDenoms.halfDollars / 0.5)},${sDenoms.halfDollars.toFixed(2)}\n`;
     csvContent += `,,,Quarters,${Math.round(sDenoms.quarters / 0.25)},${sDenoms.quarters.toFixed(2)}\n`;
     csvContent += `,,,Dimes,${Math.round(sDenoms.dimes / 0.1)},${sDenoms.dimes.toFixed(2)}\n`;
@@ -1794,6 +1820,119 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
   };
 
+  // The one write shape for every provisional close. The assumed figure lives ONLY in
+  // provisionalAssumedCash (alongside expectedCash): actualCash/overShort are cleared, not
+  // set, so actualCash only ever means a real physical count and over/short stays pending
+  // until Finalize. closingDenominations is deliberately not written here.
+  const buildProvisionalCloseFields = (assumedCash: number, now: string, closedBy: string) => ({
+    status: 'provisional' as const,
+    expectedCash: assumedCash,
+    actualCash: deleteField(),
+    overShort: deleteField(),
+    provisionalClose: true,
+    provisionalClosedAt: now,
+    provisionalClosedBy: closedBy,
+    provisionalAssumedCash: assumedCash
+  });
+
+  // End-of-day provisional close for the open session on screen (no physical count).
+  // Totals are fetched fresh rather than taken from on-screen state, which can still hold
+  // the previously viewed day's tickets/transactions right after switching days.
+  const handleProvisionalCloseSelected = async () => {
+    const targetSession = selectedSession || activeSession;
+    if (!targetSession || !profile) return;
+    if (profile.role !== 'manager') {
+      toastError('Manager Required', 'Only managers can provisionally close cash sessions.');
+      return;
+    }
+    if (targetSession.status !== 'open') return;
+    // Cancel any pending debounced count auto-save so it can't land after this close
+    // and put an actualCash/overShort back onto the provisional record.
+    if (autoSaveTimeoutRef.current) {
+      clearTimeout(autoSaveTimeoutRef.current);
+      autoSaveTimeoutRef.current = null;
+    }
+    setProcessing(true);
+    try {
+      const startOfDay = new Date(`${targetSession.date}T00:00:00`);
+      const endOfDay = new Date(`${targetSession.date}T23:59:59.999`);
+      const ticketsSnap = await getDocs(
+        query(
+          collection(db, 'buyTickets'),
+          where('timestamp', '>=', startOfDay.toISOString()),
+          where('timestamp', '<=', endOfDay.toISOString())
+        )
+      );
+      const dayTickets = ticketsSnap.docs
+        .map(d => d.data() as BuyTicket)
+        .filter(t => t.status !== 'voided' && t.status !== 'cancelled');
+      const ticketPayouts = Math.round(dayTickets.filter(t => isCashPayoutTicket(t.paymentMethod)).reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100) / 100;
+
+      const txSnap = await getDocs(
+        query(collection(db, 'cashTransactions'), where('sessionId', '==', targetSession.id))
+      );
+      const txs = txSnap.docs.map(d => d.data() as CashTransaction);
+      const replenishments = Math.round(txs.filter(t => t.type === 'inflow').reduce((sum, t) => sum + (t.amount || 0), 0) * 100) / 100;
+      const expenses = Math.round(txs.filter(t => t.type === 'expense').reduce((sum, t) => sum + (t.amount || 0), 0) * 100) / 100;
+
+      const assumedCash = calculateExpectedCash(
+        targetSession.openingCash,
+        replenishments,
+        ticketPayouts,
+        expenses
+      );
+
+      const confirmed = window.confirm(
+        `Provisionally close ${targetSession.date} WITHOUT a physical count?\n\n` +
+        `Assumed closing cash (expected): $${assumedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}\n\n` +
+        `The day will be flagged PROVISIONAL - not counted. Over/short stays pending until it is finalized with a real count. ` +
+        `The assumed figure carries into the next day's opening.`
+      );
+      if (!confirmed) return;
+
+      const now = new Date().toISOString();
+      await updateDoc(
+        doc(db, 'cashSessions', targetSession.id),
+        buildProvisionalCloseFields(assumedCash, now, profile.email)
+      );
+
+      await logAuditEvent(
+        'cashDrawer',
+        targetSession.id,
+        'close',
+        {
+          before: { status: 'open', expectedCash: targetSession.expectedCash },
+          after: { status: 'provisional', provisionalAssumedCash: assumedCash, provisionalClose: true, physicalCount: 'pending' }
+        },
+        `Provisional close for ${targetSession.date}: assumed expected cash $${assumedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}, no physical count. Awaiting final reconciliation.`
+      );
+
+      const localFields = {
+        status: 'provisional' as const,
+        expectedCash: assumedCash,
+        actualCash: undefined,
+        overShort: undefined,
+        provisionalClose: true,
+        provisionalClosedAt: now,
+        provisionalClosedBy: profile.email,
+        provisionalAssumedCash: assumedCash
+      };
+      setSelectedSession(prev => prev && prev.id === targetSession.id ? { ...prev, ...localFields } : prev);
+      if (activeSession && activeSession.id === targetSession.id) {
+        setActiveSession(prev => prev ? { ...prev, ...localFields } : null);
+      }
+
+      setShowCloseModal(false);
+      success('Session Provisionally Closed', `Session for ${targetSession.date} marked provisional with assumed cash of $${assumedCash.toFixed(2)}. Physical count pending.`);
+      // Same end-of-day handoff as a counted close: the Ohio report deadline doesn't wait for the count.
+      setOhioReportPrompt({ date: targetSession.date || todayStr });
+    } catch (err: any) {
+      toastError('Error', `Failed to provisionally close session: ${err.message || err}`);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
   const handleProvisionalClose = async (item: {
     session: CashSession;
     date: string;
@@ -1813,16 +1952,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       const assumedCash = item.computedExpectedCash;
       const now = new Date().toISOString();
 
-      await updateDoc(doc(db, 'cashSessions', item.session.id), {
-        status: 'provisional',
-        expectedCash: assumedCash,
-        actualCash: assumedCash,
-        overShort: 0,
-        provisionalClose: true,
-        provisionalClosedAt: now,
-        provisionalClosedBy: profile.email,
-        provisionalAssumedCash: assumedCash
-      });
+      await updateDoc(
+        doc(db, 'cashSessions', item.session.id),
+        buildProvisionalCloseFields(assumedCash, now, profile.email)
+      );
 
       await logAuditEvent(
         'cashDrawer',
@@ -1830,7 +1963,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         'close',
         {
           before: { status: 'open', expectedCash: item.session.openingCash },
-          after: { status: 'provisional', actualCash: assumedCash, overShort: 0, provisionalClose: true }
+          after: { status: 'provisional', provisionalAssumedCash: assumedCash, provisionalClose: true, physicalCount: 'pending' }
         },
         `Provisional close for ${item.date}: assumed expected cash $${assumedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}, no physical count. Awaiting final reconciliation.`
       );
@@ -1872,14 +2005,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
         await updateDoc(doc(db, 'cashSessions', item.session.id), {
           openingCash: dayOpening,
-          status: 'provisional',
-          expectedCash: dayExpected,
-          actualCash: dayExpected,
-          overShort: 0,
-          provisionalClose: true,
-          provisionalClosedAt: now,
-          provisionalClosedBy: profile.email,
-          provisionalAssumedCash: dayExpected
+          ...buildProvisionalCloseFields(dayExpected, now, profile.email)
         });
 
         await logAuditEvent(
@@ -1888,7 +2014,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           'close',
           {
             before: { status: 'open', openingCash: item.session.openingCash },
-            after: { status: 'provisional', openingCash: dayOpening, actualCash: dayExpected, overShort: 0, provisionalClose: true }
+            after: { status: 'provisional', openingCash: dayOpening, provisionalAssumedCash: dayExpected, provisionalClose: true, physicalCount: 'pending' }
           },
           `Provisional close for ${item.date}: assumed expected cash $${dayExpected.toLocaleString(undefined, { minimumFractionDigits: 2 })}, no physical count. Awaiting final reconciliation.`
         );
@@ -1965,7 +2091,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         provisionalSessionToFinalize.id,
         'close',
         {
-          before: { status: 'provisional', actualCash: provisionalSessionToFinalize.actualCash, overShort: 0 },
+          before: { status: 'provisional', actualCash: provisionalSessionToFinalize.actualCash ?? null, overShort: 0 },
           after: { status: 'closed', actualCash, overShort: diff, closingDenominations: finalizeDenoms }
         },
         `Provisional ${provisionalSessionToFinalize.date} finalized: assumed $${assumedStr}, actual $${actualStr}, true over/short $${diffStr}.`
@@ -2801,8 +2927,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           totalExpenses
         );
 
+        // Provisional sessions have no physical count, so there is no over/short to
+        // recompute -- it stays pending until the day is finalized.
         let newOverShort: number | undefined = undefined;
-        if (sess.actualCash !== undefined && sess.actualCash !== null) {
+        if (!isProvisionalSession(sess) && sess.actualCash !== undefined && sess.actualCash !== null) {
           newOverShort = calculateOverShort(sess.actualCash, newExpectedCash);
         }
 
@@ -3086,7 +3214,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             </span>
                           </div>
                           <p className="text-xs text-slate-500 mt-1">
-                            Assumed Cash: <span className="font-mono font-bold text-slate-800">${(session.actualCash ?? session.expectedCash).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                            Assumed Cash: <span className="font-mono font-bold text-slate-800">${(getClosingBasis(session) ?? session.expectedCash).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                           </p>
                         </div>
                         {profile?.role === 'manager' && (
@@ -3367,9 +3495,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
                     let continuity: { type: 'match' | 'diff'; tooltip: string; diffAmount?: number } | null = null;
                     if (priorSession) {
-                      const priorClosingCash = priorSession.actualCash !== undefined && priorSession.actualCash !== null
-                        ? priorSession.actualCash
-                        : priorSession.expectedCash;
+                      const priorClosingCash = getClosingBasis(priorSession) ?? priorSession.expectedCash;
 
                       if (priorClosingCash !== undefined) {
                         const diffVal = Math.round((session.openingCash - priorClosingCash) * 100) / 100;
@@ -3466,6 +3592,15 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             ) : (
                               <span className="text-slate-400 font-medium italic text-xs">— not counted</span>
                             )
+                          ) : isProvisionalSession(session) ? (
+                            <div className="flex flex-col items-end">
+                              <span className="text-amber-700">
+                                ${(getClosingBasis(session) ?? session.expectedCash).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </span>
+                              <span className="text-[8px] font-black uppercase text-amber-600 tracking-wider font-sans">
+                                Assumed — not counted
+                              </span>
+                            </div>
                           ) : (
                             session.actualCash !== undefined && session.actualCash !== null ? (
                               `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -3477,6 +3612,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         <td className="px-6 py-4 text-right">
                           {session.status === 'open' ? (
                             <span className="text-slate-400 font-medium italic text-xs">— pending count</span>
+                          ) : isProvisionalSession(session) ? (
+                            <span className="text-amber-600 font-medium italic text-xs">— pending count</span>
                           ) : session.overShort !== undefined ? (
                             (() => {
                               const tCount = recentTickets.filter(t => t.timestamp && getTicketLocalDate(t.timestamp) === session.date && t.status !== 'voided' && t.status !== 'cancelled').length;
@@ -3925,14 +4062,27 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     Edit Starting Cash
                   </button>
                   {selectedSession.status === 'open' ? (
-                    <button
-                      type="button"
-                      onClick={() => setShowCloseModal(true)}
-                      className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
-                    >
-                      <CheckCircle2 className="w-4 h-4 text-emerald-300" />
-                      Finalize Reconciliation
-                    </button>
+                    <>
+                      {profile?.role === 'manager' && (
+                        <button
+                          type="button"
+                          disabled={processing}
+                          onClick={handleProvisionalCloseSelected}
+                          className="px-4 py-2.5 bg-amber-600/30 hover:bg-amber-600/40 text-amber-300 border border-amber-500/30 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all cursor-pointer active:scale-95 disabled:opacity-50"
+                        >
+                          <AlertTriangle className="w-4 h-4" />
+                          Provisional Close (No Count)
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setShowCloseModal(true)}
+                        className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shadow-md cursor-pointer active:scale-95"
+                      >
+                        <CheckCircle2 className="w-4 h-4 text-emerald-300" />
+                        Finalize Reconciliation
+                      </button>
+                    </>
                   ) : (
                     <button
                       type="button"
@@ -4301,7 +4451,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                               You do not have permission to close cash sessions. Please contact a manager.
                             </div>
                           ) : (
-                            <button 
+                            <button
                               onClick={() => setShowCloseModal(true)}
                               className="w-full py-5 bg-white text-slate-900 rounded-3xl font-black text-xs uppercase tracking-widest hover:bg-slate-100 transition-all shadow-xl flex items-center justify-center gap-2 group/btn"
                             >
@@ -4309,15 +4459,37 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                               Finalize Reconciliation
                             </button>
                           )}
+                          {profile?.role === 'manager' && (
+                            <button
+                              type="button"
+                              disabled={processing}
+                              onClick={handleProvisionalCloseSelected}
+                              className="w-full py-3 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                            >
+                              <AlertTriangle className="w-4 h-4" />
+                              {processing ? 'Processing...' : 'Provisional Close (No Count)'}
+                            </button>
+                          )}
                         </div>
                       ) : (
                         <div className="space-y-6 pt-4">
                           <div className="p-6 bg-white/5 rounded-3xl border border-white/10 space-y-4">
                             <div className="flex items-center justify-between">
-                              <span className="text-xs font-bold text-slate-400 uppercase">Physical Count</span>
-                              <span className="font-mono font-black">${selectedSession.actualCash?.toLocaleString()}</span>
+                              <span className="text-xs font-bold text-slate-400 uppercase">
+                                {isProvisionalSession(selectedSession) ? 'Assumed Cash (Not Counted)' : 'Physical Count'}
+                              </span>
+                              <span className={cn("font-mono font-black", isProvisionalSession(selectedSession) && "text-amber-400")}>
+                                ${getClosingBasis(selectedSession)?.toLocaleString()}
+                              </span>
                             </div>
-                            {(() => {
+                            {isProvisionalSession(selectedSession) ? (
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-bold text-slate-400 uppercase">Over/Short</span>
+                                <span className="p-2 rounded-xl font-black text-[10px] uppercase tracking-widest bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                                  Pending Count
+                                </span>
+                              </div>
+                            ) : (() => {
                               const overShort = selectedSession.overShort || 0;
                               const status = getShortageStatus(overShort, buyTickets.length);
                               return (
@@ -4362,7 +4534,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                 <div className="flex items-center gap-3 p-4 bg-amber-500/10 rounded-2xl border border-amber-500/20">
                                   <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
                                   <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest">
-                                    Provisionally closed on assumed balance (${(selectedSession.actualCash ?? selectedSession.expectedCash).toFixed(2)}). Physical count pending.
+                                    Provisionally closed on assumed balance (${(getClosingBasis(selectedSession) ?? selectedSession.expectedCash).toFixed(2)}). Physical count pending.
                                   </p>
                                 </div>
                                 {profile?.role === 'manager' && (
@@ -4570,7 +4742,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                         </span>
                       </div>
-                      {(() => {
+                      {isProvisionalSession(selectedSession) ? (
+                        <div className="flex justify-between items-center text-xs pb-2">
+                          <span className="font-bold text-slate-400 uppercase">Over / Short</span>
+                          <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200">
+                            Pending Count
+                          </span>
+                        </div>
+                      ) : (() => {
                         const totalCount = calculateDenomTotal(physicalCountDenoms);
                         const diff = Math.round((totalCount - expectedCash) * 100) / 100;
                         const status = getShortageStatus(diff, buyTickets.length);
@@ -4604,7 +4783,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           className="w-full py-4 bg-slate-950 hover:bg-slate-900 text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all flex items-center justify-center gap-2 shadow-lg disabled:opacity-50"
                         >
                           <Save className="w-4 h-4 text-emerald-400" />
-                          {processing ? 'Saving...' : selectedSession.status === 'closed' ? 'Save Audit Changes' : 'Save Physical Count'}
+                          {processing ? 'Saving...' : isProvisionalSession(selectedSession) ? 'Finalize with Physical Count' : selectedSession.status === 'closed' ? 'Save Audit Changes' : 'Save Physical Count'}
                         </button>
                       )}
                     </div>
@@ -4823,7 +5002,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                           </span>
                         </div>
-                        {(() => {
+                        {isProvisionalSession(selectedSession) ? (
+                          <div className="flex justify-between items-center py-2.5 border-t-2 border-slate-300 col-span-2 bg-white rounded-xl px-4 border border-slate-200">
+                            <span className="font-black text-slate-800 uppercase text-xs">Over / Short</span>
+                            <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200">
+                              Pending Count
+                            </span>
+                          </div>
+                        ) : (() => {
                           const totalCount = calculateDenomTotal(physicalCountDenoms);
                           const diff = Math.round((totalCount - sheetExpectedCash) * 100) / 100;
                           const status = getShortageStatus(diff, buyTickets.length);
@@ -4862,15 +5048,17 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         </div>
                         <div className="space-y-2 text-xs">
                           <div className="flex justify-between items-center py-1">
-                            <span className="font-bold text-slate-500 uppercase">Previous Day Closing Cash</span>
-                            <span className="font-mono font-black text-slate-900">${previousSession.actualCash?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                            <span className="font-bold text-slate-500 uppercase">
+                              Previous Day Closing Cash{isProvisionalSession(previousSession) ? ' (Assumed — Not Counted)' : ''}
+                            </span>
+                            <span className="font-mono font-black text-slate-900">${getClosingBasis(previousSession)?.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                           </div>
                           <div className="flex justify-between items-center py-1">
                             <span className="font-bold text-slate-500 uppercase">Today Opening Cash</span>
                             <span className="font-mono font-black text-slate-900">${selectedSession.openingCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                           </div>
                           {(() => {
-                            const carryoverDiff = selectedSession.openingCash - (previousSession.actualCash || 0);
+                            const carryoverDiff = selectedSession.openingCash - (getClosingBasis(previousSession) || 0);
                             const isMatch = Math.abs(carryoverDiff) < 0.01;
                             return (
                               <div className="flex justify-between items-center py-2 border-t border-dashed border-slate-200">
@@ -5295,7 +5483,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           className="mt-4 w-full py-4 bg-slate-950 hover:bg-slate-900 text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all flex items-center justify-center gap-2 shadow-lg disabled:opacity-50 cursor-pointer"
                         >
                           <Save className="w-4 h-4 text-emerald-400" />
-                          {selectedSession.status === 'closed' ? 'Save Audit Changes' : 'Save Physical Count'}
+                          {isProvisionalSession(selectedSession) ? 'Finalize with Physical Count' : selectedSession.status === 'closed' ? 'Save Audit Changes' : 'Save Physical Count'}
                         </button>
                       )}
                     </div>
@@ -5929,26 +6117,29 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
             {mostRecentClosedSession && (
               <div className="mb-6 p-5 bg-amber-50/60 border border-amber-200/80 rounded-3xl flex items-center justify-between text-xs shadow-sm">
                 <div>
-                  <span className="font-bold text-slate-500 uppercase block tracking-wider text-[10px]">Previous Day Close ({mostRecentClosedSession.date})</span>
+                  <span className="font-bold text-slate-500 uppercase block tracking-wider text-[10px]">
+                    Previous Day Close ({mostRecentClosedSession.date}){isProvisionalSession(mostRecentClosedSession) ? ' — Provisional, assumed (not counted)' : ''}
+                  </span>
                   <span className="font-mono font-black text-amber-900 text-base">
-                    ${mostRecentClosedSession.actualCash?.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    ${getClosingBasis(mostRecentClosedSession)?.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                   </span>
                 </div>
                 <button
                   type="button"
                   onClick={() => {
+                    const priorBasis = getClosingBasis(mostRecentClosedSession) || 0;
                     if (useOpeningDenoms) {
-                      if (mostRecentClosedSession.closingDenominations) {
+                      if (!isProvisionalSession(mostRecentClosedSession) && mostRecentClosedSession.closingDenominations) {
                         setOpeningDenoms(ensureDenomTotals(mostRecentClosedSession.closingDenominations));
                       } else {
-                        // fallback if no denom breakdown was stored
+                        // fallback if no denom breakdown was stored (or prior day is provisional: no count exists)
                         setOpeningDenoms({
                           ...initialDenominations,
-                          ones: mostRecentClosedSession.actualCash || 0
+                          ones: priorBasis
                         });
                       }
                     } else {
-                      setQuickOpeningCash((mostRecentClosedSession.actualCash || 0).toFixed(2));
+                      setQuickOpeningCash(priorBasis.toFixed(2));
                     }
                   }}
                   className="px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-1.5 shadow-sm active:scale-95"

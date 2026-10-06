@@ -403,8 +403,8 @@ export interface CashSession {
   status: 'open' | 'closed' | 'provisional';
   openingCash: number; // Combined Safe + Register
   expectedCash: number; // Calculated: Opening + Replenishments - Payouts - Expenses
-  actualCash?: number; // Physical count at end of day (or assumed expected cash for provisional)
-  overShort?: number;
+  actualCash?: number; // Physical count at end of day ONLY. A provisional close does not set this (see provisionalAssumedCash); provisional records closed before 2026-10-05 still carry the assumed figure here -- read through lib/provisionalCash.ts.
+  overShort?: number; // actualCash - expectedCash. Pending (not meaningful) while status is 'provisional'.
   openedAt: string;
   openedBy: string;
   closedAt?: string;

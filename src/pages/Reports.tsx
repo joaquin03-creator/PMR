@@ -5,6 +5,7 @@ import { useSettings } from '../context/SettingsContext';
 import { collection, onSnapshot, query, where, addDoc, getDocs, serverTimestamp, orderBy, limit, doc, updateDoc } from 'firebase/firestore';
 import { BuyTicket, TripTicket, Material, Customer, Invoice, InventoryItem, DailySnapshot, AuditLog, ComplianceSubmission, CashSession, CashTransaction, PricingSnapshot } from '../types';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
+import { isProvisionalSession, getClosingBasis, getCountedOverShort } from '../lib/provisionalCash';
 import { BrandLogo } from '../components/BrandLogo';
 import { 
   BarChart3, 
@@ -4057,9 +4058,13 @@ export default function Reports({ profile }: { profile: any }) {
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-sans">
                     {filteredSessions.map((session) => {
-                      const isBalanced = session.overShort === 0;
-                      const isShort = session.overShort !== undefined && session.overShort < 0;
-                      const isOver = session.overShort !== undefined && session.overShort > 0;
+                      // Provisional = closed with no physical count: its over/short is pending,
+                      // never "Balanced", whatever is stored on the record.
+                      const isProvisional = isProvisionalSession(session);
+                      const countedOverShort = getCountedOverShort(session);
+                      const isBalanced = countedOverShort === 0;
+                      const isShort = countedOverShort !== undefined && countedOverShort < 0;
+                      const isOver = countedOverShort !== undefined && countedOverShort > 0;
 
                       return (
                         <tr key={session.id} className="hover:bg-slate-50/50 transition-colors">
@@ -4083,11 +4088,20 @@ export default function Reports({ profile }: { profile: any }) {
                             ${session.expectedCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                           </td>
                           <td className="px-8 py-5 text-sm font-mono font-black text-slate-800 text-right">
-                            {session.actualCash !== undefined ? `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '—'}
+                            {isProvisional ? (
+                              <div className="flex flex-col items-end">
+                                <span className="text-amber-700">
+                                  ${(getClosingBasis(session) ?? session.expectedCash).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                </span>
+                                <span className="text-[8px] font-black uppercase tracking-widest text-amber-600 font-sans">Assumed — not counted</span>
+                              </div>
+                            ) : session.actualCash !== undefined ? `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '—'}
                           </td>
                           <td className="px-8 py-5 text-right">
                             {session.status === 'open' ? (
                               <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Open Session</span>
+                            ) : isProvisional ? (
+                              <span className="px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-widest inline-block bg-amber-50 text-amber-700 border border-amber-200">Pending Count</span>
                             ) : session.overShort === undefined ? (
                               <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">No Count</span>
                             ) : (
