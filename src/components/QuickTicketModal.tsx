@@ -593,10 +593,13 @@ export default function QuickTicketModal({
     const saveDraft = async () => {
       try {
         if (activeDraftId) {
-          await updateDoc(doc(db, 'ticketDrafts', activeDraftId), draftData);
+          await setDoc(doc(db, 'ticketDrafts', activeDraftId), draftData);
         } else {
-          const ref = await addDoc(collection(db, 'ticketDrafts'), draftData);
+          // Id is chosen locally BEFORE the save: waiting for the server to hand one back
+          // meant every autosave made while the server was unreachable created another draft.
+          const ref = doc(collection(db, 'ticketDrafts'));
           setActiveDraftId(ref.id);
+          await setDoc(ref, draftData);
         }
       } catch (e) {
         console.warn('Draft auto-save failed:', e);

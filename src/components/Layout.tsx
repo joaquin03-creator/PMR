@@ -28,6 +28,7 @@ import { cn } from '../lib/utils';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { useToast } from '../context/ToastContext';
 import { replayTicketOutbox } from '../lib/ticketOutbox';
+import { useSaveWatchdog } from '../hooks/useSaveWatchdog';
 import { useSettings } from '../context/SettingsContext';
 import { useQuickTicket } from '../context/QuickTicketContext';
 import { COMPANY_NAME, handleImageError } from '../constants';
@@ -53,6 +54,7 @@ export default function Layout({ user, profile }: LayoutProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [problemReportOpen, setProblemReportOpen] = useState(false);
   const { firestore: toastSaved, error: toastError } = useToast();
+  const savesStalled = useSaveWatchdog(!!user);
 
   // Re-send any completed ticket that never reached the server (page refreshed or died
   // mid-save). Runs once after login and again whenever the device comes back online.
@@ -370,6 +372,23 @@ export default function Layout({ user, profile }: LayoutProps) {
           settings.theme === 'dark' && "bg-slate-950"
         )}>
           <div className="max-w-7xl mx-auto">
+            {savesStalled && (
+              <div role="alert" className="mb-4 p-4 bg-red-600 text-white rounded-2xl shadow-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3 print:hidden">
+                <div>
+                  <p className="text-xs font-black uppercase tracking-widest">This screen is not saving to the server</p>
+                  <p className="text-xs font-semibold mt-1 leading-relaxed">
+                    Changes made here have not reached the server for over a minute. Check the internet connection; if it is working, close any other PMR tabs or windows on this computer and refresh this page. Completed tickets are held on this computer and are sent automatically once it reconnects.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="px-4 py-2 bg-white text-red-700 rounded-xl text-[10px] font-black uppercase tracking-widest shrink-0 cursor-pointer self-start sm:self-auto"
+                >
+                  Refresh This Page
+                </button>
+              </div>
+            )}
             <Outlet />
           </div>
         </main>

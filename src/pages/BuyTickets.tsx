@@ -466,9 +466,12 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
       if (draftId) {
         await setDoc(doc(db, 'ticketDrafts', draftId), draftData);
       } else {
-        const docRef = await addDoc(collection(db, 'ticketDrafts'), draftData);
+        // Id is chosen locally BEFORE the save: waiting for the server to hand one back meant
+        // every autosave made while the server was unreachable created another draft.
+        const docRef = doc(collection(db, 'ticketDrafts'));
         draftId = docRef.id;
         setActiveDraftId(draftId);
+        await setDoc(docRef, draftData);
       }
       setSaveStatus('saved');
       local(

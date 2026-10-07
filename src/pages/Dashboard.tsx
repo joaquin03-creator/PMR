@@ -861,9 +861,12 @@ export default function Dashboard({ profile }: DashboardProps) {
       if (draftId) {
         await setDoc(doc(db, 'ticketDrafts', draftId), draftData);
       } else {
-        const docRef = await addDoc(collection(db, 'ticketDrafts'), draftData);
+        // Id is chosen locally BEFORE the save: waiting for the server to hand one back meant
+        // every autosave made while the server was unreachable created another draft.
+        const docRef = doc(collection(db, 'ticketDrafts'));
         draftId = docRef.id;
         setActiveDraftId(draftId);
+        await setDoc(docRef, draftData);
       }
       setSaveStatus('saved');
     } catch (err) {
@@ -2011,7 +2014,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                 Pending & Unfinished Tickets Drawer
               </h2>
               <p className="text-xs text-amber-700/80 mt-1">
-                A laptop closure or battery loss was detected, auto-saving your draft. Choose robust or quick ticket to resume:
+                Tickets that were started but not completed. Resume one to finish it, or delete it if it was already completed or abandoned:
               </p>
             </div>
             <span className="px-3 py-1 bg-amber-100 text-amber-800 text-[10px] font-black uppercase tracking-widest rounded-full">
