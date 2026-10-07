@@ -65,6 +65,8 @@ import {
   isCashPayoutTicket
 } from '../lib/cashLogicLock';
 import { isProvisionalSession, getClosingBasis } from '../lib/provisionalCash';
+import { buildLedgerRows, LedgerRow } from '../lib/ledgerRows';
+import CashLedgerTable from '../components/CashLedgerTable';
 import { TicketPayoutExpander } from '../components/TicketPayoutExpander';
 
 interface CashDrawerProps {
@@ -378,6 +380,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [userSelectedHistorical, setUserSelectedHistorical] = useState(false);
   const userSelectedHistoricalRef = useRef(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historyLimit, setHistoryLimit] = useState(30);
   const appliedDateParamRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -1315,7 +1318,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
     // 2. Historical sessions
     const unsubHistory = onSnapshot(
-      query(collection(db, 'cashSessions'), orderBy('date', 'desc'), limit(30)),
+      query(collection(db, 'cashSessions'), orderBy('date', 'desc'), limit(historyLimit)),
       (snapshot) => {
         const loadedHistory = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as CashSession[];
         setHistory(loadedHistory);
@@ -1336,7 +1339,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         console.warn('unsubHistory error', e);
       }
     };
-  }, [todayStr, profile]);
+  }, [todayStr, profile, historyLimit]);
 
   // Keep selectedSession synchronized with history/activeSession updates
   useEffect(() => {
@@ -1577,6 +1580,133 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   }, [allKnownTickets, history, afterHoursNotesMap]);
 
   const selectedDay = selectedSession ? selectedSession.date : (selectedDate || todayStr);
+
+  // ─── HISTORICAL LEDGERS (display only) ───────────────────────────────
+  // Money In / Money Out for every day in the table come from the same data the in-day
+  // sheet uses: cashTransactions by session, and buyTickets by local day. See lib/ledgerRows.ts.
+  const [ledgerTransactions, setLedgerTransactions] = useState<CashTransaction[]>([]);
+  const [ledgerTransactionsLoaded, setLedgerTransactionsLoaded] = useState(false);
+  const [olderLedgerTickets, setOlderLedgerTickets] = useState<BuyTicket[]>([]);
+  // The 14-day ticket listener above fully covers local days from (today - 13) onward.
+  const [ledgerTicketDaysBack, setLedgerTicketDaysBack] = useState(13);
+  const [loadingEarlierLedgerTickets, setLoadingEarlierLedgerTickets] = useState(false);
+
+  const ledgerSessionIdsKey = useMemo(() => history.map(s => s.id).sort().join(','), [history]);
+
+  useEffect(() => {
+    if (!auth.currentUser || !showHistory || historyTab !== 'ledgers') return;
+    const ids = ledgerSessionIdsKey ? ledgerSessionIdsKey.split(',') : [];
+    // Until every chunk has answered, rows show "…" rather than a Money In of $0.00.
+    setLedgerTransactionsLoaded(false);
+    if (ids.length === 0) {
+      setLedgerTransactions([]);
+      setLedgerTransactionsLoaded(true);
+      return;
+    }
+    // Firestore 'in' takes at most 30 values per query.
+    const chunks: string[][] = [];
+    for (let i = 0; i < ids.length; i += 30) chunks.push(ids.slice(i, i + 30));
+    const byChunk: CashTransaction[][] = chunks.map(() => []);
+    const arrived = chunks.map(() => false);
+    const unsubs = chunks.map((chunk, index) =>
+      onSnapshot(
+        query(collection(db, 'cashTransactions'), where('sessionId', 'in', chunk)),
+        (snapshot) => {
+          byChunk[index] = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as CashTransaction[];
+          arrived[index] = true;
+          setLedgerTransactions(byChunk.flat());
+          if (arrived.every(Boolean)) setLedgerTransactionsLoaded(true);
+        },
+        (error) => console.error('Error loading ledger transactions:', error)
+      )
+    );
+    return () => {
+      unsubs.forEach(u => { try { u(); } catch (e) { console.warn('ledger unsub error', e); } });
+    };
+  }, [ledgerSessionIdsKey, showHistory, historyTab, profile]);
+
+  const ledgerTicketsLoadedFromDate = useMemo(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - ledgerTicketDaysBack);
+    return d.toLocaleDateString('en-CA');
+  }, [ledgerTicketDaysBack]);
+
+  const handleLoadEarlierLedgerTickets = async () => {
+    if (loadingEarlierLedgerTickets) return;
+    setLoadingEarlierLedgerTickets(true);
+    try {
+      const newDaysBack = ledgerTicketDaysBack + 14;
+      const from = new Date();
+      from.setHours(0, 0, 0, 0);
+      from.setDate(from.getDate() - newDaysBack);
+      const to = new Date();
+      to.setHours(0, 0, 0, 0);
+      to.setDate(to.getDate() - ledgerTicketDaysBack); // start of the first day already covered
+      const snap = await getDocs(
+        query(
+          collection(db, 'buyTickets'),
+          where('timestamp', '>=', from.toISOString()),
+          where('timestamp', '<', to.toISOString())
+        )
+      );
+      const loaded = snap.docs.map(d => ({ id: d.id, ...d.data() })) as BuyTicket[];
+      setOlderLedgerTickets(prev => [...prev, ...loaded]);
+      setLedgerTicketDaysBack(newDaysBack);
+    } catch (err: any) {
+      toastError('Load Failed', `Could not load earlier tickets: ${err.message || err}`);
+    } finally {
+      setLoadingEarlierLedgerTickets(false);
+    }
+  };
+
+  const ledgerRows = useMemo(() => {
+    const byId = new Map<string, BuyTicket>();
+    olderLedgerTickets.forEach(t => byId.set(t.id, t));
+    allKnownTickets.forEach(t => byId.set(t.id, t));
+    return buildLedgerRows({
+      sessions: history,
+      transactions: ledgerTransactions,
+      transactionsLoaded: ledgerTransactionsLoaded,
+      tickets: [...byId.values()],
+      ticketsLoadedFromDate: ledgerTicketsLoadedFromDate,
+      toLocalDate: getTicketLocalDate
+    });
+  }, [history, ledgerTransactions, ledgerTransactionsLoaded, olderLedgerTickets, allKnownTickets, ledgerTicketsLoadedFromDate, getTicketLocalDate]);
+
+  // Past days that are still open but already have a count can be closed in one click.
+  const ledgerClosableSessionIds = useMemo(() => {
+    return new Set(
+      history
+        .filter(s => s.status === 'open' && s.date !== todayStr && s.actualCash !== undefined && s.actualCash !== null)
+        .map(s => s.id)
+    );
+  }, [history, todayStr]);
+
+  const handleOpenLedgerDay = (row: LedgerRow) => {
+    const session = row.sessionId ? history.find(s => s.id === row.sessionId) : null;
+    const isHistorical = row.date !== todayStr;
+    userSelectedHistoricalRef.current = isHistorical;
+    setUserSelectedHistorical(isHistorical);
+    if (session) {
+      setSelectedDate('');
+      setSelectedSession(session);
+      setSearchParams({});
+    } else {
+      setSelectedDate(row.date);
+      setSelectedSession(null);
+      setSearchParams({ date: row.date });
+    }
+    setShowHistory(false);
+  };
+
+  const handleCloseLedgerDay = (row: LedgerRow) => {
+    const session = row.sessionId ? history.find(s => s.id === row.sessionId) : null;
+    if (!session) return;
+    if (window.confirm(`Are you sure you want to finalize and close the session for ${session.date}?`)) {
+      handleQuickCloseSession(session);
+    }
+  };
 
   const currentAfterHoursDay = useMemo(() => {
     if (selectedSession) return null; // Session exists, so not after-hours
@@ -3442,274 +3572,19 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           )}
 
           {historyTab === 'ledgers' && (
-            <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-sm animate-in fade-in duration-200 overflow-x-auto">
-              <table className="w-full text-left min-w-[820px]">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-100">
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Date</th>
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Status</th>
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Opening</th>
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Expected</th>
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Actual</th>
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Diff</th>
-                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-50">
-                  {afterHoursActivity.map(ahDay => (
-                    <tr key={`ah-${ahDay.date}`} className="bg-amber-50/40 hover:bg-amber-50/70 transition-colors border-l-4 border-l-amber-500">
-                      <td className="px-6 py-4">
-                        <div className="flex items-center gap-3">
-                          <div className="p-2 bg-amber-100 rounded-xl shrink-0 text-amber-800">
-                            <Clock className="w-4 h-4" />
-                          </div>
-                          <div className="flex flex-col">
-                            <span className="font-bold text-slate-900">{ahDay.date}</span>
-                            <span className="text-[10px] text-amber-800 font-medium">
-                              {ahDay.ticketCount} ticket{ahDay.ticketCount === 1 ? '' : 's'} · ${ahDay.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                            </span>
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4">
-                        <div className="flex flex-col gap-1">
-                          <span className="inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 w-fit">
-                            <AlertTriangle className="w-2.5 h-2.5 text-amber-600" />
-                            After-hours
-                          </span>
-                          {ahDay.hasNote && ahDay.note ? (
-                            <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-semibold bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 truncate max-w-[200px]" title={ahDay.note}>
-                              <Check className="w-3 h-3 text-emerald-600 shrink-0" />
-                              <span className="truncate">"{ahDay.note}"</span>
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-[10px] text-slate-500 font-medium bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 w-fit">
-                              <span className="w-1.5 h-1.5 rounded-full bg-slate-400 shrink-0" />
-                              needs review
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
-                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
-                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
-                      <td className="px-6 py-4 text-right text-slate-400 font-mono text-xs">—</td>
-                      <td className="px-6 py-4 text-right">
-                        <div className="flex items-center justify-end gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setSelectedDate(ahDay.date);
-                              setSelectedSession(null);
-                              const isHist = ahDay.date !== todayStr;
-                              setUserSelectedHistorical(isHist);
-                              userSelectedHistoricalRef.current = isHist;
-                              setShowHistory(false);
-                              setSearchParams({ date: ahDay.date });
-                            }}
-                            className="px-3 py-1.5 bg-slate-900 hover:bg-amber-600 text-white rounded-xl text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer shadow-xs"
-                          >
-                            Review Day
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                  {history.map(session => {
-                    // Chronologically prior session to evaluate day-to-day cash continuity
-                    const priorSession = history
-                      .filter(s => s.date < session.date)
-                      .sort((a, b) => b.date.localeCompare(a.date))[0];
-
-                    let continuity: { type: 'match' | 'diff'; tooltip: string; diffAmount?: number } | null = null;
-                    if (priorSession) {
-                      const priorClosingCash = getClosingBasis(priorSession) ?? priorSession.expectedCash;
-
-                      if (priorClosingCash !== undefined) {
-                        const diffVal = Math.round((session.openingCash - priorClosingCash) * 100) / 100;
-                        if (Math.abs(diffVal) <= 0.01) {
-                          continuity = {
-                            type: 'match',
-                            tooltip: `Carried from ${priorSession.date} close`
-                          };
-                        } else {
-                          continuity = {
-                            type: 'diff',
-                            tooltip: `Opening differs from prior day's close by $${Math.abs(diffVal).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-                            diffAmount: Math.abs(diffVal)
-                          };
-                        }
-                      }
-                    }
-
-                    const hasClosingCount = !!session.closingDenominations && Object.values(session.closingDenominations).some(v => (v || 0) > 0);
-
-                    return (
-                      <tr key={session.id} className="hover:bg-slate-50/50 transition-colors">
-                        <td className="px-6 py-4">
-                          <div className="flex items-center gap-3">
-                            <div className="p-2 bg-slate-100 rounded-xl shrink-0">
-                              <Calendar className="w-4 h-4 text-slate-500" />
-                            </div>
-                            <div className="flex flex-col">
-                              <span className="font-bold text-slate-900">{session.date}</span>
-                              <div className="flex gap-1.5 mt-1">
-                                {session.openingDenominations && (
-                                  <button
-                                    type="button"
-                                    onClick={() => setViewingDenoms({
-                                      title: `Opening Count Breakdown (${session.date})`,
-                                      denoms: session.openingDenominations!,
-                                      closedBy: session.closedBy
-                                    })}
-                                    className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
-                                  >
-                                    Opening Breakdown
-                                  </button>
-                                )}
-                                {session.closingDenominations && (
-                                  <button
-                                    type="button"
-                                    onClick={() => setViewingDenoms({
-                                      title: `Closing Count Breakdown (${session.date})`,
-                                      denoms: session.closingDenominations!,
-                                      closedBy: session.closedBy
-                                    })}
-                                    className="px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-600 rounded text-[9px] font-black uppercase tracking-wider transition-all cursor-pointer"
-                                  >
-                                    Closing Breakdown
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                        </td>
-                        <td className="px-6 py-4">
-                          <span className={cn(
-                            "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
-                            session.status === 'provisional' ? "bg-amber-100 text-amber-800 border border-amber-200" :
-                            session.status === 'open' ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-600"
-                          )}>
-                            {session.status === 'provisional' ? 'PROVISIONAL — needs count' : session.status}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            {continuity?.type === 'match' && (
-                              <span title={continuity.tooltip} className="cursor-help inline-flex items-center text-emerald-600">
-                                <Link2 className="w-3.5 h-3.5" />
-                              </span>
-                            )}
-                            {continuity?.type === 'diff' && (
-                              <span title={continuity.tooltip} className="cursor-help inline-flex items-center">
-                                <span className="w-2 h-2 rounded-full bg-amber-500 ring-2 ring-amber-200" />
-                              </span>
-                            )}
-                            <span className="font-mono font-bold text-slate-900">
-                              ${session.openingCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                            </span>
-                          </div>
-                        </td>
-                        <td className="px-6 py-4 text-right font-mono font-bold text-slate-900">
-                          ${session.expectedCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                        </td>
-                        <td className="px-6 py-4 text-right font-mono font-bold text-slate-900">
-                          {session.status === 'open' ? (
-                            hasClosingCount && session.actualCash !== undefined && session.actualCash !== null ? (
-                              `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                            ) : (
-                              <span className="text-slate-400 font-medium italic text-xs">— not counted</span>
-                            )
-                          ) : isProvisionalSession(session) ? (
-                            <div className="flex flex-col items-end">
-                              <span className="text-amber-700">
-                                ${(getClosingBasis(session) ?? session.expectedCash).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                              </span>
-                              <span className="text-[8px] font-black uppercase text-amber-600 tracking-wider font-sans">
-                                Assumed — not counted
-                              </span>
-                            </div>
-                          ) : (
-                            session.actualCash !== undefined && session.actualCash !== null ? (
-                              `$${session.actualCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                            ) : (
-                              '-'
-                            )
-                          )}
-                        </td>
-                        <td className="px-6 py-4 text-right">
-                          {session.status === 'open' ? (
-                            <span className="text-slate-400 font-medium italic text-xs">— pending count</span>
-                          ) : isProvisionalSession(session) ? (
-                            <span className="text-amber-600 font-medium italic text-xs">— pending count</span>
-                          ) : session.overShort !== undefined ? (
-                            (() => {
-                              const tCount = recentTickets.filter(t => t.timestamp && getTicketLocalDate(t.timestamp) === session.date && t.status !== 'voided' && t.status !== 'cancelled').length;
-                              const status = getShortageStatus(session.overShort, tCount);
-                              return (
-                                <div className="flex flex-col items-end">
-                                  <span className={cn("font-mono font-bold", status.textClass)}>
-                                    {session.overShort > 0 ? '+' : ''}${session.overShort.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                  </span>
-                                  {status.isTolerance && (
-                                    <span className="text-[8px] font-black uppercase text-amber-500 tracking-wider">
-                                      Rounding Tol
-                                    </span>
-                                  )}
-                                </div>
-                              );
-                            })()
-                          ) : (
-                            <span className="text-slate-400 font-bold">-</span>
-                          )}
-                        </td>
-                        <td className="px-6 py-4 text-right">
-                          <div className="flex items-center justify-end gap-2">
-                            {session.status === 'provisional' && profile?.role === 'manager' && (
-                              <button
-                                type="button"
-                                onClick={() => handleOpenFinalizeProvisional(session)}
-                                className="px-3.5 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-sm shrink-0"
-                              >
-                                Finalize Count
-                              </button>
-                            )}
-                            {session.status === 'open' && session.date !== todayStr && session.actualCash !== undefined && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (window.confirm(`Are you sure you want to finalize and close the session for ${session.date}?`)) {
-                                    handleQuickCloseSession(session);
-                                  }
-                                }}
-                                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-sm"
-                              >
-                                Close Day
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const isHistorical = session.date !== todayStr;
-                                userSelectedHistoricalRef.current = isHistorical;
-                                setUserSelectedHistorical(isHistorical);
-                                setSelectedDate('');
-                                setSelectedSession(session);
-                                setShowHistory(false);
-                                setSearchParams({});
-                              }}
-                              className="px-3.5 py-2 bg-slate-900 hover:bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
-                            >
-                              View Ledger
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+            <CashLedgerTable
+              rows={ledgerRows}
+              todayStr={todayStr}
+              ticketsLoadedFromDate={ledgerTicketsLoadedFromDate}
+              loadingEarlierTickets={loadingEarlierLedgerTickets}
+              onLoadEarlierTickets={handleLoadEarlierLedgerTickets}
+              canShowEarlierDays={history.length >= historyLimit}
+              onShowEarlierDays={() => setHistoryLimit(n => n + 30)}
+              onOpenDay={handleOpenLedgerDay}
+              closableSessionIds={ledgerClosableSessionIds}
+              onCloseDay={handleCloseLedgerDay}
+              processing={processing}
+            />
           )}
 
           {historyTab === 'audits' && (
