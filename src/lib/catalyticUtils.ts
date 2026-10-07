@@ -1,10 +1,17 @@
-import { collection, getDocs, Firestore } from 'firebase/firestore';
+import { collection, getDocs, query, where, Firestore } from 'firebase/firestore';
 import { Material, Customer, BuyTicket } from '../types';
+
+// PMR material codes that are catalytic converters. The live material is code 33
+// ("Catalytic Convertor"); 38 is the code this check was originally written for. Until
+// 2026-10-07 only 38 was matched, so the rule below never fired for any real ticket.
+const CATALYTIC_CONVERTER_CODES = new Set(['33', '38']);
 
 export const isCatalyticConverterMat = (mat: Material | null | undefined): boolean => {
   if (!mat) return false;
-  const c = String(mat.code || '').trim();
-  return c === '38' || c === '038' || parseInt(c, 10) === 38;
+  const c = String(mat.code ?? '').trim().replace(/^0+/, '');
+  if (CATALYTIC_CONVERTER_CODES.has(c)) return true;
+  // Safety net if the material is ever re-coded: match on the name as well.
+  return /catalytic\s+conver/i.test(String(mat.name || ''));
 };
 
 export interface CatalyticCheckResult {
@@ -68,8 +75,17 @@ export const checkCatalyticConverterLimit = async (
   let alreadyRecordedTodayCount = 0;
 
   try {
-    const ticketsRef = collection(db, 'buyTickets');
-    const querySnapshot = await getDocs(ticketsRef);
+    // Only TODAY's tickets are needed. This used to download the whole buyTickets collection
+    // (every ticket with its photos) before the ticket could be saved.
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todaysTickets = query(collection(db, 'buyTickets'), where('timestamp', '>=', startOfToday.toISOString()));
+    // Bounded so a slow lookup can never leave the submit button spinning. On timeout this
+    // falls into the catch below and the check continues with this ticket's own count.
+    const querySnapshot = await Promise.race([
+      getDocs(todaysTickets),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Catalytic converter lookup timed out')), 10000))
+    ]);
 
     const now = new Date();
     const todayYear = now.getFullYear();

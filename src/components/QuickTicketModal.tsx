@@ -1048,7 +1048,13 @@ export default function QuickTicketModal({
       );
 
       if (!catalyticCheck.allowed) {
-        alert(catalyticCheck.errorMessage);
+        // Quick Ticket has no Business Name field, so say where to enter it.
+        const needsBusinessName = !bName.trim() && /business name/i.test(catalyticCheck.errorMessage || '');
+        alert(
+          needsBusinessName
+            ? `${catalyticCheck.errorMessage}\n\nAdd the business name on this customer's profile (Customers), or write this ticket on the full Buy Ticket screen.`
+            : catalyticCheck.errorMessage
+        );
         setQtProcessing(false);
         return;
       }
