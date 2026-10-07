@@ -55,6 +55,7 @@ import { checkCatalyticConverterLimit } from '../lib/catalyticUtils';
 import { calculateMaterialLineItem, isTonMaterial, formatUnitPrice } from '../lib/scrapPricing';
 import { Hint } from './Hint';
 import { trackOfflineWrite } from '../hooks/useNetworkStatus';
+import { TicketOutboxEntry, saveOutboxEntry, fireTicketWrites, finishTicket } from '../lib/ticketOutbox';
 import { PricingUnitBadge } from './PricingUnitBadge';
 import USBBarcodeScannerModal from './USBBarcodeScannerModal';
 import { useQuickTicket } from '../context/QuickTicketContext';
@@ -1050,10 +1051,10 @@ export default function QuickTicketModal({
       }
 
       let customerId = qtCustomer?.id;
-      let newCustomerDocPromise: Promise<void> | null = null;
+      let newCustomerData: Record<string, any> | null = null;
       if (isQtNewCustomer && !customerId) {
         customerId = doc(collection(db, 'customers')).id;
-        const newCustomerData = {
+        newCustomerData = {
           ...qtNewCustomer,
           photoUrl: qtCustomerPhotoUrl || '',
           idImageUrl: qtIdImageUrl || '',
@@ -1061,8 +1062,6 @@ export default function QuickTicketModal({
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         };
-        newCustomerDocPromise = setDoc(doc(db, 'customers', customerId), newCustomerData);
-        trackOfflineWrite(newCustomerDocPromise);
       }
 
       if (!customerId) throw new Error('Customer ID missing');
@@ -1127,13 +1126,64 @@ export default function QuickTicketModal({
 
       // 1. Locally generated ticket ID
       const ticketId = generateTicketId('BUY');
-      const docRef = doc(db, 'buyTickets', ticketId);
-
-      // 2. Write the ticket document with setDoc — do NOT await this for the purposes of printing. Fire it, keep the promise.
-      const ticketPromise = setDoc(docRef, ticketData);
-      trackOfflineWrite(ticketPromise);
-
       const customerName = qtCustomer?.name || qtNewCustomer.name || 'Walk-in Customer';
+
+      // Customer profile update with photos, ID, and vehicle info (sent after the ticket is confirmed)
+      const customerUpdate: any = {};
+      if (qtCustomerPhotoUrl) customerUpdate.photoUrl = qtCustomerPhotoUrl;
+      if (qtIdImageUrl) {
+        customerUpdate.idImageUrl = qtIdImageUrl;
+        customerUpdate.idImageUpdatedAt = ticketData.timestamp;
+      }
+      if (qtVehiclePlate) customerUpdate.vehiclePlate = qtVehiclePlate;
+      if (qtVehicleType) customerUpdate.vehicleType = qtVehicleType;
+      if (qtVehiclePhotoUrl) customerUpdate.vehiclePhotoUrl = qtVehiclePhotoUrl;
+
+      if (qtCustomer) {
+        customerUpdate.phone = qtCustomer.phone || '';
+        customerUpdate.secondaryPhone = qtCustomer.secondaryPhone || '';
+        customerUpdate.email = qtCustomer.email || '';
+        customerUpdate.address = qtCustomer.address || '';
+        customerUpdate.businessName = qtCustomer.businessName || '';
+        customerUpdate.idType = qtCustomer.idType || '';
+        customerUpdate.idNumber = qtCustomer.idNumber || '';
+        customerUpdate.idExpiration = qtCustomer.idExpiration || '';
+        if (qtCustomer.idImageUpdatedAt && !customerUpdate.idImageUpdatedAt) {
+          customerUpdate.idImageUpdatedAt = qtCustomer.idImageUpdatedAt;
+        }
+      }
+
+      // 2. Durable safety copy FIRST (its own small local database, independent of Firestore),
+      //    then fire the ticket write. Nothing below waits on the network: the receipt prints
+      //    straight away and the rest is finished ("backfilled") in the background. If this page
+      //    is refreshed or dies before the server has the ticket, the copy is re-sent on the
+      //    next load with the same ticket id and the original timestamp. See lib/ticketOutbox.ts.
+      const outboxEntry: TicketOutboxEntry = {
+        ticketId,
+        savedAt: new Date().toISOString(),
+        ticketData,
+        customerId,
+        customerName,
+        newCustomerData,
+        customerUpdate,
+        inventory: ticketMaterials.map((m) => ({ materialId: m.materialId, netWeight: m.netWeight })),
+        overrides: qtItems
+          .filter((i) => i.material && i.overridePrice !== undefined && i.overridePrice !== i.material.buyPrice)
+          .map((i) => ({ materialName: i.material!.name, before: i.material!.buyPrice, after: i.overridePrice as number })),
+        draftId: activeDraftId || null,
+        auditNote: `Quick Ticket created for ${customerName}`,
+        ticketConfirmed: false,
+        issued: { customerUpdate: false, inventory: false, audit: false, draft: false },
+        attempts: 0
+      };
+      const safetyCopyStored = await saveOutboxEntry(outboxEntry);
+      if (!safetyCopyStored) {
+        console.warn('Ticket safety copy could not be stored; continuing with the normal save.');
+      }
+      const ticketWrites = fireTicketWrites(outboxEntry);
+      trackOfflineWrite(ticketWrites.ticketPromise);
+      if (ticketWrites.newCustomerPromise) trackOfflineWrite(ticketWrites.newCustomerPromise);
+      if (activeDraftId) setActiveDraftId(null);
 
       // 3. Immediately set the printedTicket snapshot, set success state, and if autoPrint is enabled, call printTicket right away. The receipt renders from local state only — no fetches.
       const ticketSnapshot = {
@@ -1198,145 +1248,34 @@ export default function QuickTicketModal({
         }
       }
 
-      // 4. THEN await the remaining writes, each wrapped in its own try/catch so one failure does not abort the others
-      let hadOfflineSyncPending = typeof navigator !== 'undefined' && !navigator.onLine;
-
-      // Ticket document write
-      try {
-        await ticketPromise;
-      } catch (ticketErr) {
-        console.warn('Ticket write queued locally:', ticketErr);
-        hadOfflineSyncPending = true;
-      }
-
-      // New customer creation write
-      if (newCustomerDocPromise) {
-        try {
-          await newCustomerDocPromise;
-        } catch (custErr) {
-          console.warn('New customer doc write queued locally:', custErr);
-          hadOfflineSyncPending = true;
-        }
-      }
-
-      // Customer profile update with photos, ID, and vehicle info
-      const customerUpdate: any = {};
-      if (qtCustomerPhotoUrl) customerUpdate.photoUrl = qtCustomerPhotoUrl;
-      if (qtIdImageUrl) {
-        customerUpdate.idImageUrl = qtIdImageUrl;
-        customerUpdate.idImageUpdatedAt = ticketData.timestamp;
-      }
-      if (qtVehiclePlate) customerUpdate.vehiclePlate = qtVehiclePlate;
-      if (qtVehicleType) customerUpdate.vehicleType = qtVehicleType;
-      if (qtVehiclePhotoUrl) customerUpdate.vehiclePhotoUrl = qtVehiclePhotoUrl;
-
-      if (qtCustomer) {
-        customerUpdate.phone = qtCustomer.phone || '';
-        customerUpdate.secondaryPhone = qtCustomer.secondaryPhone || '';
-        customerUpdate.email = qtCustomer.email || '';
-        customerUpdate.address = qtCustomer.address || '';
-        customerUpdate.businessName = qtCustomer.businessName || '';
-        customerUpdate.idType = qtCustomer.idType || '';
-        customerUpdate.idNumber = qtCustomer.idNumber || '';
-        customerUpdate.idExpiration = qtCustomer.idExpiration || '';
-        if (qtCustomer.idImageUpdatedAt && !customerUpdate.idImageUpdatedAt) {
-          customerUpdate.idImageUpdatedAt = qtCustomer.idImageUpdatedAt;
-        }
-      }
-
-      if (Object.keys(customerUpdate).length > 0) {
-        try {
-          const custUpdatePromise = updateDoc(doc(db, 'customers', customerId), {
-            ...customerUpdate,
-            updatedAt: new Date().toISOString()
-          });
-          trackOfflineWrite(custUpdatePromise);
-          await custUpdatePromise;
-        } catch (custUpdateErr) {
-          console.warn('Customer update write queued locally:', custUpdateErr);
-          hadOfflineSyncPending = true;
-        }
-      }
-
-      // Atomic inventory increments with merge: true — no prior read required
-      for (const item of ticketMaterials) {
-        try {
-          const invRef = doc(db, 'inventory', item.materialId);
-          const invPromise = setDoc(
-            invRef,
-            {
-              materialId: item.materialId,
-              currentWeight: increment(item.netWeight),
-              lastUpdated: new Date().toISOString()
-            },
-            { merge: true }
-          );
-          trackOfflineWrite(invPromise);
-          await invPromise;
-        } catch (invErr) {
-          console.warn(`Inventory increment for ${item.materialId} queued locally:`, invErr);
-          hadOfflineSyncPending = true;
-        }
-      }
-
-      // Audit logs
-      try {
-        const auditPromise = logAuditEvent(
-          'buyTicket',
-          ticketId,
-          'create',
-          { after: ticketData },
-          `Quick Ticket created for ${customerName}`
-        );
-        trackOfflineWrite(auditPromise);
-        await auditPromise;
-      } catch (auditErr) {
-        console.warn('Audit log write queued locally:', auditErr);
-      }
-
-      // Override audit logs
-      for (const item of qtItems) {
-        if (item.material && item.overridePrice !== undefined && item.overridePrice !== item.material.buyPrice) {
-          try {
-            const overridePromise = logAuditEvent(
-              'buyTicket',
-              ticketId,
-              'override',
-              {
-                before: { price: item.material.buyPrice },
-                after: { price: item.overridePrice }
-              },
-              `Price override approved for ${item.material.name} in Quick Ticket #${ticketId.toUpperCase()}: $${item.material.buyPrice.toFixed(2)}/lb to $${item.overridePrice.toFixed(2)}/lb`
-            );
-            trackOfflineWrite(overridePromise);
-            await overridePromise;
-          } catch (overrideErr) {
-            console.warn('Override audit log queued locally:', overrideErr);
-          }
-        }
-      }
-
-      // Clean draft
-      if (activeDraftId) {
-        try {
-          const draftDeletePromise = deleteDoc(doc(db, 'ticketDrafts', activeDraftId));
-          trackOfflineWrite(draftDeletePromise);
-          await draftDeletePromise;
-          setActiveDraftId(null);
-        } catch (draftErr) {
-          console.warn('Draft cleanup queued locally:', draftErr);
-        }
-      }
-
-      // 5. If any write is still pending because the device is offline, show a non-blocking amber toast: "Saved on this device — will sync when back online." Do not show an error.
-      if (hadOfflineSyncPending || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+      // 4. Finish in the BACKGROUND -- the screen is released as soon as the receipt has printed.
+      //    finishTicket() waits for the server to confirm the ticket, then issues the customer
+      //    update, inventory increments, audit entries and draft cleanup.
+      const wasOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+      if (wasOffline) {
         toastWarning('Offline Mode', 'Saved on this device — will sync when back online.');
-      } else {
-        firestore(
-          'Quick Ticket Finalized',
-          `Ohio Buy Ticket #${ticketId.toUpperCase()} committed for ${customerName}. Total: $${calculatedFinalTotal.toFixed(2)}`
-        );
       }
+      void finishTicket(outboxEntry, ticketWrites).then((result) => {
+        if (!result.ok) {
+          // The server REJECTED the ticket. Never report this as "will sync".
+          toastError(
+            'TICKET NOT SAVED',
+            `Ticket #${ticketId.toUpperCase()} for ${customerName} ($${calculatedFinalTotal.toFixed(2)}) was rejected by the server: ${result.error}. Keep the printed receipt and tell a manager — it is held on this device and will be retried.`
+          );
+          return;
+        }
+        if (result.followUpFailed) {
+          toastWarning('Ticket Saved', `Ticket #${ticketId.toUpperCase()} is saved, but a customer/inventory update did not go through. Tell a manager.`);
+        } else if (!wasOffline) {
+          firestore(
+            'Quick Ticket Finalized',
+            `Ohio Buy Ticket #${ticketId.toUpperCase()} committed for ${customerName}. Total: $${calculatedFinalTotal.toFixed(2)}`
+          );
+        }
+      }).catch((bgErr) => {
+        console.error('Background ticket finish failed:', bgErr);
+        toastError('Ticket Save Problem', `Ticket #${ticketId.toUpperCase()} is held on this device and will be retried. Tell a manager if this repeats.`);
+      });
     } catch (err: any) {
       console.error('Error saving Quick Ticket:', err);
       setQtVerificationStatus('failed');

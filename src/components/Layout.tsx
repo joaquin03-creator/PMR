@@ -26,6 +26,8 @@ import {
 import { useState, useEffect } from 'react';
 import { cn } from '../lib/utils';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
+import { useToast } from '../context/ToastContext';
+import { replayTicketOutbox } from '../lib/ticketOutbox';
 import { useSettings } from '../context/SettingsContext';
 import { useQuickTicket } from '../context/QuickTicketContext';
 import { COMPANY_NAME, handleImageError } from '../constants';
@@ -50,6 +52,40 @@ export default function Layout({ user, profile }: LayoutProps) {
   const stationName = typeof window !== 'undefined' ? (localStorage.getItem('pm_connected_laptop_id') || localStorage.getItem('pmr_hardware_id') || '') : '';
   const [searchOpen, setSearchOpen] = useState(false);
   const [problemReportOpen, setProblemReportOpen] = useState(false);
+  const { firestore: toastSaved, error: toastError } = useToast();
+
+  // Re-send any completed ticket that never reached the server (page refreshed or died
+  // mid-save). Runs once after login and again whenever the device comes back online.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    const run = () => {
+      replayTicketOutbox()
+        .then(({ recovered, failed }) => {
+          if (cancelled) return;
+          if (recovered.length > 0) {
+            toastSaved(
+              'Ticket Recovered',
+              `${recovered.length === 1 ? 'A ticket that had not finished saving was' : `${recovered.length} tickets that had not finished saving were`} sent to the server: ${recovered.map((id) => '#' + id.toUpperCase()).join(', ')}`
+            );
+          }
+          if (failed.length > 0) {
+            toastError(
+              'TICKET NOT SAVED',
+              `${failed.map((f) => '#' + f.ticketId.toUpperCase()).join(', ')} could not be saved to the server (${failed[0].error}). It is still held on this device — tell a manager.`
+            );
+          }
+        })
+        .catch((e) => console.warn('Ticket outbox replay failed:', e));
+    };
+    const timer = setTimeout(run, 4000);
+    window.addEventListener('online', run);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      window.removeEventListener('online', run);
+    };
+  }, [user?.uid]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
