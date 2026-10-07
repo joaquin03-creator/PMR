@@ -59,7 +59,21 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
   const [materials, setMaterials] = useState<Material[]>([]);
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
+  // Search runs when it is SUBMITTED (Enter or the Search button), not on every keystroke:
+  // `searchInput` is what is typed, `searchTerm` is the query actually applied to the list.
+  const [searchInput, setSearchInput] = useState('');
+  const [searchTerm, setSearchTermApplied] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
+  const setSearchTerm = (value: string) => {
+    setSearchInput(value);
+    setSearchTermApplied(value.trim());
+  };
+  const submitSearch = (value: string) => {
+    setIsSearching(true);
+    setSearchTermApplied(value.trim());
+    // The filter itself is instant; hold the "Searching…" state briefly so the submit is visible.
+    window.setTimeout(() => setIsSearching(false), 350);
+  };
   const [selectedTicket, setSelectedTicket] = useState<BuyTicket | null>(null);
   const [showPrintPreview, setShowPrintPreview] = useState(false);
   const [printFormat, setPrintFormat] = useState<'letter' | 'thermal'>('letter');
@@ -177,6 +191,12 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     }).length;
   }, [buyTickets, todayLocalDateString]);
 
+  const materialSearchIndex = useMemo(() => {
+    const index = new Map<string, { name: string; code: string }>();
+    materials.forEach(m => index.set(m.id, { name: (m.name || '').toLowerCase(), code: String(m.code ?? '').trim().toLowerCase() }));
+    return index;
+  }, [materials]);
+
   const sortedAndFilteredTickets = useMemo(() => {
     const filtered = buyTickets.filter(ticket => {
       if (dateFilter === 'today') {
@@ -185,12 +205,20 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
         if (ticketLocalDate !== todayLocalDateString) return false;
       }
 
+      const search = searchTerm.toLowerCase();
+      if (!search) return true;
+
       const customer = customers.find(c => c.id === ticket.customerId);
       const customerName = customer?.name.toLowerCase() || '';
       const ticketId = ticket.id.toLowerCase();
-      const search = searchTerm.toLowerCase();
-      
-      return customerName.includes(search) || ticketId.includes(search);
+      if (customerName.includes(search) || ticketId.includes(search)) return true;
+
+      // Materials: a ticket's line items store only a materialId, so match the typed text
+      // against that material's NAME (contains) or CODE (exact) from the materials list.
+      return (ticket.materials || []).some(line => {
+        const mat = materialSearchIndex.get(line.materialId);
+        return !!mat && (mat.name.includes(search) || mat.code === search);
+      });
     });
 
     return [...filtered].sort((a, b) => {
@@ -222,7 +250,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       if (aValue > bValue) return sortConfig.direction === 'asc' ? 1 : -1;
       return 0;
     });
-  }, [buyTickets, customers, searchTerm, sortConfig]);
+  }, [buyTickets, customers, searchTerm, sortConfig, dateFilter, todayLocalDateString, materialSearchIndex]);
 
   const handleSort = (key: string) => {
     setSortConfig(prev => ({
@@ -545,18 +573,56 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
         <>
       {/* Search and Filter Bar */}
       <div className="flex flex-col md:flex-row items-stretch md:items-center gap-4">
-        <div className="relative group flex-1">
-          <label htmlFor="ticket-search" className="sr-only">Search by customer name or ticket ID</label>
-          <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 group-focus-within:text-blue-500 transition-colors" aria-hidden="true" />
-          <input
-            id="ticket-search"
-            type="text"
-            placeholder="Search by customer name or ticket ID..."
-            className="w-full pl-14 pr-6 py-4 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-medium shadow-sm transition-all text-lg"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-          />
-        </div>
+        <form
+          className="flex-1 space-y-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submitSearch(searchInput);
+          }}
+        >
+          <div className="flex items-stretch gap-2">
+            <div className="relative group flex-1">
+              <label htmlFor="ticket-search" className="sr-only">Search by customer name, ticket ID, or material, then press Enter</label>
+              <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 group-focus-within:text-blue-500 transition-colors" aria-hidden="true" />
+              <input
+                id="ticket-search"
+                type="text"
+                placeholder="Customer, ticket ID, or material — press Enter"
+                className="w-full pl-14 pr-6 py-4 bg-white border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-medium shadow-sm transition-all text-lg"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={isSearching}
+              className="px-6 bg-slate-900 hover:bg-blue-600 text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all flex items-center gap-2 shadow-sm disabled:opacity-70 cursor-pointer"
+            >
+              {isSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+              {isSearching ? 'Searching…' : 'Search'}
+            </button>
+            {(searchTerm || searchInput) && (
+              <button
+                type="button"
+                onClick={() => setSearchTerm('')}
+                className="px-4 bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 rounded-2xl font-black text-xs uppercase tracking-widest transition-all cursor-pointer"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <p className="text-xs font-semibold text-slate-500 pl-1 min-h-[1rem]" aria-live="polite">
+            {isSearching
+              ? 'Searching…'
+              : searchInput.trim() !== searchTerm
+                ? 'Press Enter or click Search to run this search.'
+                : searchTerm
+                  ? (sortedAndFilteredTickets.length === 0
+                      ? `No tickets matched "${searchTerm}".`
+                      : `${sortedAndFilteredTickets.length} ticket${sortedAndFilteredTickets.length === 1 ? '' : 's'} matched "${searchTerm}".`)
+                  : ''}
+          </p>
+        </form>
 
         {/* Date Filter Pills */}
         <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800 p-1.5 rounded-2xl shrink-0 self-start md:self-auto">
@@ -762,8 +828,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                       <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto">
                         <Search className="w-8 h-8 text-slate-200" />
                       </div>
-                      <p className="text-slate-900 font-bold">No tickets found</p>
-                      <p className="text-sm text-slate-500">Try adjusting your search term or filters.</p>
+                      <p className="text-slate-900 font-bold">
+                        {searchTerm ? `Nothing matched "${searchTerm}"` : 'No tickets found'}
+                      </p>
+                      <p className="text-sm text-slate-500">
+                        {searchTerm
+                          ? `The search ran across ${dateFilter === 'today' ? "today's tickets" : `all ${buyTickets.length} tickets`} by customer name, ticket ID, and material name or code — none matched.`
+                          : 'Try adjusting your filters.'}
+                      </p>
                     </div>
                   </td>
                 </tr>

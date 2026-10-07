@@ -300,7 +300,12 @@ export default function SpotlightSearch({ isOpen, onClose, profile }: SpotlightS
           t.id.toLowerCase().includes(queryStr) ||
           custName.toLowerCase().includes(queryStr) ||
           t.vehiclePlate?.toLowerCase().includes(queryStr) ||
-          t.paymentMethod?.toLowerCase().includes(queryStr)
+          t.paymentMethod?.toLowerCase().includes(queryStr) ||
+          // Line items store only a materialId: match the material's name (contains) or code (exact).
+          (t.materials || []).some(line => {
+            const mat = materials.find(m => m.id === line.materialId);
+            return !!mat && ((mat.name || '').toLowerCase().includes(queryStr) || String(mat.code ?? '').trim().toLowerCase() === queryStr);
+          })
         );
       })
       .slice(0, 10)

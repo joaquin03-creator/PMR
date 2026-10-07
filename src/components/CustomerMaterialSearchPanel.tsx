@@ -59,13 +59,14 @@ export default function CustomerMaterialSearchPanel({
     return selectedCategory ? materials.filter(m => m.category === selectedCategory).map(m => m.id) : [];
   }, [matchBy, selectedMaterialId, selectedCategory, materials]);
 
-  const hasValidSearch = materialIds.length > 0 && typeof minWeightLbs === 'number' && minWeightLbs > 0;
+  // A blank weight means "any amount" -- picking a material alone is a valid search.
+  const hasValidSearch = materialIds.length > 0 && (minWeightLbs === '' || (typeof minWeightLbs === 'number' && minWeightLbs >= 0));
 
   const results: CustomerSearchResult[] = useMemo(() => {
     if (!hasValidSearch) return [];
     const criteria: CustomerSearchCriteria = {
       materialIds,
-      minWeightLbs: minWeightLbs as number,
+      minWeightLbs: typeof minWeightLbs === 'number' ? minWeightLbs : 0,
       quantityMode,
       dateFrom: dateFrom || undefined,
       dateTo: dateTo || undefined,
@@ -260,7 +261,7 @@ export default function CustomerMaterialSearchPanel({
       {!hasValidSearch ? (
         <div className="text-center py-16 text-slate-400">
           <Search className="w-10 h-10 mx-auto mb-3 opacity-40" />
-          <p className="text-sm font-bold uppercase tracking-wider">Pick a material and a weight to search</p>
+          <p className="text-sm font-bold uppercase tracking-wider">Pick a material to search (weight is optional)</p>
         </div>
       ) : (
         <section className="space-y-4" aria-label="Search results">
