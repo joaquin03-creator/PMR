@@ -29,6 +29,7 @@ import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { useToast } from '../context/ToastContext';
 import { replayTicketOutbox } from '../lib/ticketOutbox';
 import { useSaveWatchdog } from '../hooks/useSaveWatchdog';
+import { getLocalOffsetFromEasternMinutes } from '../lib/utils';
 import { useSettings } from '../context/SettingsContext';
 import { useQuickTicket } from '../context/QuickTicketContext';
 import { COMPANY_NAME, handleImageError } from '../constants';
@@ -55,6 +56,9 @@ export default function Layout({ user, profile }: LayoutProps) {
   const [problemReportOpen, setProblemReportOpen] = useState(false);
   const { firestore: toastSaved, error: toastError } = useToast();
   const savesStalled = useSaveWatchdog(!!user);
+  // Informational only: ticket ids and photo timestamps already use Eastern time regardless.
+  const [clockOffsetMinutes] = useState(() => getLocalOffsetFromEasternMinutes());
+  const [clockNoticeDismissed, setClockNoticeDismissed] = useState(false);
 
   // Re-send any completed ticket that never reached the server (page refreshed or died
   // mid-save). Runs once after login and again whenever the device comes back online.
@@ -372,6 +376,20 @@ export default function Layout({ user, profile }: LayoutProps) {
           settings.theme === 'dark' && "bg-slate-950"
         )}>
           <div className="max-w-7xl mx-auto">
+            {clockOffsetMinutes !== 0 && !clockNoticeDismissed && (
+              <div role="status" className="mb-4 px-4 py-3 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl flex items-center justify-between gap-3 print:hidden">
+                <p className="text-xs font-semibold leading-relaxed">
+                  This computer's clock is set {Math.abs(clockOffsetMinutes) >= 60 ? `${Math.round(Math.abs(clockOffsetMinutes) / 60)} hour${Math.round(Math.abs(clockOffsetMinutes) / 60) === 1 ? '' : 's'}` : `${Math.abs(clockOffsetMinutes)} minutes`} {clockOffsetMinutes < 0 ? 'behind' : 'ahead of'} Eastern time. Tickets and photo timestamps are still recorded in Eastern time, but dates shown on this computer can be off near midnight. Set the Windows time zone to Eastern when convenient.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setClockNoticeDismissed(true)}
+                  className="px-3 py-1.5 bg-white text-amber-800 border border-amber-300 rounded-xl text-[10px] font-black uppercase tracking-widest shrink-0 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
             {savesStalled && (
               <div role="alert" className="mb-4 p-4 bg-red-600 text-white rounded-2xl shadow-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3 print:hidden">
                 <div>

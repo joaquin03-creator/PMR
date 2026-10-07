@@ -196,6 +196,11 @@ export function fireTicketWrites(entry: TicketOutboxEntry): TicketWrites {
     ? setDoc(doc(db, 'customers', entry.customerId), entry.newCustomerData)
     : null;
   const ticketPromise = setDoc(doc(db, 'buyTickets', entry.ticketId), entry.ticketData);
+  // The ticket is complete: remove its autosave draft right away. Safe even if this page
+  // dies now -- the ticket itself is held in the outbox -- and deleting twice is harmless.
+  if (entry.draftId) {
+    deleteDoc(doc(db, 'ticketDrafts', entry.draftId)).catch((e) => console.warn('[TicketOutbox] Draft cleanup failed:', e));
+  }
   // Never leave these as unhandled rejections; finishTicket() reports the outcome.
   ticketPromise.catch(() => {});
   newCustomerPromise?.catch(() => {});

@@ -394,6 +394,12 @@ export default function QuickTicketModal({
     resetQuickTicket(false);
   };
 
+  // A completed ticket must not be waiting when Quick Ticket is opened again: once the
+  // modal is closed after a finished ticket, clear it so the next open starts a new one.
+  useEffect(() => {
+    if (!isOpen && qtSuccess) resetQuickTicket(false);
+  }, [isOpen]);
+
   // Real-time Firestore Subscriptions
   useEffect(() => {
     if (!isOpen) return;
@@ -1189,7 +1195,9 @@ export default function QuickTicketModal({
         draftId: activeDraftId || null,
         auditNote: `Quick Ticket created for ${customerName}`,
         ticketConfirmed: false,
-        issued: { customerUpdate: false, inventory: false, audit: false, draft: false },
+        // The draft is deleted immediately with the ticket write (see fireTicketWrites), so the
+        // next Quick Ticket never offers to "resume" a ticket that was already completed.
+        issued: { customerUpdate: false, inventory: false, audit: false, draft: true },
         attempts: 0
       };
       const safetyCopyStored = await saveOutboxEntry(outboxEntry);

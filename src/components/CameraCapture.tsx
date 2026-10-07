@@ -1,3 +1,4 @@
+import { getEasternDateParts } from '../lib/utils';
 import React, { useState, useRef } from 'react';
 import { Camera, RefreshCw, X, Video, Loader2 } from 'lucide-react';
 import { PHOTO_PLACEHOLDER_URL } from '../constants';
@@ -16,14 +17,15 @@ const stampImage = (base64OrDataUrl: string): Promise<string> => {
       ctx.drawImage(img, 0, 0);
 
       // Format: mm/dd/yyyy hh:mm AM/PM
-      const now = new Date();
-      const mm = String(now.getMonth() + 1).padStart(2, '0');
-      const dd = String(now.getDate()).padStart(2, '0');
-      const yyyy = now.getFullYear();
-      let hours = now.getHours();
+      // Always Eastern time (the yard is in Ohio), whatever this computer's clock zone is set to.
+      const eastern = getEasternDateParts(new Date());
+      const mm = eastern.month;
+      const dd = eastern.day;
+      const yyyy = eastern.year;
+      let hours = Number(eastern.hours);
       const ampm = hours >= 12 ? 'PM' : 'AM';
       hours = hours % 12 || 12;
-      const mins = String(now.getMinutes()).padStart(2, '0');
+      const mins = eastern.minutes;
       const stamp = `${mm}/${dd}/${yyyy} ${hours}:${mins} ${ampm}`;
 
       // Scale font to image size, minimum 16px
