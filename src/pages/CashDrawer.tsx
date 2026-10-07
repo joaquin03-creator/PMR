@@ -377,6 +377,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const [selectedSession, setSelectedSession] = useState<CashSession | null>(null);
   const [userSelectedHistorical, setUserSelectedHistorical] = useState(false);
   const userSelectedHistoricalRef = useRef(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const appliedDateParamRef = useRef<string | null>(null);
 
   useEffect(() => {
     userSelectedHistoricalRef.current = userSelectedHistorical;
@@ -1283,16 +1285,6 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           setActiveSession(sess);
           setSelectedSession(prev => {
             const willKeepPrev = userSelectedHistoricalRef.current || (prev && prev.date !== todayStr);
-            const decision = willKeepPrev ? 'keep prev' : (!prev || prev.id === sess.id || prev.date === todayStr ? 'set sess' : 'keep prev');
-            console.log('[CASHDBG] today snapshot fired (non-empty)', {
-              incomingId: sess.id,
-              incomingDate: sess.date,
-              userSelectedHistoricalRef: userSelectedHistoricalRef.current,
-              prevId: prev?.id,
-              prevDate: prev?.date,
-              decision,
-              resultId: decision === 'set sess' ? sess.id : prev?.id
-            });
             // Guard against overwriting any deliberate historical session selection
             if (willKeepPrev) {
               return prev;
@@ -1306,12 +1298,6 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           setActiveSession(null);
           setSelectedSession(prev => {
             const willKeepPrev = userSelectedHistoricalRef.current || (prev && prev.date !== todayStr);
-            console.log('[CASHDBG] today snapshot fired (empty)', {
-              userSelectedHistoricalRef: userSelectedHistoricalRef.current,
-              prevId: prev?.id,
-              prevDate: prev?.date,
-              decision: willKeepPrev ? 'keep prev' : (!prev || prev.date === todayStr ? 'set null' : 'keep prev')
-            });
             // Guard against resetting any deliberate historical session selection
             if (willKeepPrev) {
               return prev;
@@ -1333,6 +1319,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       (snapshot) => {
         const loadedHistory = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as CashSession[];
         setHistory(loadedHistory);
+        setHistoryLoaded(true);
         pruneDraftStorage(loadedHistory, activeSession?.id);
       }
     );
@@ -1357,25 +1344,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       if (userSelectedHistorical || selectedSession.date !== todayStr) {
         // User deliberately selected a historical session: only re-sync from history array, never reassign to activeSession/today
         const updated = history.find(s => s.id === selectedSession.id);
-        console.log('[CASHDBG] sync effect ran (historical branch)', {
-          userSelectedHistorical,
-          selectedSessionId: selectedSession.id,
-          selectedSessionDate: selectedSession.date,
-          foundUpdated: !!updated,
-          updatedId: updated?.id,
-          updatedDate: updated?.date
-        });
         if (updated && JSON.stringify(updated) !== JSON.stringify(selectedSession)) {
           setSelectedSession(updated);
         }
       } else {
-        console.log('[CASHDBG] sync effect ran (today branch)', {
-          userSelectedHistorical,
-          selectedSessionId: selectedSession.id,
-          selectedSessionDate: selectedSession.date,
-          activeSessionId: activeSession?.id,
-          activeSessionDate: activeSession?.date
-        });
         if (activeSession && selectedSession.id === activeSession.id) {
           if (JSON.stringify(selectedSession) !== JSON.stringify(activeSession)) {
             setSelectedSession(activeSession);
@@ -1425,23 +1397,24 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     return () => unsubAfterHours();
   }, [profile]);
 
-  // Listen to searchParams 'date' query parameter
+  // Apply the 'date' query parameter ONCE per distinct value (after history has loaded, so
+  // the session lookup works). It used to re-apply on every cashSessions snapshot, which
+  // yanked the view back to the URL's date whenever another day was selected.
   useEffect(() => {
     const paramDate = searchParams.get('date');
-    if (paramDate) {
-      setSelectedDate(paramDate);
-      const existingSession = history.find(s => s.date === paramDate);
-      if (existingSession) {
-        setSelectedSession(existingSession);
-      } else {
-        setSelectedSession(null);
-      }
-      const isHist = paramDate !== todayStr;
-      setUserSelectedHistorical(isHist);
-      userSelectedHistoricalRef.current = isHist;
-      setShowHistory(false);
+    if (!paramDate) {
+      appliedDateParamRef.current = null;
+      return;
     }
-  }, [searchParams, history, todayStr]);
+    if (appliedDateParamRef.current === paramDate || !historyLoaded) return;
+    appliedDateParamRef.current = paramDate;
+    setSelectedDate(paramDate);
+    setSelectedSession(history.find(s => s.date === paramDate) || null);
+    const isHist = paramDate !== todayStr;
+    setUserSelectedHistorical(isHist);
+    userSelectedHistoricalRef.current = isHist;
+    setShowHistory(false);
+  }, [searchParams, history, historyLoaded, todayStr]);
 
   // Subscribe to historical Buy Tickets for the last 14 days to identify missing days
   useEffect(() => {
@@ -3090,14 +3063,6 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     );
   }
 
-  console.log('[CASHDBG] render', {
-    selectedSessionId: selectedSession?.id,
-    selectedSessionDate: selectedSession?.date,
-    activeSessionId: activeSession?.id,
-    activeSessionDate: activeSession?.date,
-    userSelectedHistorical,
-    userSelectedHistoricalRef: userSelectedHistoricalRef.current
-  });
 
   return (
     <main className="space-y-8 pb-20">
@@ -3130,7 +3095,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 setShowHistory(false);
                 userSelectedHistoricalRef.current = false;
                 setUserSelectedHistorical(false);
+                setSelectedDate('');
                 setSelectedSession(activeSession);
+                setSearchParams({});
               } else {
                 setShowHistory(true);
               }
@@ -3724,16 +3691,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                               type="button"
                               onClick={() => {
                                 const isHistorical = session.date !== todayStr;
-                                console.log('[CASHDBG] View Ledger clicked', {
-                                  sessionId: session.id,
-                                  sessionDate: session.date,
-                                  isHistorical,
-                                  todayStr
-                                });
                                 userSelectedHistoricalRef.current = isHistorical;
                                 setUserSelectedHistorical(isHistorical);
+                                setSelectedDate('');
                                 setSelectedSession(session);
                                 setShowHistory(false);
+                                setSearchParams({});
                               }}
                               className="px-3.5 py-2 bg-slate-900 hover:bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer"
                             >
@@ -3861,8 +3824,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   onClick={() => {
                     userSelectedHistoricalRef.current = false;
                     setUserSelectedHistorical(false);
+                    setSelectedDate('');
                     setSelectedSession(activeSession);
                     setShowHistory(false);
+                    setSearchParams({});
                   }}
                   className="px-5 py-2.5 bg-white text-slate-900 hover:bg-slate-100 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 shadow-lg shrink-0 cursor-pointer"
                 >
