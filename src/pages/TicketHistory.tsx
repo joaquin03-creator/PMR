@@ -50,7 +50,7 @@ logAuditEvent } from '../lib/audit';
 import {
 isTonMaterial, formatUnitPrice, formatRateBreakdown } from '../lib/scrapPricing';
 import CustomerMaterialSearchPanel from '../components/CustomerMaterialSearchPanel';
-import { getCatalyticFollowUp, CATALYTIC_FOLLOW_UP_LABELS } from '../lib/catalyticUtils';
+import { getCatalyticFollowUp, getCatalyticDailyLimitTicketIds, CATALYTIC_FOLLOW_UP_LABELS } from '../lib/catalyticUtils';
 import { updateTicketPaymentMethod } from '../lib/ticketPaymentMethod';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
@@ -197,6 +197,9 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     materials.forEach(m => index.set(m.id, { name: (m.name || '').toLowerCase(), code: String(m.code ?? '').trim().toLowerCase() }));
     return index;
   }, [materials]);
+
+  // Tickets that put a seller past one catalytic converter in a day (flag only, never blocked).
+  const catalyticDailyLimitTicketIds = useMemo(() => getCatalyticDailyLimitTicketIds(buyTickets, materials), [buyTickets, materials]);
 
   const sortedAndFilteredTickets = useMemo(() => {
     const filtered = buyTickets.filter(ticket => {
@@ -796,6 +799,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                           <p className="text-sm font-black text-slate-900 uppercase tracking-tight">
                             {new Date(ticket.timestamp).toLocaleDateString()}
                           </p>
+                          {catalyticDailyLimitTicketIds.has(ticket.id) && (
+                            <span
+                              className="px-1.5 py-0.5 bg-red-100 text-red-800 text-[8px] font-black uppercase rounded tracking-widest border border-red-300"
+                              title="This seller has more than one catalytic converter on tickets for this day (limit: one per person per day)."
+                            >
+                              Daily limit
+                            </span>
+                          )}
                           {getCatalyticFollowUp(ticket, materials).length > 0 && (
                             <span
                               className="px-1.5 py-0.5 bg-amber-100 text-amber-800 text-[8px] font-black uppercase rounded tracking-widest border border-amber-300"
@@ -950,6 +961,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
             </div>
 
             <div className="p-8 space-y-8">
+              {catalyticDailyLimitTicketIds.has(selectedTicket.id) && (
+                <div className="p-5 bg-red-50 border border-red-200 rounded-2xl" role="status">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-red-800">Catalytic converter — daily limit</p>
+                  <p className="text-sm font-semibold text-red-900 mt-1">
+                    This seller has more than one catalytic converter on tickets for this day (limit: one per person per day). The ticket was completed and flagged for manager review.
+                  </p>
+                </div>
+              )}
               {(() => {
                 const missing = getCatalyticFollowUp(selectedTicket, materials);
                 if (missing.length === 0) return null;

@@ -1061,13 +1061,10 @@ export default function QuickTicketModal({
         customers
       );
 
-      if (!catalyticCheck.allowed) {
-        alert(catalyticCheck.errorMessage);
-        setQtProcessing(false);
-        return;
-      }
-      // Missing catalytic-converter details never block the ticket; they are flagged for follow-up.
+      // Nothing in the catalytic-converter check blocks the ticket: missing details and the
+      // one-per-day limit are both reported after submit and flagged for follow-up.
       const catalyticMissing = catalyticCheck.missingItems || [];
+      const catalyticDailyLimitNotice = catalyticCheck.dailyLimitExceeded ? catalyticCheck.errorMessage || '' : '';
 
       let customerId = qtCustomer?.id;
       let newCustomerData: Record<string, any> | null = null;
@@ -1271,6 +1268,9 @@ export default function QuickTicketModal({
       //    finishTicket() waits for the server to confirm the ticket, then issues the customer
       //    update, inventory increments, audit entries and draft cleanup.
       const wasOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+      if (catalyticDailyLimitNotice) {
+        toastWarning('Catalytic Converter Daily Limit', `Ticket #${ticketId.toUpperCase()}: ${catalyticDailyLimitNotice}`, 15000);
+      }
       if (catalyticMissing.length > 0) {
         toastWarning(
           'Follow-Up Needed',

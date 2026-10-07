@@ -3,7 +3,7 @@ import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'rec
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, query, where, limit, setDoc, orderBy, deleteDoc, getDocs } from 'firebase/firestore';
 import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, InventoryItem, UserProfile, DailySnapshot, PricingSnapshot, SystemConfig, ComplianceSubmission, CashSession, AfterHoursNote } from '../types';
-import { getCatalyticFollowUp } from '../lib/catalyticUtils';
+import { getCatalyticFollowUp, getCatalyticDailyLimitTicketIds } from '../lib/catalyticUtils';
 import { getAfterHoursActivity } from '../lib/afterHoursDetection';
 import { checkTicketOhioReadiness } from '../lib/ohioSchemaLock';
 import { 
@@ -1791,6 +1791,25 @@ export default function Dashboard({ profile }: DashboardProps) {
             severity: 'amber',
             title: `${needingFollowUp.length} catalytic converter ticket${needingFollowUp.length === 1 ? '' : 's'} need follow-up`,
             description: 'Missing business name or seller ID number. Open a ticket to add it.',
+            actionText: 'Review',
+            actionHref: '/ticket-history?search=catalytic',
+            canDismiss: true
+          });
+        }
+      }
+    }
+
+    // Card 5c: tickets past the one-catalytic-converter-per-person-per-day limit (flag only).
+    {
+      const overLimit = getCatalyticDailyLimitTicketIds(buyTickets, materials);
+      if (overLimit.size > 0) {
+        const cardId = `catalytic_daily_limit_${[...overLimit].sort().join('_')}`;
+        if (complianceDismissals[cardId] !== todayLocalDateString) {
+          cards.push({
+            id: cardId,
+            severity: 'amber',
+            title: `${overLimit.size} ticket${overLimit.size === 1 ? '' : 's'} over the catalytic converter daily limit`,
+            description: 'A seller has more than one converter on tickets for the same day. Review in Ticket History.',
             actionText: 'Review',
             actionHref: '/ticket-history?search=catalytic',
             canDismiss: true

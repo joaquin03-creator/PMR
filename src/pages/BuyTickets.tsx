@@ -926,10 +926,9 @@ export default function BuyTickets({ profile }: BuyTicketsProps) {
         customers
       );
 
-      if (!catalyticCheck.allowed) {
-        alert(catalyticCheck.errorMessage);
-        setProcessing(false);
-        return;
+      // The catalytic-converter check never blocks; it only informs and flags.
+      if (catalyticCheck.dailyLimitExceeded) {
+        toastError('Catalytic Converter Daily Limit', catalyticCheck.errorMessage || '', 15000);
       }
 
       let customerId = selectedCustomer?.id;

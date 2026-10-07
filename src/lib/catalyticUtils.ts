@@ -23,9 +23,12 @@ export const CATALYTIC_FOLLOW_UP_LABELS: Record<CatalyticFollowUpItem, string> =
 };
 
 export interface CatalyticCheckResult {
-  /** False ONLY when the one-per-person-per-day limit would be exceeded. */
+  /** Always true since 2026-10-07: nothing in this check blocks a ticket any more. Kept for callers. */
   allowed: boolean;
+  /** Set with dailyLimitExceeded: the notice to show the operator. */
   errorMessage?: string;
+  /** True when this ticket takes the seller past one catalytic converter for the day. */
+  dailyLimitExceeded?: boolean;
   /** Items to add afterwards. The ticket still completes; it is flagged until they are filled in. */
   missingItems?: CatalyticFollowUpItem[];
 }
@@ -147,12 +150,49 @@ export const checkCatalyticConverterLimit = async (
   // Total converters today if this ticket completes:
   const totalToday = alreadyRecordedTodayCount + code38CountCurrent;
 
+  // One-per-person-per-day: FLAGGED, never blocking (owner decision 2026-10-07). The ticket
+  // completes and prints; the screen tells the operator and the ticket is marked for review.
   if (totalToday > 1) {
     return {
-      allowed: false,
-      errorMessage: "Ohio law (ORC 4737.04(F)(5)) allows only one catalytic converter per person per day. This seller's limit for today has been reached."
+      allowed: true,
+      missingItems,
+      dailyLimitExceeded: true,
+      errorMessage: "This seller already has a catalytic converter on a ticket today (limit: one per person per day). The ticket was completed and is flagged for manager review."
     };
   }
 
   return { allowed: true, missingItems };
+};
+
+/**
+ * Ids of saved tickets that put a seller past ONE catalytic converter in a local day.
+ * Derived across the tickets passed in (nothing extra is stored). Within a seller's day the
+ * first converter is fine; every converter line after it marks its ticket.
+ */
+export const getCatalyticDailyLimitTicketIds = (
+  tickets: { id: string; timestamp?: string; status?: string; customerId?: string; idNumber?: string; materials?: { materialId: string }[] }[],
+  allMaterials: Material[]
+): Set<string> => {
+  const flagged = new Set<string>();
+  const runningCount = new Map<string, number>();
+  const converterTickets = tickets
+    .filter(t => t.status !== 'voided' && t.status !== 'cancelled' && t.timestamp)
+    .map(t => ({
+      ticket: t,
+      converters: (t.materials || []).filter(m => isCatalyticConverterMat(allMaterials.find(mat => mat.id === m.materialId))).length
+    }))
+    .filter(x => x.converters > 0)
+    .sort((a, b) => String(a.ticket.timestamp).localeCompare(String(b.ticket.timestamp)));
+
+  for (const { ticket, converters } of converterTickets) {
+    const day = new Date(ticket.timestamp as string).toLocaleDateString('en-CA');
+    const idNum = (ticket.idNumber || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    // Same seller = same ID number when there is one, otherwise the same customer record.
+    const seller = idNum ? `id:${idNum}` : `cust:${ticket.customerId || ticket.id}`;
+    const key = `${day}|${seller}`;
+    const before = runningCount.get(key) || 0;
+    if (before + converters > 1) flagged.add(ticket.id);
+    runningCount.set(key, before + converters);
+  }
+  return flagged;
 };

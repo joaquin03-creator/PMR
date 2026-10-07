@@ -727,10 +727,9 @@ export default function BuyTicketModal({ isOpen, onClose, profile, resumeDraftId
         customers
       );
 
-      if (!catalyticCheck.allowed) {
-        alert(catalyticCheck.errorMessage);
-        setQtProcessing(false);
-        return;
+      // The catalytic-converter check never blocks; it only informs and flags.
+      if (catalyticCheck.dailyLimitExceeded) {
+        showToastWarning('Catalytic Converter Daily Limit', catalyticCheck.errorMessage || '', 15000);
       }
 
       let customerId = selectedCustomer?.id;
