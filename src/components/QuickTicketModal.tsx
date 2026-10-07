@@ -51,7 +51,7 @@ import SignaturePad from './SignaturePad';
 import { printTicket } from '../lib/printTicket';
 import { BuyTicketPrint } from './BuyTicketPrint';
 import { logAuditEvent } from '../lib/audit';
-import { checkCatalyticConverterLimit } from '../lib/catalyticUtils';
+import { checkCatalyticConverterLimit, isCatalyticConverterMat, CATALYTIC_FOLLOW_UP_LABELS } from '../lib/catalyticUtils';
 import { calculateMaterialLineItem, isTonMaterial, formatUnitPrice } from '../lib/scrapPricing';
 import { Hint } from './Hint';
 import { trackOfflineWrite } from '../hooks/useNetworkStatus';
@@ -988,6 +988,20 @@ export default function QuickTicketModal({
     setTimeout(() => setUsbScanFeedback(null), 5000);
   };
 
+  // Business name lives on the customer being used for this ticket (new or existing).
+  const qtBusinessName = isQtNewCustomer ? qtNewCustomer.businessName || '' : qtCustomer?.businessName || '';
+  const setQtBusinessName = (value: string) => {
+    if (isQtNewCustomer) setQtNewCustomer({ ...qtNewCustomer, businessName: value });
+    else if (qtCustomer) setQtCustomer({ ...qtCustomer, businessName: value });
+  };
+  const qtHasCatalyticConverter = qtItems.some((i) => isCatalyticConverterMat(i.material));
+  const qtCatalyticMissingLabels: string[] = qtHasCatalyticConverter
+    ? [
+        ...(!qtBusinessName.trim() ? [CATALYTIC_FOLLOW_UP_LABELS.business_name] : []),
+        ...(!(isQtNewCustomer ? qtNewCustomer.idNumber : qtCustomer?.idNumber)?.trim() ? [CATALYTIC_FOLLOW_UP_LABELS.seller_id_number] : [])
+      ]
+    : [];
+
   // Submission handler
   const handleQuickTicketSubmit = async () => {
     // Compliance Hard Block Validations
@@ -1048,16 +1062,12 @@ export default function QuickTicketModal({
       );
 
       if (!catalyticCheck.allowed) {
-        // Quick Ticket has no Business Name field, so say where to enter it.
-        const needsBusinessName = !bName.trim() && /business name/i.test(catalyticCheck.errorMessage || '');
-        alert(
-          needsBusinessName
-            ? `${catalyticCheck.errorMessage}\n\nAdd the business name on this customer's profile (Customers), or write this ticket on the full Buy Ticket screen.`
-            : catalyticCheck.errorMessage
-        );
+        alert(catalyticCheck.errorMessage);
         setQtProcessing(false);
         return;
       }
+      // Missing catalytic-converter details never block the ticket; they are flagged for follow-up.
+      const catalyticMissing = catalyticCheck.missingItems || [];
 
       let customerId = qtCustomer?.id;
       let newCustomerData: Record<string, any> | null = null;
@@ -1261,6 +1271,12 @@ export default function QuickTicketModal({
       //    finishTicket() waits for the server to confirm the ticket, then issues the customer
       //    update, inventory increments, audit entries and draft cleanup.
       const wasOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+      if (catalyticMissing.length > 0) {
+        toastWarning(
+          'Follow-Up Needed',
+          `Ticket #${ticketId.toUpperCase()} has a catalytic converter and is missing: ${catalyticMissing.map((m) => CATALYTIC_FOLLOW_UP_LABELS[m]).join(', ')}. It is flagged in Ticket History until this is added.`
+        );
+      }
       if (wasOffline) {
         toastWarning('Offline Mode', 'Saved on this device — will sync when back online.');
       }
@@ -2119,6 +2135,31 @@ export default function QuickTicketModal({
                       </div>
                     </div>
                   )}
+
+                  {/* Business name: optional, but expected when the ticket has a catalytic converter */}
+                  {(qtCustomer || isQtNewCustomer) && (
+                    <div className={cn(
+                      'p-5 rounded-2xl border space-y-2',
+                      qtHasCatalyticConverter && !qtBusinessName.trim() ? 'bg-amber-50 border-amber-300' : 'bg-slate-50 border-slate-200'
+                    )}>
+                      <label htmlFor="qt-business-name" className="text-xs font-black text-slate-400 uppercase tracking-widest">
+                        Business Name {qtHasCatalyticConverter ? '(needed for catalytic converters)' : '(optional)'}
+                      </label>
+                      <input
+                        id="qt-business-name"
+                        type="text"
+                        className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-500 outline-none font-medium"
+                        placeholder="Business the seller represents, if any"
+                        value={qtBusinessName}
+                        onChange={(e) => setQtBusinessName(e.target.value)}
+                      />
+                      {qtHasCatalyticConverter && !qtBusinessName.trim() && (
+                        <p className="text-xs font-semibold text-amber-800">
+                          This ticket has a catalytic converter. You can continue without a business name; the ticket will be flagged so it can be added afterwards.
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -2453,6 +2494,15 @@ export default function QuickTicketModal({
                       Customer: <span className="text-slate-900 font-black">{qtCustomer?.name || qtNewCustomer.name || 'Walk-in'}</span>
                     </span>
                   </div>
+
+                  {qtCatalyticMissingLabels.length > 0 && (
+                    <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl text-xs text-amber-900" role="status">
+                      <p className="font-black uppercase tracking-wider text-[10px]">Catalytic converter — follow-up needed</p>
+                      <p className="font-semibold mt-1">
+                        Missing: {qtCatalyticMissingLabels.join(', ')}. You can finish and print this ticket; it stays flagged in Ticket History until this is added.
+                      </p>
+                    </div>
+                  )}
 
                   {idCheckResult?.prohibited && (
                     <div className="p-4 bg-red-50 border-2 border-red-500 rounded-2xl flex items-center gap-3 text-red-900 font-bold text-xs">

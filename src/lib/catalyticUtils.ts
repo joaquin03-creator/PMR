@@ -14,10 +14,39 @@ export const isCatalyticConverterMat = (mat: Material | null | undefined): boole
   return /catalytic\s+conver/i.test(String(mat.name || ''));
 };
 
+/** Information a catalytic-converter ticket should carry. Missing items never block the ticket. */
+export type CatalyticFollowUpItem = 'business_name' | 'seller_id_number';
+
+export const CATALYTIC_FOLLOW_UP_LABELS: Record<CatalyticFollowUpItem, string> = {
+  business_name: 'Business name',
+  seller_id_number: "Seller's ID number"
+};
+
 export interface CatalyticCheckResult {
+  /** False ONLY when the one-per-person-per-day limit would be exceeded. */
   allowed: boolean;
   errorMessage?: string;
+  /** Items to add afterwards. The ticket still completes; it is flagged until they are filled in. */
+  missingItems?: CatalyticFollowUpItem[];
 }
+
+/**
+ * What a saved ticket is still missing for its catalytic converter line(s).
+ * Derived from the ticket itself (nothing extra is stored), so it also covers tickets
+ * written before this check existed and clears as soon as the information is added.
+ */
+export const getCatalyticFollowUp = (
+  ticket: { materials?: { materialId: string }[]; businessName?: string; idNumber?: string; status?: string } | null | undefined,
+  allMaterials: Material[]
+): CatalyticFollowUpItem[] => {
+  if (!ticket || ticket.status === 'voided' || ticket.status === 'cancelled') return [];
+  const hasConverter = (ticket.materials || []).some(m => isCatalyticConverterMat(allMaterials.find(mat => mat.id === m.materialId)));
+  if (!hasConverter) return [];
+  const missing: CatalyticFollowUpItem[] = [];
+  if (!(ticket.businessName || '').trim()) missing.push('business_name');
+  if (!(ticket.idNumber || '').trim()) missing.push('seller_id_number');
+  return missing;
+};
 
 export const checkCatalyticConverterLimit = async (
   items: { material?: Material | null; materialId: string }[],
@@ -38,22 +67,13 @@ export const checkCatalyticConverterLimit = async (
     return { allowed: true };
   }
 
-  // 2. Business Name check (Required ONLY when ticket has code 38)
-  if (!businessName || !businessName.trim()) {
-    return {
-      allowed: false,
-      errorMessage: "Business Name is required for transactions containing catalytic converters (material code 38) under Ohio law (ORC 4737.04(F)(5))."
-    };
-  }
-
-  // 3. Fail Safe: Personal ID Number check
+  // 2 + 3. Business name and seller ID number: FLAGGED, never blocking (owner decision
+  // 2026-10-07). The ticket completes and prints; the missing items are shown on the ticket
+  // and the Dashboard until they are added afterwards.
+  const missingItems: CatalyticFollowUpItem[] = [];
+  if (!businessName || !businessName.trim()) missingItems.push('business_name');
   const cleanSellerId = (sellerIdNumber || '').trim();
-  if (!cleanSellerId) {
-    return {
-      allowed: false,
-      errorMessage: "An ID number is required to record a catalytic converter under Ohio law. Please enter the seller's personal ID number."
-    };
-  }
+  if (!cleanSellerId) missingItems.push('seller_id_number');
 
   // 4. Query today's tickets for this seller matched by personal ID number
   const normalizedSellerId = cleanSellerId.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
@@ -66,7 +86,7 @@ export const checkCatalyticConverterLimit = async (
   if (allCustomers && allCustomers.length > 0) {
     allCustomers.forEach(c => {
       const cIdNum = (c.idNumber || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-      if (cIdNum && cIdNum === normalizedSellerId) {
+      if (cIdNum && normalizedSellerId && cIdNum === normalizedSellerId) {
         matchingCustomerIds.add(c.id);
       }
     });
@@ -134,5 +154,5 @@ export const checkCatalyticConverterLimit = async (
     };
   }
 
-  return { allowed: true };
+  return { allowed: true, missingItems };
 };

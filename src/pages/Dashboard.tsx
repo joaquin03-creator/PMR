@@ -3,6 +3,7 @@ import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'rec
 import { auth, db } from '../firebase';
 import { collection, onSnapshot, addDoc, doc, getDoc, getDocFromCache, updateDoc, increment, query, where, limit, setDoc, orderBy, deleteDoc, getDocs } from 'firebase/firestore';
 import { Material, Customer, BuyTicket, BuyTicketMaterial, DoNotBuyEntry, InventoryItem, UserProfile, DailySnapshot, PricingSnapshot, SystemConfig, ComplianceSubmission, CashSession, AfterHoursNote } from '../types';
+import { getCatalyticFollowUp } from '../lib/catalyticUtils';
 import { getAfterHoursActivity } from '../lib/afterHoursDetection';
 import { checkTicketOhioReadiness } from '../lib/ohioSchemaLock';
 import { 
@@ -1776,6 +1777,25 @@ export default function Dashboard({ profile }: DashboardProps) {
           actionHref: `/cash-drawer?date=${firstDay.date}`,
           canDismiss: true
         });
+      }
+    }
+
+    // Card 5b: Catalytic converter tickets still missing details (informational, never blocking).
+    {
+      const needingFollowUp = buyTickets.filter(t => getCatalyticFollowUp(t, materials).length > 0);
+      if (needingFollowUp.length > 0) {
+        const cardId = `catalytic_followup_${needingFollowUp.length}`;
+        if (complianceDismissals[cardId] !== todayLocalDateString) {
+          cards.push({
+            id: cardId,
+            severity: 'amber',
+            title: `${needingFollowUp.length} catalytic converter ticket${needingFollowUp.length === 1 ? '' : 's'} need follow-up`,
+            description: 'Missing business name or seller ID number. Open a ticket to add it.',
+            actionText: 'Review',
+            actionHref: '/ticket-history?search=catalytic',
+            canDismiss: true
+          });
+        }
       }
     }
 

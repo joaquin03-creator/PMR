@@ -50,6 +50,7 @@ logAuditEvent } from '../lib/audit';
 import {
 isTonMaterial, formatUnitPrice, formatRateBreakdown } from '../lib/scrapPricing';
 import CustomerMaterialSearchPanel from '../components/CustomerMaterialSearchPanel';
+import { getCatalyticFollowUp, CATALYTIC_FOLLOW_UP_LABELS } from '../lib/catalyticUtils';
 import { updateTicketPaymentMethod } from '../lib/ticketPaymentMethod';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
@@ -370,6 +371,64 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       console.error('Error updating payment method:', error);
       setNotification({ type: 'error', message: 'Failed to update payment method. Please check permissions.' });
       handleFirestoreError(error, OperationType.UPDATE, 'buyTickets');
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  // ─── Catalytic converter follow-up (add missing details AFTER the ticket was completed) ───
+  const [followUpBusinessName, setFollowUpBusinessName] = useState('');
+  const [followUpIdNumber, setFollowUpIdNumber] = useState('');
+  useEffect(() => {
+    setFollowUpBusinessName('');
+    setFollowUpIdNumber('');
+  }, [selectedTicket?.id]);
+
+  const handleSaveCatalyticFollowUp = async (ticket: BuyTicket) => {
+    if (!profile || profile.role !== 'manager') return;
+    const businessName = followUpBusinessName.trim();
+    const idNumber = followUpIdNumber.trim();
+    const changes: Record<string, string> = {};
+    if (businessName && !(ticket.businessName || '').trim()) changes.businessName = businessName;
+    if (idNumber && !(ticket.idNumber || '').trim()) changes.idNumber = idNumber;
+    if (Object.keys(changes).length === 0) return;
+
+    setProcessing(true);
+    try {
+      await updateDoc(doc(db, 'buyTickets', ticket.id), changes);
+      await logAuditEvent(
+        'buyTicket',
+        ticket.id,
+        'update',
+        {
+          before: { businessName: ticket.businessName || null, idNumber: ticket.idNumber || null },
+          after: { businessName: changes.businessName ?? ticket.businessName ?? null, idNumber: changes.idNumber ?? ticket.idNumber ?? null }
+        },
+        `Catalytic converter follow-up added after the ticket was completed: ${Object.keys(changes).map(k => k === 'businessName' ? 'business name' : 'seller ID number').join(' and ')}.`
+      );
+
+      // Keep the customer profile in step, but only fill blanks -- never overwrite what is there.
+      const customer = customers.find(c => c.id === ticket.customerId);
+      if (customer) {
+        const customerChanges: Record<string, string> = {};
+        if (changes.businessName && !(customer.businessName || '').trim()) customerChanges.businessName = changes.businessName;
+        if (changes.idNumber && !(customer.idNumber || '').trim()) customerChanges.idNumber = changes.idNumber;
+        if (Object.keys(customerChanges).length > 0) {
+          try {
+            await updateDoc(doc(db, 'customers', customer.id), { ...customerChanges, updatedAt: new Date().toISOString() });
+          } catch (custErr) {
+            console.warn('Ticket updated, but the customer profile could not be updated:', custErr);
+          }
+        }
+      }
+
+      setSelectedTicket(prev => (prev && prev.id === ticket.id ? { ...prev, ...changes } : prev));
+      setFollowUpBusinessName('');
+      setFollowUpIdNumber('');
+      setNotification({ type: 'success', message: 'Follow-up information saved to the ticket.' });
+    } catch (error) {
+      console.error('Error saving catalytic follow-up:', error);
+      setNotification({ type: 'error', message: 'Could not save the follow-up information. Please check permissions.' });
     } finally {
       setProcessing(false);
     }
@@ -737,6 +796,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                           <p className="text-sm font-black text-slate-900 uppercase tracking-tight">
                             {new Date(ticket.timestamp).toLocaleDateString()}
                           </p>
+                          {getCatalyticFollowUp(ticket, materials).length > 0 && (
+                            <span
+                              className="px-1.5 py-0.5 bg-amber-100 text-amber-800 text-[8px] font-black uppercase rounded tracking-widest border border-amber-300"
+                              title={`Catalytic converter ticket missing: ${getCatalyticFollowUp(ticket, materials).map(m => CATALYTIC_FOLLOW_UP_LABELS[m]).join(', ')}`}
+                            >
+                              Follow-up
+                            </span>
+                          )}
                           {(ticket as any).archivedAt && (
                             <span className="px-1.5 py-0.5 bg-amber-100 text-amber-700 text-[8px] font-black uppercase rounded tracking-widest border border-amber-200">
                               Archived
@@ -883,6 +950,55 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
             </div>
 
             <div className="p-8 space-y-8">
+              {(() => {
+                const missing = getCatalyticFollowUp(selectedTicket, materials);
+                if (missing.length === 0) return null;
+                const isManager = profile?.role === 'manager';
+                return (
+                  <div className="p-5 bg-amber-50 border border-amber-300 rounded-2xl space-y-3" role="status">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-widest text-amber-800">Catalytic converter — follow-up needed</p>
+                      <p className="text-sm font-semibold text-amber-900 mt-1">
+                        This ticket is missing: {missing.map(m => CATALYTIC_FOLLOW_UP_LABELS[m]).join(', ')}.
+                      </p>
+                    </div>
+                    {isManager ? (
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        {missing.includes('business_name') && (
+                          <input
+                            type="text"
+                            aria-label="Business name"
+                            placeholder="Business name"
+                            value={followUpBusinessName}
+                            onChange={(e) => setFollowUpBusinessName(e.target.value)}
+                            className="flex-1 px-3 py-2 bg-white border border-amber-300 rounded-xl text-sm font-medium outline-none focus:ring-2 focus:ring-amber-500"
+                          />
+                        )}
+                        {missing.includes('seller_id_number') && (
+                          <input
+                            type="text"
+                            aria-label="Seller ID number"
+                            placeholder="Seller ID number"
+                            value={followUpIdNumber}
+                            onChange={(e) => setFollowUpIdNumber(e.target.value)}
+                            className="flex-1 px-3 py-2 bg-white border border-amber-300 rounded-xl text-sm font-medium outline-none focus:ring-2 focus:ring-amber-500"
+                          />
+                        )}
+                        <button
+                          type="button"
+                          disabled={processing || (!followUpBusinessName.trim() && !followUpIdNumber.trim())}
+                          onClick={() => handleSaveCatalyticFollowUp(selectedTicket)}
+                          className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest disabled:opacity-50 cursor-pointer shrink-0"
+                        >
+                          {processing ? 'Saving…' : 'Save'}
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="text-xs font-semibold text-amber-800">A manager can add this information here.</p>
+                    )}
+                  </div>
+                );
+              })()}
               {(selectedTicket.status === 'voided' || selectedTicket.status === 'cancelled') && (
                 <div className="p-4 bg-red-50 border border-red-100 rounded-2xl flex items-center gap-3">
                   <Ban className="w-5 h-5 text-red-600" />
