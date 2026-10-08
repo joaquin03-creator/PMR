@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { useSettings } from '../context/SettingsContext';
-import { collection, onSnapshot, addDoc, doc, getDoc, updateDoc, increment, setDoc, query, orderBy, writeBatch } from 'firebase/firestore';
+import { collection, onSnapshot, addDoc, doc, updateDoc, setDoc, query, orderBy, writeBatch } from 'firebase/firestore';
 import { Material, TripTicket, TripTicketMaterial, Invoice, UserProfile } from '../types';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
@@ -176,24 +176,16 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
     setProcessing(true);
     try {
       const batch = writeBatch(db);
-      
+
       // Update ticket status
+      // Trip Ticket is paperwork only and does not move inventory, so
+      // voiding it does not touch inventory either.
       batch.update(doc(db, 'tripTickets', ticket.id), { status: 'voided' });
-      
-      // Reverse inventory (Add back)
-      for (const item of ticket.materials) {
-        const invRef = doc(db, 'inventory', item.materialId);
-        batch.set(invRef, {
-          materialId: item.materialId,
-          currentWeight: increment(item.weight),
-          lastUpdated: new Date().toISOString()
-        }, { merge: true });
-      }
-      
+
       await batch.commit();
       setSelectedTicket(null);
       setConfirmAction(null);
-      setNotification({ type: 'success', message: 'Trip ticket voided. Inventory restored.' });
+      setNotification({ type: 'success', message: 'Trip ticket voided.' });
     } catch (error) {
       console.error('Error voiding ticket:', error);
       setNotification({ type: 'error', message: 'Failed to void trip ticket. Check permissions.' });
@@ -209,20 +201,9 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
     setProcessing(true);
     try {
       const batch = writeBatch(db);
-      
-      // Reverse inventory (Add back) if not already voided
-      if (ticket.status !== 'voided') {
-        for (const item of ticket.materials) {
-          const invRef = doc(db, 'inventory', item.materialId);
-          batch.set(invRef, {
-            materialId: item.materialId,
-            currentWeight: increment(item.weight),
-            lastUpdated: new Date().toISOString()
-          }, { merge: true });
-        }
-      }
-      
-      // Delete ticket
+
+      // Trip Ticket is paperwork only and does not move inventory, so
+      // deleting it does not touch inventory either.
       batch.delete(doc(db, 'tripTickets', ticket.id));
       
       await batch.commit();
@@ -322,49 +303,8 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
         handleFirestoreError(error, OperationType.CREATE, 'tripTickets');
       }
 
-      // Update Inventory (Deduct)
-      for (const item of selectedMaterials) {
-        const invRef = doc(db, 'inventory', item.materialId);
-        try {
-          const invDoc = await getDoc(invRef);
-          if (invDoc.exists()) {
-            const oldWeight = invDoc.data().currentWeight;
-            await updateDoc(invRef, {
-              currentWeight: increment(-item.weight),
-              lastUpdated: new Date().toISOString()
-            });
-
-            // Log inventory update
-            await logAuditEvent(
-              'inventory',
-              item.materialId,
-              'update',
-              {
-                before: { weight: oldWeight },
-                after: { weight: oldWeight - item.weight }
-              },
-              `Inventory deducted via Trip Ticket ${lastCreatedTicket?.id || 'new'}`
-            );
-          } else {
-            await setDoc(invRef, {
-              materialId: item.materialId,
-              currentWeight: -item.weight,
-              lastUpdated: new Date().toISOString()
-            });
-
-            // Log inventory creation (negative)
-            await logAuditEvent(
-              'inventory',
-              item.materialId,
-              'create',
-              { after: { weight: -item.weight } },
-              `Initial inventory created (negative) via Trip Ticket ${lastCreatedTicket?.id || 'new'}`
-            );
-          }
-        } catch (error) {
-          handleFirestoreError(error, OperationType.WRITE, `inventory/${item.materialId}`);
-        }
-      }
+      // Trip Ticket is paperwork (BOL) only -- it does not move inventory.
+      // The linked Invoice is the single inventory-affecting shipment event.
 
       setSuccess(true);
       setTimeout(() => {
@@ -443,9 +383,9 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                 {confirmAction.type === 'void' ? 'Void Load?' : 'Delete Load?'}
               </h3>
               <p className="text-sm text-slate-500 font-medium leading-relaxed px-4">
-                {confirmAction.type === 'void' 
-                  ? 'This will return materials to inventory but keep a historical record. This action is permanent.' 
-                  : 'CRITICAL: This will return inventory AND permanently remove the load record. This cannot be undone.'}
+                {confirmAction.type === 'void'
+                  ? 'This will mark the load void but keep a historical record. This action is permanent.'
+                  : 'CRITICAL: This will permanently remove the load record. This cannot be undone.'}
               </p>
             </div>
 
@@ -512,7 +452,7 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
               <div className="flex items-center gap-3">
                 <CheckCircle2 className="w-6 h-6 text-green-600" />
                 <div>
-                  <p className="font-bold">Trip Ticket created! Inventory deducted and load logged.</p>
+                  <p className="font-bold">Trip Ticket created! Load logged.</p>
                   <p className="text-sm opacity-75">The load has been dispatched and is now in transit.</p>
                 </div>
               </div>

@@ -2,7 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { auth, db } from '../firebase';
 import { useSettings } from '../context/SettingsContext';
 import { collection, onSnapshot, addDoc, doc, updateDoc, query, orderBy, getDoc, deleteDoc, writeBatch, increment } from 'firebase/firestore';
-import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfile, BuyTicket, LoadPlan } from '../types';
+import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfile, BuyTicket, LoadPlan, MaterialConversion, ExternalSale, ProcessingShrinkAdjustment } from '../types';
+import { ReconcileShipmentModal } from '../components/ReconcileShipmentModal';
+import { LoadEconomicsSummary } from '../components/LoadEconomicsSummary';
 import { logAuditEvent } from '../lib/audit';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
@@ -32,7 +34,8 @@ import {
   Edit2,
   Save,
   ChevronDown,
-  Package
+  Package,
+  Scale
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { safeSetItem } from '../lib/safeStorage';
@@ -365,6 +368,10 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const [paymentTerms, setPaymentTerms] = useState('Net 30');
   const [loadPlans, setLoadPlans] = useState<LoadPlan[]>([]);
   const [selectedLoadPlanId, setSelectedLoadPlanId] = useState<string>('');
+  const [conversions, setConversions] = useState<MaterialConversion[]>([]);
+  const [sales, setSales] = useState<ExternalSale[]>([]);
+  const [shrinkAdjustments, setShrinkAdjustments] = useState<ProcessingShrinkAdjustment[]>([]);
+  const [showReconcileModal, setShowReconcileModal] = useState(false);
 
   const [selectedTicket, setSelectedTicket] = useState<TripTicket | null>(null);
   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
@@ -549,6 +556,30 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       setInventoryMap(map);
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'inventory'));
 
+    const unsubConversions = onSnapshot(
+      query(collection(db, 'materialConversions'), orderBy('timestamp', 'desc')),
+      (snapshot) => {
+        setConversions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as MaterialConversion[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'materialConversions')
+    );
+
+    const unsubSales = onSnapshot(
+      query(collection(db, 'externalSales'), orderBy('date', 'desc')),
+      (snapshot) => {
+        setSales(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as ExternalSale[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'externalSales')
+    );
+
+    const unsubShrinkAdjustments = onSnapshot(
+      query(collection(db, 'processingShrinkAdjustments'), orderBy('timestamp', 'desc')),
+      (snapshot) => {
+        setShrinkAdjustments(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as ProcessingShrinkAdjustment[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'processingShrinkAdjustments')
+    );
+
     return () => {
       try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
       try { unsubTrips(); } catch (e) { console.warn('unsubTrips error', e); }
@@ -557,6 +588,9 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       try { unsubBuyTickets(); } catch (e) { console.warn('unsubBuyTickets error', e); }
       try { unsubLoadPlans(); } catch (e) { console.warn('unsubLoadPlans error', e); }
       try { unsubInventory(); } catch (e) { console.warn('unsubInventory error', e); }
+      try { unsubConversions(); } catch (e) { console.warn('unsubConversions error', e); }
+      try { unsubSales(); } catch (e) { console.warn('unsubSales error', e); }
+      try { unsubShrinkAdjustments(); } catch (e) { console.warn('unsubShrinkAdjustments error', e); }
     };
   }, [profile]);
 
@@ -2152,7 +2186,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                 )}
                 
                 {!isEditing && selectedInvoice.status !== 'paid' && (
-                  <button 
+                  <button
                     onClick={() => handleUpdateInvoiceStatus(selectedInvoice.id, 'paid')}
                     className="px-6 py-3 bg-emerald-600 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-emerald-700 transition-all flex items-center gap-2 shadow-lg shadow-emerald-200"
                   >
@@ -2160,7 +2194,17 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                     Mark as Paid
                   </button>
                 )}
-                
+
+                {!isEditing && selectedInvoice.status === 'paid' && !selectedInvoice.reconciledAt && profile?.role === 'manager' && (
+                  <button
+                    onClick={() => setShowReconcileModal(true)}
+                    className="px-6 py-3 bg-amber-600 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-amber-700 transition-all flex items-center gap-2 shadow-lg shadow-amber-200"
+                  >
+                    <Scale className="w-4 h-4" />
+                    Reconcile Shipment
+                  </button>
+                )}
+
                 {!isEditing && (
                   <button 
                     onClick={() => handleDeleteInvoice(selectedInvoice.id, selectedInvoice.tripTicketId)}
@@ -2193,6 +2237,19 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
             </div>
 
             <div className="flex-1 overflow-y-auto p-12 bg-slate-100 no-scrollbar print:p-0 print:bg-transparent">
+              {selectedInvoice.reconciledAt && (
+                <div className="max-w-[1000px] mx-auto mb-6 no-print">
+                  <LoadEconomicsSummary
+                    invoice={selectedInvoice}
+                    shrinkAdjustments={shrinkAdjustments}
+                    buyTickets={buyTickets}
+                    conversions={conversions}
+                    invoices={invoices}
+                    sales={sales}
+                    materials={materials}
+                  />
+                </div>
+              )}
               {/* Landscape Invoice Container */}
               <div id="printable-invoice" className="bg-white shadow-2xl mx-auto w-full max-w-[1000px] min-h-[650px] print:shadow-none print:max-w-none print:w-full print:m-0 font-sans text-slate-900 relative flex flex-col overflow-visible">
                 {isEditing ? (
@@ -2635,6 +2692,20 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
             </div>
           </div>
         </div>
+      )}
+
+      {showReconcileModal && selectedInvoice && (
+        <ReconcileShipmentModal
+          invoice={selectedInvoice}
+          materials={materials}
+          inventoryMap={inventoryMap}
+          profile={profile}
+          onClose={() => setShowReconcileModal(false)}
+          onReconciled={() => {
+            setSelectedInvoice({ ...selectedInvoice, reconciledAt: new Date().toISOString() });
+            setShowReconcileModal(false);
+          }}
+        />
       )}
     </div>
   );

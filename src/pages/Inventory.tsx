@@ -13,7 +13,8 @@ import {
   InventoryAdjustment,
   BuyTicket,
   Invoice,
-  ConversionLog
+  ConversionLog,
+  ProcessingShrinkAdjustment
 } from '../types';
 import { 
   Package, 
@@ -58,7 +59,9 @@ import {
   Sparkles
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import MaterialInventorySheetTab from '../components/MaterialInventorySheetTab';
 import { safeSetItem } from '../lib/safeStorage';
+import { useLocalDraftBackup, readDraft, clearDraft } from '../hooks/useLocalDraftBackup';
 import { COMPANY_NAME, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
@@ -93,8 +96,10 @@ export function getConversionDestinations(c: MaterialConversion) {
   return [];
 }
 
+const COUNT_DRAFT_KEY = 'pm_draft_physicalcount';
+
 export default function Inventory({ profile }: { profile: UserProfile | null }) {
-  const [activeTab, setActiveTab] = useState<'inventory' | 'sales' | 'planner' | 'conversions' | 'adjustments'>('inventory');
+  const [activeTab, setActiveTab] = useState<'inventory' | 'sales' | 'planner' | 'conversions' | 'adjustments' | 'sheet'>('inventory');
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [sales, setSales] = useState<ExternalSale[]>([]);
@@ -181,6 +186,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
 
   const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [shrinkAdjustments, setShrinkAdjustments] = useState<ProcessingShrinkAdjustment[]>([]);
 
   // TOOL 1 — Physical Count Mode State
   const [isCountMode, setIsCountMode] = useState(false);
@@ -189,6 +195,17 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   const [countSuccessSummary, setCountSuccessSummary] = useState<string | null>(null);
   const [focusedMaterialId, setFocusedMaterialId] = useState<string | null>(null);
   const countInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  // Crash-safety: a count session can mean walking the whole yard weighing
+  // every material before ever hitting Apply. Back it up to localStorage as
+  // entries come in so a killed/crashed tab never loses that work.
+  const [recoveredCountDraft, setRecoveredCountDraft] = useState<{ value: Record<string, string>; savedAt: string } | null>(null);
+  useEffect(() => {
+    const draft = readDraft<Record<string, string>>(COUNT_DRAFT_KEY);
+    if (draft && Object.values(draft.value).some(v => v !== undefined && v.trim() !== '')) {
+      setRecoveredCountDraft(draft);
+    }
+  }, []);
+  useLocalDraftBackup(COUNT_DRAFT_KEY, countEntries, isCountMode);
 
   // TOOL 2 — Variance Dashboard State
   const [sinceLastCountToggle, setSinceLastCountToggle] = useState<boolean>(true);
@@ -269,6 +286,14 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       (error) => handleFirestoreError(error, OperationType.LIST, 'invoices')
     );
 
+    const unsubShrinkAdjustments = onSnapshot(
+      query(collection(db, 'processingShrinkAdjustments'), orderBy('timestamp', 'desc')),
+      (snapshot) => {
+        setShrinkAdjustments(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as ProcessingShrinkAdjustment[]);
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'processingShrinkAdjustments')
+    );
+
     return () => {
       unsubMaterials();
       unsubInventory();
@@ -278,6 +303,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       unsubAdjustments();
       unsubBuyTickets();
       unsubInvoices();
+      unsubShrinkAdjustments();
     };
   }, [profile]);
 
@@ -1592,6 +1618,59 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     return varianceData.filter(v => v.absVariance >= 5);
   }, [varianceData]);
 
+  // Residual variance: what's left unexplained AFTER the most recent
+  // Processing & Shrink booking for a material, using that reconciliation's
+  // physical weight (not the last full physical count) as the baseline.
+  // This is the loss/theft/scale-error signal -- raw book-vs-expected above
+  // is the detailed view, this is the headline.
+  const residualVarianceData = useMemo(() => {
+    return materials.map(mat => {
+      const inv = inventory.find(i => i.materialId === mat.id);
+      const actual = inv?.currentWeight ?? 0;
+
+      const materialReconciliations = shrinkAdjustments
+        .flatMap(adj => adj.materialDeltas
+          .filter(d => d.materialId === mat.id)
+          .map(d => ({ timestamp: adj.timestamp, physicalWeight: d.physicalWeight })))
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      const lastReconciliation = materialReconciliations[0];
+
+      if (!lastReconciliation) {
+        return { material: mat, hasBaseline: false, residualVariance: 0, absResidualVariance: 0, since: null as string | null };
+      }
+
+      const boughtSince = buyTickets
+        .filter(t => t.status === 'completed' && ((t.timestamp || '') > lastReconciliation.timestamp))
+        .reduce((sum, t) => {
+          const lines = (t.materials || []).filter(m => m.materialId === mat.id);
+          return sum + lines.reduce((s, m) => s + (m.netWeight || 0), 0);
+        }, 0);
+
+      const soldSince = invoices
+        .filter(invDoc => invDoc.status === 'paid' && ((invDoc.inventoryDeductedAt || invDoc.date || '') > lastReconciliation.timestamp))
+        .reduce((sum, invDoc) => {
+          const lines = (invDoc.materials || []).filter(m => m.materialId === mat.id);
+          return sum + lines.reduce((s, m) => s + (m.weight || 0), 0);
+        }, 0);
+
+      const expectedSinceReconciliation = lastReconciliation.physicalWeight + boughtSince - soldSince;
+      const residualVariance = actual - expectedSinceReconciliation;
+
+      return {
+        material: mat,
+        hasBaseline: true,
+        residualVariance,
+        absResidualVariance: Math.abs(residualVariance),
+        since: lastReconciliation.timestamp
+      };
+    });
+  }, [materials, inventory, buyTickets, invoices, shrinkAdjustments]);
+
+  const flaggedResidualVariances = useMemo(
+    () => residualVarianceData.filter(v => v.hasBaseline && v.absResidualVariance >= 5),
+    [residualVarianceData]
+  );
+
   // TOOL 1 — Physical Count Mode Handlers
   const handleStartPhysicalCount = (targetMaterialId?: string) => {
     setIsCountMode(true);
@@ -1613,6 +1692,20 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     setCountEntries({});
     setShowConfirmApplyCount(false);
     setFocusedMaterialId(null);
+    clearDraft(COUNT_DRAFT_KEY);
+  };
+
+  const handleResumeCountDraft = () => {
+    if (!recoveredCountDraft) return;
+    setCountEntries(recoveredCountDraft.value);
+    setIsCountMode(true);
+    setCountSuccessSummary(null);
+    setRecoveredCountDraft(null);
+  };
+
+  const handleDiscardCountDraft = () => {
+    clearDraft(COUNT_DRAFT_KEY);
+    setRecoveredCountDraft(null);
   };
 
   const countedCount = useMemo(() => {
@@ -1681,6 +1774,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       setCountEntries({});
       setShowConfirmApplyCount(false);
       setFocusedMaterialId(null);
+      clearDraft(COUNT_DRAFT_KEY);
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, 'inventory');
     } finally {
@@ -1897,10 +1991,10 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-6">
         <div>
           <h1 className="text-4xl font-black text-slate-900 tracking-tight font-display uppercase">Inventory</h1>
-          <p className="text-slate-500 font-medium mt-1">Real-time stock tracking and truck capacity load planner.</p>
+          <p className="text-slate-500 font-medium mt-1">Real-time stock tracking and material readiness.</p>
         </div>
-        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4 shrink-0">
-          <nav className="flex bg-slate-100 p-1.5 rounded-2xl animate-fade-in" aria-label="Inventory Tabs">
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4 min-w-0">
+          <nav className="flex flex-wrap gap-y-1.5 w-full sm:w-auto bg-slate-100 p-1.5 rounded-2xl animate-fade-in" aria-label="Inventory Tabs">
             <button
               onClick={() => setActiveTab('inventory')}
               className={cn(
@@ -1912,6 +2006,16 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
               Real-time Stock
             </button>
             <button
+              onClick={() => setActiveTab('sheet')}
+              className={cn(
+                "px-5 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-2",
+                activeTab === 'sheet' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
+              )}
+            >
+              <ClipboardCheck className="w-4 h-4" />
+              Material Sheet
+            </button>
+            <button
               onClick={() => setActiveTab('adjustments')}
               className={cn(
                 "px-5 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-2",
@@ -1920,16 +2024,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
             >
               <SlidersHorizontal className="w-4 h-4" />
               Manual Adjustments
-            </button>
-            <button
-              onClick={() => setActiveTab('planner')}
-              className={cn(
-                "px-5 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-2",
-                activeTab === 'planner' ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
-              )}
-            >
-              <Truck className="w-4 h-4" />
-              Flatbed Planner
             </button>
             <button
               onClick={() => setActiveTab('sales')}
@@ -2025,6 +2119,37 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         </div>
       </header>
 
+      {/* Recovered physical count draft from a crashed/closed tab on this device */}
+      {recoveredCountDraft && !isCountMode && (
+        <div className="p-5 bg-amber-50 border border-amber-200 rounded-3xl flex items-center justify-between gap-4 text-xs text-amber-950 shadow-sm animate-in fade-in slide-in-from-top-2 duration-300 mb-6">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-amber-100 rounded-2xl text-amber-700 shrink-0">
+              <ClipboardCheck className="w-5 h-5" />
+            </div>
+            <div>
+              <h5 className="font-black uppercase tracking-wider text-amber-950">Unsaved Physical Count Found</h5>
+              <p className="font-medium text-amber-900 mt-0.5">
+                {Object.values(recoveredCountDraft.value).filter(v => v !== undefined && v.trim() !== '').length} materials counted, never applied -- from a session on this device that didn't close cleanly.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={handleDiscardCountDraft}
+              className="px-4 py-2.5 text-amber-700 hover:bg-amber-100 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer"
+            >
+              Discard
+            </button>
+            <button
+              onClick={handleResumeCountDraft}
+              className="px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer"
+            >
+              Resume Count
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Page-level success feedback banner for Physical Count */}
       {countSuccessSummary && (
         <div className="p-5 bg-emerald-50 border border-emerald-200 rounded-3xl flex items-center justify-between gap-4 text-xs text-emerald-950 shadow-sm animate-in fade-in slide-in-from-top-2 duration-300 mb-6">
@@ -2114,7 +2239,53 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
 
       {activeTab === 'inventory' && (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-300">
-          {/* TOOL 2 — Expected vs. Actual Stock Variance Dashboard */}
+          {/* Residual Variance — the headline signal: what's left unexplained
+              after the most recent Processing & Shrink booking at load-out.
+              The raw book-vs-expected table below stays available as detail. */}
+          <div className={cn(
+            "rounded-[2.5rem] p-6 sm:p-8 shadow-sm border",
+            flaggedResidualVariances.length === 0 ? "bg-emerald-50/60 border-emerald-200" : "bg-red-50/60 border-red-200"
+          )}>
+            <div className="flex items-start gap-4">
+              <div className={cn(
+                "p-3 rounded-2xl shrink-0",
+                flaggedResidualVariances.length === 0 ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
+              )}>
+                <AlertCircle className="w-6 h-6" />
+              </div>
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-xl font-black text-slate-900 uppercase tracking-tight">Residual Variance</h2>
+                  <Hint text="What's left unexplained after the most recent Processing & Shrink booking at load-out -- this is the real loss/theft/scale-error signal, not raw ticket-vs-book drift (which is expected and gets absorbed at every load-out)." />
+                </div>
+                <p className="text-xs text-slate-500 font-medium mt-0.5 mb-4">
+                  Measured since each material's last load-out reconciliation, not since the last full physical count.
+                </p>
+
+                {residualVarianceData.every(v => !v.hasBaseline) ? (
+                  <p className="text-sm font-bold text-slate-500">No load has been reconciled yet -- residual variance will appear here after the first "Reconcile Load" is booked from the Flatbed Planner tab.</p>
+                ) : flaggedResidualVariances.length === 0 ? (
+                  <p className="text-sm font-bold text-emerald-800">All reconciled materials are within ±5 lbs of expected since their last load-out. No unexplained loss detected.</p>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {flaggedResidualVariances.map(v => (
+                      <div key={v.material.id} className="bg-white rounded-2xl p-4 border border-red-200 flex items-center justify-between">
+                        <div>
+                          <p className="text-sm font-bold text-slate-900">{v.material.name}</p>
+                          <p className="text-[10px] text-slate-400 uppercase tracking-wider">Since {v.since ? new Date(v.since).toLocaleDateString() : '--'}</p>
+                        </div>
+                        <span className={cn("font-mono font-black", v.residualVariance < 0 ? "text-red-600" : "text-blue-600")}>
+                          {v.residualVariance > 0 ? '+' : ''}{Math.round(v.residualVariance).toLocaleString()} lbs
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* TOOL 2 — Expected vs. Actual Stock Variance Dashboard (raw detail, not the headline) */}
           <div className="bg-white border border-slate-200/80 rounded-[2.5rem] p-6 sm:p-8 shadow-sm space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div className="flex items-center gap-3">
@@ -2644,407 +2815,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         </div>
       )}
 
-      {activeTab === 'planner' && (
-        (() => {
-          const activePlan = loadPlans.find(lp => lp.id === selectedLoadId) || loadPlans[0];
-          const activeDrafts = loadPlans.filter(lp => lp.status === 'draft');
-
-          return (
-            <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-300">
-              {/* Draft Recovery / Resume Panel */}
-              {activeDrafts.length > 0 && (
-                <div className="bg-amber-50/80 border border-amber-200 rounded-[2rem] p-6 space-y-4 animate-in fade-in duration-300">
-                  <div className="flex items-center justify-between flex-wrap gap-4">
-                    <div className="flex items-center gap-3">
-                      <div className="p-2.5 bg-amber-100 text-amber-800 rounded-2xl">
-                        <Truck className="w-5 h-5 animate-bounce" />
-                      </div>
-                      <div>
-                        <h4 className="text-sm font-black text-slate-900 uppercase tracking-tight">Active Load Plan Drafts ({activeDrafts.length})</h4>
-                        <p className="text-[10px] font-bold text-amber-800 uppercase tracking-wider">Incomplete flatbed load drafts detected. Click to resume editing or ship out immediately.</p>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                    {activeDrafts.map((draft) => {
-                      const boxCount = draft.boxes.filter(b => b.materialId).length;
-                      return (
-                        <div key={draft.id} className="bg-white p-4 rounded-2xl border border-amber-200/60 shadow-sm flex flex-col justify-between space-y-3">
-                          <div>
-                            <div className="flex justify-between items-center">
-                              <span className="font-mono text-xs font-black text-slate-800">{draft.loadNumber}</span>
-                              <span className="text-[9px] font-black uppercase tracking-wider text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
-                                Draft
-                              </span>
-                            </div>
-                            <p className="text-[11px] text-slate-500 font-bold uppercase mt-1 truncate">Carrier: {draft.carrier || 'Unassigned'}</p>
-                            <p className="text-[10px] text-slate-400 font-mono mt-1">{boxCount} / 8 slots filled • {draft.totalWeight.toLocaleString()} lbs</p>
-                          </div>
-                          <div className="flex items-center gap-2 pt-2 border-t border-slate-50">
-                            <button
-                              onClick={() => handleOpenEditLoad(draft)}
-                              className="flex-1 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-1 active:scale-95"
-                            >
-                              <Edit2 className="w-3 h-3" /> Resume Draft
-                            </button>
-                            <button
-                              onClick={() => handleShipDraftLoad(draft)}
-                              className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-[10px] font-black uppercase tracking-wider transition-all active:scale-95"
-                              title="Ship Out"
-                            >
-                              <Truck className="w-3 h-3" />
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* Active / Selection Details or Quick Help */}
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                <div className="lg:col-span-2 bg-slate-50 border border-slate-200/60 rounded-[2.5rem] p-8 space-y-6">
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-slate-100 pb-6">
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2">
-                        <Truck className="w-5 h-5 text-blue-600" />
-                        <h2 className="text-lg font-black text-slate-900 uppercase tracking-tight">Active Load Layout</h2>
-                      </div>
-                      <p className="text-xs text-slate-400 font-bold uppercase tracking-widest leading-none">
-                        Assign Gaylord boxes to the 8 flatbed slots to maximize capacity and weight efficiency
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3 w-full sm:w-auto">
-                      {loadPlans.length > 0 && (
-                        <div className="flex items-center gap-2 bg-white px-3 py-2 border border-slate-200 rounded-xl shadow-sm">
-                          <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">View:</span>
-                          <select
-                            className="bg-transparent border-none outline-none text-xs font-bold text-slate-700 cursor-pointer pr-4"
-                            value={selectedLoadId || activePlan?.id || ''}
-                            onChange={(e) => setSelectedLoadId(e.target.value)}
-                          >
-                            {loadPlans.map(lp => (
-                              <option key={lp.id} value={lp.id}>
-                                {lp.loadNumber} - {lp.carrier || 'No Carrier'} ({lp.status.toUpperCase()})
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
-                      <button
-                        onClick={handleOpenCreateLoad}
-                        className="px-5 py-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-black uppercase tracking-widest rounded-xl transition-all active:scale-95 shrink-0 shadow-md shadow-blue-100"
-                      >
-                        Create New Load
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Truck Bed Visualizer */}
-                  <div className="bg-slate-900 rounded-[2rem] p-8 border border-slate-800 shadow-inner relative overflow-hidden">
-                    <div className="absolute top-0 right-0 p-4">
-                      <span className="text-[10px] font-mono font-black text-slate-500 uppercase tracking-widest bg-slate-950 px-3 py-1.5 rounded-full border border-slate-800">
-                        Flatbed Bed (8 slots capacity)
-                      </span>
-                    </div>
-
-                    {/* Truck Front Cabin Indicator */}
-                    <div className="flex justify-center mb-6">
-                      <div className="w-48 bg-slate-800 h-8 rounded-t-xl border-x border-t border-slate-700 flex items-center justify-center shadow-md">
-                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">▲ Front of Truck ▲</span>
-                      </div>
-                    </div>
-
-                    {/* The 8 Pallet/Box Slots Grid */}
-                    <div className="grid grid-cols-2 gap-4 max-w-2xl mx-auto">
-                      {Array.from({ length: 8 }).map((_, idx) => {
-                        const selectedLoad = editingLoad || activePlan;
-                        const box = selectedLoad?.boxes.find(b => b.slotIndex === idx);
-                        const material = box?.materialId ? materials.find(m => m.id === box.materialId) : null;
-                        const hasBox = !!material;
-
-                        return (
-                          <div 
-                            key={idx} 
-                            className={cn(
-                              "relative aspect-video rounded-2xl border-2 transition-all p-4 flex flex-col justify-between overflow-hidden shadow-sm",
-                              hasBox 
-                                ? "bg-amber-50/90 border-amber-500/50 hover:bg-amber-50" 
-                                : "bg-slate-950/40 border-dashed border-slate-800 text-slate-600"
-                            )}
-                          >
-                            {/* Pallet Slats Graphic in Background */}
-                            <div className="absolute inset-x-0 bottom-0 h-2 bg-yellow-900/10 border-t border-yellow-900/5 flex justify-around px-2">
-                              <span className="w-1 bg-yellow-900/20 h-full" />
-                              <span className="w-1 bg-yellow-900/20 h-full" />
-                              <span className="w-1 bg-yellow-900/20 h-full" />
-                              <span className="w-1 bg-yellow-900/20 h-full" />
-                            </div>
-
-                            <div className="flex justify-between items-start">
-                              <span className="text-[10px] font-mono font-black px-2 py-0.5 rounded bg-slate-950/10 text-slate-500 border border-slate-200">
-                                Slot {idx + 1}
-                              </span>
-                              {hasBox && (
-                                <span className="text-[9px] font-black uppercase tracking-widest text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-200">
-                                  4ft Gaylord
-                                </span>
-                              )}
-                            </div>
-
-                            {hasBox ? (
-                              <div className="space-y-1.5 my-2">
-                                <p className="font-mono text-xs font-black text-amber-900 tracking-tight flex items-center gap-1.5">
-                                  <span className="bg-amber-100 px-1.5 py-0.5 rounded border border-amber-200">{material.code}</span>
-                                  <span className="truncate max-w-[120px]">{material.name}</span>
-                                </p>
-                                <p className="text-xl font-black text-slate-900 tracking-tight leading-none">
-                                  {box.weight?.toLocaleString()} <span className="text-[10px] font-medium text-slate-400 uppercase">lbs</span>
-                                </p>
-                              </div>
-                            ) : (
-                              <div className="my-auto text-center py-2">
-                                <Package className="w-5 h-5 mx-auto text-slate-800 mb-1" />
-                                <p className="text-[10px] font-black uppercase tracking-widest text-slate-700">Empty Slot</p>
-                              </div>
-                            )}
-
-                            <div className="text-[9px] font-medium text-slate-400 truncate">
-                              {box?.notes ? `📝 ${box.notes}` : (hasBox ? 'Pallet: Standard Wood' : 'Available for loading')}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {/* Truck Rear Indicator */}
-                    <div className="flex justify-center mt-6">
-                      <div className="w-48 bg-slate-800 h-6 rounded-b-xl border-x border-b border-slate-700 flex items-center justify-center shadow-md">
-                        <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">▼ Rear Tailgate ▼</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Load Capacity Sidebar */}
-                <div className="bg-white border border-slate-200 rounded-[2.5rem] p-8 flex flex-col justify-between shadow-sm">
-                  <div className="space-y-6">
-                    <div className="space-y-1">
-                      <span className="text-[10px] font-black uppercase tracking-widest text-blue-600">Active Load Summary</span>
-                      {loadPlans.length > 0 ? (
-                        <div>
-                          <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">
-                            {editingLoad ? `Editing: ${editingLoad.loadNumber}` : `Latest: ${activePlan.loadNumber}`}
-                          </h3>
-                          <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-1">
-                            Driver/Carrier: {editingLoad?.carrier || activePlan.carrier || 'Unassigned'}
-                          </p>
-                        </div>
-                      ) : (
-                        <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">No Load Plans</h3>
-                      )}
-                    </div>
-
-                    {/* Flatbed Stats */}
-                    {loadPlans.length > 0 ? (
-                      (() => {
-                        const filledBoxesCount = activePlan.boxes.filter(b => b.materialId).length;
-                        const percentFilled = (filledBoxesCount / 8) * 100;
-
-                        return (
-                          <div className="space-y-6 pt-4 border-t border-slate-100">
-                            <div className="space-y-2">
-                              <div className="flex justify-between items-end text-xs">
-                                <span className="font-bold text-slate-400 uppercase tracking-wider">Flatbed Capacity</span>
-                                <span className="font-black text-slate-950">{filledBoxesCount} / 8 Boxes</span>
-                              </div>
-                              <div className="h-4 bg-slate-100 border border-slate-200/60 rounded-full overflow-hidden p-[2px]">
-                                <div 
-                                  className={cn(
-                                    "h-full rounded-full transition-all duration-500",
-                                    percentFilled === 100 ? "bg-emerald-500" : "bg-amber-500"
-                                  )}
-                                  style={{ width: `${percentFilled}%` }}
-                                />
-                              </div>
-                            </div>
-
-                            <div className="space-y-1">
-                              <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Total Planned Weight</span>
-                              <p className="text-4xl font-black text-slate-900 tracking-tight">
-                                {activePlan.totalWeight.toLocaleString()} <span className="text-xs text-slate-400 tracking-widest font-bold">lbs</span>
-                              </p>
-                            </div>
-
-                            <div className="space-y-2 pt-4 border-t border-slate-100">
-                              <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Load Status</span>
-                              <div className="flex items-center gap-3">
-                                <span className={cn(
-                                  "px-3.5 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest border",
-                                  activePlan.status === 'shipped' 
-                                    ? "bg-emerald-50 border-emerald-200 text-emerald-700" 
-                                    : "bg-amber-50 border-amber-200 text-amber-700"
-                                )}>
-                                  {activePlan.status}
-                                </span>
-                                {activePlan.status === 'draft' && (
-                                  <button
-                                    onClick={() => handleShipDraftLoad(activePlan)}
-                                    className="flex items-center gap-1 text-[10px] font-black uppercase tracking-wider text-blue-600 bg-blue-50 px-3 py-1.5 rounded-xl hover:bg-blue-100 border border-blue-200/50 active:scale-95 transition-all"
-                                  >
-                                    Ship Out
-                                    <ArrowUpRight className="w-3.5 h-3.5" />
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-
-                            <div className="text-xs font-medium text-slate-400 leading-relaxed bg-slate-50 p-4 rounded-2xl border border-slate-200/40">
-                              💡 Each Gaylord box pallet measures approx. 4x4 feet. Assigning 8 boxes fully fills the physical layout of your flatbed trailer for maximum safety and transport efficiency.
-                            </div>
-                          </div>
-                        );
-                      })()
-                    ) : (
-                      <p className="text-sm text-slate-400 font-bold py-6 uppercase tracking-wider">No active load plans configured yet. Click "Create New Load" to begin.</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* Historical Load Plans Table */}
-              <div className="space-y-6 pt-8 border-t border-slate-100">
-                <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <h3 className="text-xl font-black text-slate-900 uppercase tracking-tight">Historical Load Plans</h3>
-                    <p className="text-xs text-slate-400 font-bold uppercase tracking-widest">Track capacity utilization and correction logs</p>
-                  </div>
-
-                  <div className="relative group w-full sm:max-w-md">
-                    <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-blue-600 transition-colors" />
-                    <input
-                      type="text"
-                      className="w-full pl-10 pr-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all shadow-sm"
-                      placeholder="Search loads by number, carrier, notes..."
-                      value={loadSearch}
-                      onChange={(e) => setLoadSearch(e.target.value)}
-                    />
-                  </div>
-                </div>
-
-                <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left border-collapse">
-                      <thead>
-                        <tr className="bg-slate-50/50 text-slate-500 text-[10px] font-black uppercase tracking-widest border-b border-slate-100">
-                          <th className="px-8 py-5">Load ID</th>
-                          <th className="px-8 py-5">Shipment Date</th>
-                          <th className="px-8 py-5">Carrier/Driver</th>
-                          <th className="px-8 py-5">Boxes Loaded</th>
-                          <th className="px-8 py-5">Total Weight</th>
-                          <th className="px-8 py-5">Status</th>
-                          <th className="px-8 py-5">Notes</th>
-                          <th className="px-8 py-5 text-right">Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-50">
-                        {loadPlans
-                          .filter(load => {
-                            const searchLower = loadSearch.toLowerCase();
-                            return load.loadNumber.toLowerCase().includes(searchLower) ||
-                                   (load.carrier || '').toLowerCase().includes(searchLower) ||
-                                   (load.notes || '').toLowerCase().includes(searchLower);
-                          })
-                          .map((load) => {
-                            const boxCount = load.boxes.filter(b => b.materialId).length;
-                            return (
-                              <tr key={load.id} className="hover:bg-blue-50/20 transition-all group">
-                                <td className="px-8 py-6">
-                                  <span className="font-mono text-sm font-black text-slate-800">{load.loadNumber}</span>
-                                </td>
-                                <td className="px-8 py-6">
-                                  <span className="text-sm font-bold text-slate-700">
-                                    {new Date(load.date).toLocaleDateString()}
-                                  </span>
-                                </td>
-                                <td className="px-8 py-6">
-                                  <span className="text-sm font-medium text-slate-600">{load.carrier || '-'}</span>
-                                </td>
-                                <td className="px-8 py-6">
-                                  <span className="text-sm font-black text-slate-900">
-                                    {boxCount} / 8 <span className="text-xs text-slate-400 font-normal">boxes</span>
-                                  </span>
-                                </td>
-                                <td className="px-8 py-6">
-                                  <span className="text-sm font-black text-slate-900">
-                                    {load.totalWeight.toLocaleString()} lbs
-                                  </span>
-                                </td>
-                                <td className="px-8 py-6">
-                                  <span className={cn(
-                                    "px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider border",
-                                    load.status === 'shipped' 
-                                      ? "bg-emerald-50 border-emerald-200 text-emerald-700" 
-                                      : "bg-amber-50 border-amber-200 text-amber-700"
-                                  )}>
-                                    {load.status}
-                                  </span>
-                                </td>
-                                <td className="px-8 py-6 max-w-xs truncate">
-                                  <p className="text-xs text-slate-500 font-medium" title={load.notes}>{load.notes || '-'}</p>
-                                </td>
-                                <td className="px-8 py-6 text-right">
-                                  <div className="flex items-center justify-end gap-2">
-                                    {load.status === 'draft' && (
-                                      <button
-                                        onClick={() => handleShipDraftLoad(load)}
-                                        className="p-2 text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
-                                        title="Dispatch Load"
-                                      >
-                                        <Truck className="w-4 h-4" />
-                                      </button>
-                                    )}
-                                    <button
-                                      onClick={() => handleOpenEditLoad(load)}
-                                      className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                                      title="Edit Plan"
-                                    >
-                                      <Edit2 className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      onClick={() => handleDeleteLoadPlan(load)}
-                                      className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                                      title="Delete Record"
-                                    >
-                                      <Trash2 className="w-4 h-4" />
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        {loadPlans.length === 0 && (
-                          <tr>
-                            <td colSpan={8} className="px-8 py-12 text-center text-slate-400">
-                              <div className="max-w-xs mx-auto space-y-2">
-                                <Truck className="w-12 h-12 text-slate-200 mx-auto" />
-                                <p className="font-bold text-slate-800">No load plans recorded</p>
-                                <p className="text-xs text-slate-400">Maximize flatbed efficiency by drafting your wood-pallet boxes loads.</p>
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
-            </div>
-          );
-        })()
-      )}
-
       {activeTab === 'sales' && (
         <section className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
           <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
@@ -3558,6 +3328,11 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
             </div>
           </div>
         </section>
+      )}
+
+      {/* Digital Material Inventory Sheet Tab */}
+      {activeTab === 'sheet' && (
+        <MaterialInventorySheetTab materials={materials} profile={profile} />
       )}
 
       {/* Manual Inventory Adjustments Tab */}

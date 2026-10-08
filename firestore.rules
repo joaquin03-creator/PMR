@@ -285,6 +285,49 @@ service cloud.firestore {
              (!('recordedByUid' in data) || (data.recordedByUid is string && data.recordedByUid.size() <= 100));
     }
 
+    function isValidMaterialInventorySheetRow(row) {
+      return row.keys().hasAll(['id', 'boxNumber', 'materialId', 'gross', 'tare', 'net', 'date']) &&
+             row.id is string &&
+             row.boxNumber is string &&
+             row.materialId is string &&
+             row.gross is number &&
+             row.tare is number &&
+             row.net is number &&
+             row.date is string &&
+             (!('remarks' in row) || (row.remarks is string && row.remarks.size() <= 1000));
+    }
+
+    function isValidMaterialInventorySheet(data) {
+      return data.keys().hasAll(['date', 'rows', 'netTotal', 'createdAt', 'createdBy']) &&
+             data.date is string &&
+             data.rows is list && data.rows.size() <= 200 &&
+             data.netTotal is number &&
+             (data.createdAt is string || data.createdAt is timestamp) &&
+             data.createdBy is string &&
+             (!('updatedAt' in data) || (data.updatedAt is string || data.updatedAt is timestamp)) &&
+             (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 200)) &&
+             (!('orderLockedAt' in data) || (data.orderLockedAt is string || data.orderLockedAt is timestamp));
+    }
+
+    function isValidProcessingShrinkDelta(line) {
+      return line.keys().hasAll(['materialId', 'bookWeight', 'physicalWeight', 'delta']) &&
+             line.materialId is string &&
+             line.bookWeight is number &&
+             line.physicalWeight is number &&
+             line.delta is number;
+    }
+
+    function isValidProcessingShrinkAdjustment(data) {
+      return data.keys().hasAll(['materialDeltas', 'timestamp', 'recordedBy']) &&
+             data.materialDeltas is list &&
+             (data.timestamp is string || data.timestamp is timestamp) &&
+             data.recordedBy is string &&
+             (!('invoiceId' in data) || (data.invoiceId is string)) &&
+             (!('invoiceNumber' in data) || (data.invoiceNumber is string && data.invoiceNumber.size() <= 100)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             (!('slipPhotoUrl' in data) || (data.slipPhotoUrl is string && data.slipPhotoUrl.size() <= 1000));
+    }
+
     function isValidDailySnapshot(data) {
       return data.keys().hasAll(['date', 'timestamp', 'createdBy', 'materials', 'inventory', 'summary']) &&
              data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
@@ -410,7 +453,10 @@ service cloud.firestore {
              (!('createdByName' in data) || (data.createdByName is string && data.createdByName.size() <= 200)) &&
              (!('loadPlanId' in data) || (data.loadPlanId is string && data.loadPlanId.size() <= 100)) &&
              (!('inventoryDeducted' in data) || (data.inventoryDeducted is bool)) &&
-             (!('inventoryDeductedAt' in data) || (data.inventoryDeductedAt is string || data.inventoryDeductedAt is timestamp));
+             (!('inventoryDeductedAt' in data) || (data.inventoryDeductedAt is string || data.inventoryDeductedAt is timestamp)) &&
+             (!('reconciledAt' in data) || (data.reconciledAt is string || data.reconciledAt is timestamp)) &&
+             (!('shortfallResolution' in data) || (data.shortfallResolution is string)) &&
+             (!('shortfallNote' in data) || (data.shortfallNote is string && data.shortfallNote.size() <= 2000));
     }
 
     function isValidUserSession(data) {
@@ -552,6 +598,23 @@ service cloud.firestore {
     match /inventoryAdjustments/{adjustmentId} {
       allow read: if isStaff();
       allow create: if (canManageInventory() || isStaff()) && isValidInventoryAdjustment(request.resource.data);
+      allow update: if false;
+      allow delete: if canDeleteData();
+    }
+
+    match /materialInventorySheets/{sheetId} {
+      allow read: if isStaff();
+      allow create: if isStaff() && isValidMaterialInventorySheet(request.resource.data);
+      // Rows/net total/lock date are editable (boxes get topped off after entry);
+      // the sheet's own identifying date never changes once created.
+      allow update: if isStaff() && isValidMaterialInventorySheet(request.resource.data) &&
+                    request.resource.data.date == resource.data.date;
+      allow delete: if canDeleteData();
+    }
+
+    match /processingShrinkAdjustments/{adjustmentId} {
+      allow read: if isStaff();
+      allow create: if isManager() && isValidProcessingShrinkAdjustment(request.resource.data);
       allow update: if false;
       allow delete: if canDeleteData();
     }

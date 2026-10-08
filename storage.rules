@@ -20,6 +20,11 @@ service firebase.storage {
       allow read, write: if isStaff();
     }
 
+    // Buyer receiving slips/receipts, attached to a Processing & Shrink reconciliation
+    match /reconciliation-slips/{allPaths=**} {
+      allow read, write: if isStaff();
+    }
+
     // Default deny for everything else
     match /{allPaths=**} {
       allow read, write: if false;

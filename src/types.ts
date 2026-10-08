@@ -180,6 +180,8 @@ export interface Invoice {
   inventoryDeductedAt?: string;
   shortfallResolution?: 'adjustment' | 'passthrough';
   shortfallNote?: string;
+  /** Set once this invoice's book-vs-physical gap has been booked to a ProcessingShrinkAdjustment. */
+  reconciledAt?: string;
 }
 
 export interface InventoryItem {
@@ -190,6 +192,56 @@ export interface InventoryItem {
   lastPhysicalCount?: string;
   lastPhysicalCountBy?: string;
   lastPhysicalCountWeight?: number;
+}
+
+// Digital version of the paper "Material Inventory Sheet" -- a dated
+// snapshot of currently-full boxes, filled roughly weekly to judge load
+// readiness. Rows are editable after entry (boxes get topped off later);
+// net is always gross-tare, never independently stored/editable.
+export interface MaterialInventorySheetRow {
+  id: string;
+  boxNumber: string;
+  materialId: string;
+  gross: number;
+  tare: number;
+  net: number;
+  date: string; // YYYY-MM-DD, when this box was last weighed/topped off
+  remarks?: string;
+}
+
+export interface MaterialInventorySheet {
+  id: string;
+  date: string; // YYYY-MM-DD, when this sheet was started
+  rows: MaterialInventorySheetRow[];
+  netTotal: number;
+  orderLockedAt?: string; // set when a load is locked in with the buyer at ~75% (27,000 lb)
+  createdAt: string;
+  createdBy: string;
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+// One append-only entry per load-out, booking the aggregate gap between
+// book (ticket-derived, estimate) and physical (load-out weigh-up) on-hand
+// per material -- not per-conversion. bookWeight/physicalWeight are each
+// material's state as of this reconciliation; delta = physical - book.
+export interface ProcessingShrinkMaterialDelta {
+  materialId: string;
+  bookWeight: number;
+  physicalWeight: number;
+  delta: number;
+}
+
+export interface ProcessingShrinkAdjustment {
+  id: string;
+  invoiceId?: string;
+  invoiceNumber?: string;
+  materialDeltas: ProcessingShrinkMaterialDelta[];
+  notes?: string;
+  /** Photo of the buyer's receiving slip/receipt from this drop-off. */
+  slipPhotoUrl?: string;
+  timestamp: string;
+  recordedBy: string;
 }
 
 export interface ConversionLog {
