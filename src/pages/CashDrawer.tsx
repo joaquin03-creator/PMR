@@ -1575,9 +1575,26 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     return Array.from(map.values());
   }, [recentTickets, buyTickets]);
 
+  // Today is never an "after-hours day": tickets written before the drawer is opened are a
+  // normal morning, and today must always offer Start Cash Session, never Resolve Day.
   const afterHoursActivity = useMemo(() => {
-    return getAfterHoursActivity(allKnownTickets, history, afterHoursNotesMap);
-  }, [allKnownTickets, history, afterHoursNotesMap]);
+    return getAfterHoursActivity(allKnownTickets, history, afterHoursNotesMap)
+      .filter(d => d.date !== todayStr);
+  }, [allKnownTickets, history, afterHoursNotesMap, todayStr]);
+
+  // Cash tickets already paid today (shown on the Open Ledger form when the drawer is
+  // opened after the first tickets). Display only -- no figure is derived from it.
+  const todayCashTicketsPaid = useMemo(() => {
+    const paid = recentTickets.filter(t =>
+      t.status !== 'voided' && t.status !== 'cancelled'
+      && getTicketLocalDate(t.timestamp) === todayStr
+      && isCashPayoutTicket(t.paymentMethod)
+    );
+    return {
+      count: paid.length,
+      total: Math.round(paid.reduce((sum, t) => sum + (t.totalAmount || 0), 0) * 100) / 100
+    };
+  }, [recentTickets, todayStr, getTicketLocalDate]);
 
   const selectedDay = selectedSession ? selectedSession.date : (selectedDate || todayStr);
 
@@ -2305,6 +2322,27 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     openingCash = Math.round(openingCash * 100) / 100;
     
     try {
+      // One session per day: if another station already opened today, use that one instead of
+      // creating a second. Bounded to 5 s so a slow or offline connection never blocks opening.
+      const existingToday = await Promise.race([
+        getDocs(query(collection(db, 'cashSessions'), where('date', '==', todayStr), limit(1)))
+          .then(snap => snap.empty ? null : ({ id: snap.docs[0].id, ...snap.docs[0].data() } as CashSession))
+          .catch(() => null),
+        new Promise<null>(resolve => setTimeout(() => resolve(null), 5000))
+      ]);
+      if (existingToday) {
+        userSelectedHistoricalRef.current = false;
+        setUserSelectedHistorical(false);
+        setActiveSession(existingToday);
+        setSelectedSession(existingToday);
+        setShowStartModal(false);
+        firestore(
+          'Today Is Already Open',
+          `The drawer for ${todayStr} was already opened${existingToday.openedBy ? ` by ${existingToday.openedBy}` : ''} with $${(existingToday.openingCash || 0).toFixed(2)}. Nothing new was created.`
+        );
+        return;
+      }
+
       const docRef = await addDoc(collection(db, 'cashSessions'), {
         date: todayStr,
         status: 'open',
@@ -3776,9 +3814,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             setRetroNotes(`Retroactive session for after-hours day ${currentAfterHoursDay.date}`);
                             setShowRetroactiveModal(true);
                           }}
-                          className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-xs"
+                          className="px-4 py-2 bg-white hover:bg-amber-100 text-amber-800 border border-amber-300 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-xs"
                         >
-                          Resolve Day
+                          Create Session for This Day (Optional)
                         </button>
                       )}
                     </div>
@@ -6053,6 +6091,15 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     Review Open Days
                   </button>
                 )}
+              </div>
+            )}
+
+            {todayCashTicketsPaid.count > 0 && (
+              <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-2xl flex items-start gap-2.5 text-xs">
+                <AlertCircle className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+                <p className="text-blue-900 font-semibold leading-relaxed">
+                  {todayCashTicketsPaid.count} ticket{todayCashTicketsPaid.count === 1 ? '' : 's'} (<span className="font-mono font-black">${todayCashTicketsPaid.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>) already paid in cash today. Enter the cash as it was <span className="font-black">before</span> those payouts — they are subtracted from today automatically.
+                </p>
               </div>
             )}
 

@@ -148,8 +148,10 @@ export default function Dashboard({ profile }: DashboardProps) {
     return getAfterHoursActivity(buyTickets, cashSessions, afterHoursNotesMap);
   }, [buyTickets, cashSessions, afterHoursNotesMap]);
 
+  // Today is excluded: tickets written before the drawer is opened are a normal morning.
   const unnotedAfterHoursDays = useMemo(() => {
-    return afterHoursDays.filter(day => !day.hasNote);
+    const today = new Date().toLocaleDateString('en-CA');
+    return afterHoursDays.filter(day => !day.hasNote && day.date !== today);
   }, [afterHoursDays]);
   const [chartMode, setChartMode] = useState<'financial' | 'volume'>('financial');
   const [loading, setLoading] = useState(true);
