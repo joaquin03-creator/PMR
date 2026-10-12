@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { auth, db } from '../firebase';
 import { useSettings } from '../context/SettingsContext';
 import { collection, onSnapshot, addDoc, doc, updateDoc, query, orderBy, getDoc, deleteDoc, writeBatch, increment } from 'firebase/firestore';
-import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfile, BuyTicket, LoadPlan, MaterialConversion, ExternalSale, ProcessingShrinkAdjustment } from '../types';
+import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfile, BuyTicket, MaterialConversion, ExternalSale, ProcessingShrinkAdjustment } from '../types';
 import { ReconcileShipmentModal } from '../components/ReconcileShipmentModal';
 import { LoadEconomicsSummary } from '../components/LoadEconomicsSummary';
 import { logAuditEvent } from '../lib/audit';
@@ -366,8 +366,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const [materialSearch, setMaterialSearch] = useState('');
   const [notes, setNotes] = useState('');
   const [paymentTerms, setPaymentTerms] = useState('Net 30');
-  const [loadPlans, setLoadPlans] = useState<LoadPlan[]>([]);
-  const [selectedLoadPlanId, setSelectedLoadPlanId] = useState<string>('');
   const [conversions, setConversions] = useState<MaterialConversion[]>([]);
   const [sales, setSales] = useState<ExternalSale[]>([]);
   const [shrinkAdjustments, setShrinkAdjustments] = useState<ProcessingShrinkAdjustment[]>([]);
@@ -428,7 +426,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         if (draft.selectedMaterials) setSelectedMaterials(draft.selectedMaterials);
         if (draft.notes) setNotes(draft.notes);
         if (draft.paymentTerms) setPaymentTerms(draft.paymentTerms);
-        if (draft.selectedLoadPlanId) setSelectedLoadPlanId(draft.selectedLoadPlanId);
       } catch (e) {
         console.error('Error loading draft invoice:', e);
       }
@@ -463,17 +460,16 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       selectedBuyerId,
       selectedMaterials,
       notes,
-      paymentTerms,
-      selectedLoadPlanId
+      paymentTerms
     };
 
-    const isDirty = buyerName || buyerAddress || buyerPhone || selectedBuyerId || selectedMaterials.length > 0 || notes || paymentTerms !== 'Net 30' || selectedLoadPlanId;
+    const isDirty = buyerName || buyerAddress || buyerPhone || selectedBuyerId || selectedMaterials.length > 0 || notes || paymentTerms !== 'Net 30';
     if (isDirty) {
       safeSetItem('pm_draft_invoice', JSON.stringify(draft));
     } else {
       localStorage.removeItem('pm_draft_invoice');
     }
-  }, [buyerName, buyerAddress, buyerPhone, selectedBuyerId, selectedMaterials, notes, paymentTerms, selectedLoadPlanId, draftLoaded]);
+  }, [buyerName, buyerAddress, buyerPhone, selectedBuyerId, selectedMaterials, notes, paymentTerms, draftLoaded]);
 
   // Save active editing invoice on change
   useEffect(() => {
@@ -499,7 +495,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       setSelectedMaterials([]);
       setNotes('');
       setPaymentTerms('Net 30');
-      setSelectedLoadPlanId('');
       localStorage.removeItem('pm_draft_invoice');
     }
   };
@@ -540,14 +535,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       (error) => handleFirestoreError(error, OperationType.LIST, 'buyTickets')
     );
 
-    const unsubLoadPlans = onSnapshot(
-      query(collection(db, 'loadPlans'), orderBy('date', 'desc')),
-      (snapshot) => {
-        setLoadPlans(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as LoadPlan[]);
-      },
-      (error) => handleFirestoreError(error, OperationType.LIST, 'loadPlans')
-    );
-
     const unsubInventory = onSnapshot(collection(db, 'inventory'), (snapshot) => {
       const map: Record<string, number> = {};
       snapshot.docs.forEach(docSnap => {
@@ -586,7 +573,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       try { unsubInvoices(); } catch (e) { console.warn('unsubInvoices error', e); }
       try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
       try { unsubBuyTickets(); } catch (e) { console.warn('unsubBuyTickets error', e); }
-      try { unsubLoadPlans(); } catch (e) { console.warn('unsubLoadPlans error', e); }
       try { unsubInventory(); } catch (e) { console.warn('unsubInventory error', e); }
       try { unsubConversions(); } catch (e) { console.warn('unsubConversions error', e); }
       try { unsubSales(); } catch (e) { console.warn('unsubSales error', e); }
@@ -1090,99 +1076,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
     }));
   };
 
-  const handlePreloadFromLoadPlan = (loadPlanId: string) => {
-    setSelectedLoadPlanId(loadPlanId);
-    if (!loadPlanId) return;
-
-    const lp = loadPlans.find(p => p.id === loadPlanId);
-    if (!lp) return;
-
-    if (lp.carrier) {
-      setBuyerName(lp.carrier);
-    }
-    if (lp.notes) {
-      setNotes(`Flatbed Load Plan: ${lp.loadNumber}\nNotes: ${lp.notes}`);
-    }
-
-    const preloadedItems: TripTicketMaterial[] = [];
-    lp.boxes.forEach(box => {
-      if (box.materialId) {
-        const mat = materials.find(m => m.id === box.materialId);
-        preloadedItems.push({
-          materialId: box.materialId,
-          weight: box.weight || 0,
-          salePrice: mat?.salePrice || 0,
-          boxNumber: `Box #${box.slotIndex + 1}`,
-          grossWeight: box.weight || 0,
-          tareWeight: 0,
-          slotIndex: box.slotIndex
-        });
-      }
-    });
-
-    if (preloadedItems.length > 0) {
-      setSelectedMaterials(preloadedItems);
-    }
-  };
-
-  const handleSyncBackToLoadPlan = async () => {
-    if (!selectedLoadPlanId) return;
-    const lp = loadPlans.find(p => p.id === selectedLoadPlanId);
-    if (!lp) return;
-
-    setProcessing(true);
-    try {
-      const updatedBoxes = Array.from({ length: 8 }).map((_, idx) => {
-        const matchedItem = selectedMaterials.find(item => item.slotIndex === idx);
-        if (matchedItem && matchedItem.materialId) {
-          return {
-            slotIndex: idx,
-            materialId: matchedItem.materialId,
-            weight: Number(matchedItem.weight || 0),
-            notes: `${matchedItem.boxNumber || `Box #${idx + 1}`}${matchedItem.customName ? ` - ${matchedItem.customName}` : ''}`
-          };
-        }
-        return {
-          slotIndex: idx,
-          materialId: '',
-          weight: 0,
-          notes: ''
-        };
-      });
-
-      const totalWeightNum = updatedBoxes.reduce((sum, b) => sum + (b.materialId ? b.weight : 0), 0);
-
-      const updatedData = {
-        ...lp,
-        boxes: updatedBoxes,
-        totalWeight: totalWeightNum,
-        recordedAt: new Date().toISOString(),
-        recordedBy: profile?.email || 'System'
-      };
-
-      await updateDoc(doc(db, 'loadPlans', lp.id), {
-        boxes: updatedBoxes,
-        totalWeight: totalWeightNum,
-        recordedAt: new Date().toISOString(),
-        recordedBy: profile?.email || 'System'
-      });
-
-      await logAuditEvent(
-        'loadPlan',
-        lp.id,
-        'update',
-        { before: lp, after: updatedData },
-        `Synced invoice boxes back to flatbed load plan ${lp.loadNumber}`
-      );
-
-      alert(`Successfully synced ${selectedMaterials.filter(m => m.slotIndex !== undefined).length} boxes back to Flatbed Load Plan ${lp.loadNumber}!`);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, 'loadPlans');
-    } finally {
-      setProcessing(false);
-    }
-  };
-
   const calculateDueDate = (date: string, terms: string) => {
     const baseDate = new Date(date);
     let days = 30;
@@ -1221,8 +1114,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         status: 'draft',
         notes,
         createdBy: profile?.uid || '',
-        createdByName: profile?.displayName || profile?.email || 'System',
-        loadPlanId: selectedLoadPlanId || ''
+        createdByName: profile?.displayName || profile?.email || 'System'
       };
 
       const docRef = await addDoc(collection(db, 'invoices'), invoiceData);
@@ -1242,7 +1134,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       setSelectedBuyerId('');
       setSelectedMaterials([]);
       setNotes('');
-      setSelectedLoadPlanId('');
       localStorage.removeItem('pm_draft_invoice');
       
       setSelectedInvoice({ id: docRef.id, ...invoiceData });
@@ -1565,40 +1456,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                       <option value="Net 90">Net 90</option>
                     </select>
                   </div>
-                </div>
-              </div>
-
-              {/* Flatbed Planner Integration Widget */}
-              <div className="bg-slate-50 border border-slate-200/60 p-6 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="space-y-1 text-left">
-                  <h3 className="text-sm font-black text-slate-800 uppercase tracking-tight">Flatbed Planner Integration</h3>
-                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Pre-load gaylord boxes directly from an active truck layout</p>
-                </div>
-                <div className="flex flex-wrap items-center gap-3">
-                  <select
-                    className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all cursor-pointer shadow-sm"
-                    value={selectedLoadPlanId}
-                    onChange={(e) => handlePreloadFromLoadPlan(e.target.value)}
-                  >
-                    <option value="">-- Select Flatbed Load Plan --</option>
-                    {loadPlans
-                      .filter(lp => lp.status === 'draft')
-                      .map(lp => (
-                        <option key={lp.id} value={lp.id}>
-                          {lp.loadNumber} - {lp.carrier || 'No Carrier'} ({lp.boxes.filter(b => b.materialId).length} boxes)
-                        </option>
-                      ))}
-                  </select>
-                  {selectedLoadPlanId && (
-                    <button
-                      type="button"
-                      onClick={handleSyncBackToLoadPlan}
-                      className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all active:scale-95 flex items-center gap-1.5 shadow-md shadow-blue-100"
-                      title="Save the current boxes, weights, and materials back to the active Flatbed load plan in Firestore"
-                    >
-                      🔄 Sync to Flatbed
-                    </button>
-                  )}
                 </div>
               </div>
 

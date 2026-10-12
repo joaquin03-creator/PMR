@@ -25,7 +25,6 @@ export interface UserPermissions {
   canManageCash: boolean;
   canApproveChanges: boolean;
   canOpenCloseSessions: boolean;
-  canRetroactivePriceAdjustments: boolean;
 }
 
 export interface UserProfile {

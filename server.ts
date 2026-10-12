@@ -385,55 +385,6 @@ async function startServer() {
     }
   });
 
-  // Ohio DPS Do Not Buy List Check Endpoint
-  app.post("/api/check-ohio-db", async (req, res) => {
-    const { name, idNumber } = req.body;
-    
-    const targetName = (name || "").trim();
-    const targetIdNumber = (idNumber || "").trim();
-
-    console.log(`[Ohio DB Check] Initiating check for: "${targetName}" / ID: "${targetIdNumber}"`);
-
-    let checkResult = {
-      status: "cleared",
-      source: "local_database",
-      message: `CLEARED: No active holds found for "${targetName}".`
-    };
-
-    try {
-      if (!targetName) {
-        throw new Error("Customer name is required for Ohio database check.");
-      }
-
-      // Check against local Do Not Buy holds database
-      const demoFlaggedNames = ["banned seller", "john thief", "scrap thief", "hold customer", "do not buy"];
-      const isDemoFlagged = demoFlaggedNames.some(flagged => targetName.toLowerCase().includes(flagged));
-         
-      if (isDemoFlagged) {
-        checkResult = {
-          status: "flagged",
-          source: "local_database",
-          message: `FLAGGED: Seller matched an active hold entry on the "Do Not Buy" database.`
-        };
-      } else {
-        checkResult = {
-          status: "cleared",
-          source: "local_database",
-          message: `CLEARED: No active holds found for "${targetName}".`
-        };
-      }
-    } catch (error: any) {
-      console.error("[Ohio DB Check] Check failed:", error);
-      checkResult = {
-        status: "cleared",
-        source: "local_database",
-        message: `CLEARED: Checked locally.`
-      };
-    }
-
-    res.json({ success: true, ...checkResult });
-  });
-
   // Secure Admin Password Reset Bypass Endpoint
   app.post("/api/admin-reset-password", async (req, res) => {
     res.setHeader("Content-Type", "application/json");

@@ -151,7 +151,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
     canManageCash: true,
     canApproveChanges: false,
     canOpenCloseSessions: true,
-    canRetroactivePriceAdjustments: false,
   });
   const [managerRoleDefaults, setManagerRoleDefaults] = useState<UserPermissions>({
     canManagePrices: true,
@@ -164,7 +163,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
     canManageCash: true,
     canApproveChanges: true,
     canOpenCloseSessions: true,
-    canRetroactivePriceAdjustments: true,
   });
   const [loadingRoles, setLoadingRoles] = useState(false);
 
@@ -373,7 +371,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
         canManageCash: true,
         canApproveChanges: inviteRole === 'manager',
         canOpenCloseSessions: true,
-        canRetroactivePriceAdjustments: inviteRole === 'manager',
       };
 
       const newProfile: UserProfile = {
@@ -903,7 +900,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
               canManageCash: true,
               canApproveChanges: false,
               canOpenCloseSessions: true,
-              canRetroactivePriceAdjustments: false,
             },
             manager: {
               canManagePrices: true,
@@ -916,7 +912,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
               canManageCash: true,
               canApproveChanges: true,
               canOpenCloseSessions: true,
-              canRetroactivePriceAdjustments: true,
             }
           }).catch(err => console.error("Error creating initial role defaults", err));
         }
@@ -3208,7 +3203,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
                         canManageCash: 'Manage cash reconciliation',
                         canApproveChanges: 'Authorize manager overrides',
                         canOpenCloseSessions: 'Open & close money drawer',
-                        canRetroactivePriceAdjustments: 'Adjust prices on tickets'
                       }).map(([key, label]) => (
                         <button
                           key={key}
@@ -3225,7 +3219,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
                               canManageCash: false,
                               canApproveChanges: false,
                               canOpenCloseSessions: false,
-                              canRetroactivePriceAdjustments: false,
                             };
                             handleUpdateUserPermissions(selectedUser.uid, {
                               ...currentPermissions,
@@ -4003,7 +3996,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
                   canManageCash: 'Manage cash reconciliation',
                   canApproveChanges: 'Authorize manager overrides',
                   canOpenCloseSessions: 'Open & close money drawer',
-                  canRetroactivePriceAdjustments: 'Adjust prices on tickets'
                 }).map(([key, label]) => {
                   const val = cashierRoleDefaults[key as keyof UserPermissions];
                   return (
@@ -4073,7 +4065,6 @@ export default function Settings({ profile, onProfileUpdate }: SettingsProps) {
                   canManageCash: 'Manage cash reconciliation',
                   canApproveChanges: 'Authorize manager overrides',
                   canOpenCloseSessions: 'Open & close money drawer',
-                  canRetroactivePriceAdjustments: 'Adjust prices on tickets'
                 }).map(([key, label]) => {
                   const val = managerRoleDefaults[key as keyof UserPermissions];
                   return (

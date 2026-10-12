@@ -7,8 +7,6 @@ import {
   ExternalSale, 
   ExternalSaleItem, 
   UserProfile, 
-  LoadPlan, 
-  LoadPlanBox, 
   MaterialConversion, 
   InventoryAdjustment,
   BuyTicket,
@@ -99,11 +97,10 @@ export function getConversionDestinations(c: MaterialConversion) {
 const COUNT_DRAFT_KEY = 'pm_draft_physicalcount';
 
 export default function Inventory({ profile }: { profile: UserProfile | null }) {
-  const [activeTab, setActiveTab] = useState<'inventory' | 'sales' | 'planner' | 'conversions' | 'adjustments' | 'sheet'>('inventory');
+  const [activeTab, setActiveTab] = useState<'inventory' | 'sales' | 'conversions' | 'adjustments' | 'sheet'>('inventory');
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [sales, setSales] = useState<ExternalSale[]>([]);
-  const [loadPlans, setLoadPlans] = useState<LoadPlan[]>([]);
   const [conversions, setConversions] = useState<MaterialConversion[]>([]);
   const [adjustments, setAdjustments] = useState<InventoryAdjustment[]>([]);
   const [loading, setLoading] = useState(true);
@@ -154,21 +151,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   const [stockSearch, setStockSearch] = useState('');
   const [stockSort, setStockSort] = useState<'weight-desc' | 'weight-asc' | 'code' | 'name'>('weight-desc');
   const [selectedCategory, setSelectedCategory] = useState('all');
-
-  // Load Planner State
-  const [showLoadModal, setShowLoadModal] = useState(false);
-  const [editingLoad, setEditingLoad] = useState<LoadPlan | null>(null);
-  const [selectedLoadId, setSelectedLoadId] = useState<string | null>(null);
-  const [loadSearch, setLoadSearch] = useState('');
-  const [deductFromStock, setDeductFromStock] = useState(true);
-
-  // Current load draft builder state (8 slots)
-  const [draftBoxes, setDraftBoxes] = useState<LoadPlanBox[]>(
-    Array.from({ length: 8 }, (_, idx) => ({ slotIndex: idx }))
-  );
-  const [loadDate, setLoadDate] = useState('');
-  const [loadNotes, setLoadNotes] = useState('');
-  const [loadCarrier, setLoadCarrier] = useState('');
 
   // External Sale Load Modal State
   const [showSaleModal, setShowSaleModal] = useState(false);
@@ -246,14 +228,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       (error) => handleFirestoreError(error, OperationType.LIST, 'externalSales')
     );
 
-    const unsubLoadPlans = onSnapshot(
-      query(collection(db, 'loadPlans'), orderBy('date', 'desc')),
-      (snapshot) => {
-        setLoadPlans(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as LoadPlan[]);
-      },
-      (error) => handleFirestoreError(error, OperationType.LIST, 'loadPlans')
-    );
-
     const unsubConversions = onSnapshot(
       query(collection(db, 'materialConversions'), orderBy('timestamp', 'desc')),
       (snapshot) => {
@@ -298,7 +272,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       unsubMaterials();
       unsubInventory();
       unsubSales();
-      unsubLoadPlans();
       unsubConversions();
       unsubAdjustments();
       unsubBuyTickets();
@@ -307,49 +280,10 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     };
   }, [profile]);
 
-  const [loadDraftLoaded, setLoadDraftLoaded] = useState(false);
-
-  // Load draft load plan on mount
+  // The Flatbed Planner was removed; drop any load-plan draft an old build left on this device.
   useEffect(() => {
-    const saved = localStorage.getItem('pm_draft_loadplan');
-    if (saved) {
-      try {
-        const draft = JSON.parse(saved);
-        if (draft.showLoadModal) {
-          setEditingLoad(draft.editingLoad || null);
-          setDraftBoxes(draft.draftBoxes || Array.from({ length: 8 }, (_, idx) => ({ slotIndex: idx, materialId: '', weight: 0, notes: '' })));
-          setLoadDate(draft.loadDate || '');
-          setLoadNotes(draft.loadNotes || '');
-          setLoadCarrier(draft.loadCarrier || '');
-          setDeductFromStock(draft.deductFromStock !== undefined ? draft.deductFromStock : true);
-          setShowLoadModal(true);
-        }
-      } catch (err) {
-        console.error('Error loading load plan draft:', err);
-      }
-    }
-    setLoadDraftLoaded(true);
+    localStorage.removeItem('pm_draft_loadplan');
   }, []);
-
-  // Save draft load plan on change (Autosave after any box or form edit)
-  useEffect(() => {
-    if (!loadDraftLoaded) return;
-
-    if (showLoadModal) {
-      const draft = {
-        showLoadModal,
-        editingLoad,
-        draftBoxes,
-        loadDate,
-        loadNotes,
-        loadCarrier,
-        deductFromStock
-      };
-      safeSetItem('pm_draft_loadplan', JSON.stringify(draft));
-    } else {
-      localStorage.removeItem('pm_draft_loadplan');
-    }
-  }, [showLoadModal, editingLoad, draftBoxes, loadDate, loadNotes, loadCarrier, deductFromStock, loadDraftLoaded]);
 
   const getMaterialName = (id: string) => materials.find(m => m.id === id)?.name || 'Unknown';
   const getMaterialCode = (id: string) => materials.find(m => m.id === id)?.code || '-';
@@ -627,234 +561,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
 
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, 'externalSales');
-    } finally {
-      setProcessing(false);
-    }
-  };
-
-  const handleOpenCreateLoad = () => {
-    setEditingLoad(null);
-    setDraftBoxes(Array.from({ length: 8 }, (_, idx) => ({ slotIndex: idx, materialId: '', weight: 0, notes: '' })));
-    setLoadDate(new Date().toISOString().split('T')[0]);
-    setLoadNotes('');
-    setLoadCarrier('');
-    setDeductFromStock(true);
-    setShowLoadModal(true);
-  };
-
-  const handleOpenEditLoad = (load: LoadPlan) => {
-    setEditingLoad(load);
-    
-    const boxesMap = Array.from({ length: 8 }, (_, idx) => {
-      const existing = load.boxes.find(b => b.slotIndex === idx);
-      return existing || { slotIndex: idx, materialId: '', weight: 0, notes: '' };
-    });
-    
-    setDraftBoxes(boxesMap);
-    setLoadDate(load.date.split('T')[0]);
-    setLoadNotes(load.notes || '');
-    setLoadCarrier(load.carrier || '');
-    setDeductFromStock(true);
-    setShowLoadModal(true);
-  };
-
-  const handleUpdateBoxSlot = (slotIdx: number, field: keyof LoadPlanBox, value: any) => {
-    setDraftBoxes(prev => prev.map(box => {
-      if (box.slotIndex === slotIdx) {
-        return { ...box, [field]: value };
-      }
-      return box;
-    }));
-  };
-
-  const handleCloseLoadModal = (forceDiscard = false) => {
-    if (forceDiscard || window.confirm('Discard draft load plan? This will clear all current assignments.')) {
-      setShowLoadModal(false);
-      setEditingLoad(null);
-      localStorage.removeItem('pm_draft_loadplan');
-    }
-  };
-
-  const handleSubmitLoadPlan = async (e: React.SyntheticEvent | React.FormEvent, status: 'draft' | 'shipped') => {
-    if (e) e.preventDefault();
-    if (!loadDate || processing) return;
-    setProcessing(true);
-
-    try {
-      const assignedBoxes = draftBoxes.map(box => ({
-        slotIndex: box.slotIndex,
-        materialId: box.materialId || '',
-        weight: box.materialId ? Number(box.weight || 0) : 0,
-        notes: box.notes || ''
-      }));
-
-      const totalWeightNum = assignedBoxes.reduce((sum, b) => sum + b.weight, 0);
-      const isoDate = new Date(loadDate + 'T12:00:00Z').toISOString();
-
-      if (editingLoad) {
-        const isNowShipping = status === 'shipped' && editingLoad.status === 'draft';
-
-        const updatedData = {
-          loadNumber: editingLoad.loadNumber,
-          date: isoDate,
-          status,
-          carrier: loadCarrier,
-          notes: loadNotes,
-          boxes: assignedBoxes,
-          totalWeight: totalWeightNum,
-          recordedAt: new Date().toISOString(),
-          recordedBy: profile?.email || 'System'
-        };
-
-        await updateDoc(doc(db, 'loadPlans', editingLoad.id), updatedData);
-        setSelectedLoadId(editingLoad.id);
-
-        if (isNowShipping && deductFromStock) {
-          for (const box of assignedBoxes) {
-            if (box.materialId && box.weight > 0) {
-              await setDoc(doc(db, 'inventory', box.materialId), {
-                materialId: box.materialId,
-                currentWeight: increment(-box.weight),
-                lastUpdated: new Date().toISOString()
-              }, { merge: true });
-            }
-          }
-        }
-
-        await logAuditEvent(
-          'loadPlan',
-          editingLoad.id,
-          'update',
-          { before: editingLoad, after: updatedData },
-          `Updated load plan ${editingLoad.loadNumber} (Status: ${status}, Total Weight: ${totalWeightNum.toLocaleString()} lbs)`
-        );
-
-      } else {
-        const nextLoadNum = `LOAD-${(loadPlans.length + 1001).toString()}`;
-        
-        const newLoadData = {
-          loadNumber: nextLoadNum,
-          date: isoDate,
-          status,
-          carrier: loadCarrier,
-          notes: loadNotes,
-          boxes: assignedBoxes,
-          totalWeight: totalWeightNum,
-          recordedAt: new Date().toISOString(),
-          recordedBy: profile?.email || 'System'
-        };
-
-        const docRef = await addDoc(collection(db, 'loadPlans'), newLoadData);
-        setSelectedLoadId(docRef.id);
-
-        if (status === 'shipped' && deductFromStock) {
-          for (const box of assignedBoxes) {
-            if (box.materialId && box.weight > 0) {
-              await setDoc(doc(db, 'inventory', box.materialId), {
-                materialId: box.materialId,
-                currentWeight: increment(-box.weight),
-                lastUpdated: new Date().toISOString()
-              }, { merge: true });
-            }
-          }
-        }
-
-        await logAuditEvent(
-          'loadPlan',
-          docRef.id,
-          'create',
-          { after: newLoadData },
-          `Created load plan ${nextLoadNum} (Status: ${status}, Total Weight: ${totalWeightNum.toLocaleString()} lbs)`
-        );
-      }
-
-      setShowLoadModal(false);
-      setEditingLoad(null);
-      localStorage.removeItem('pm_draft_loadplan');
-    } catch (err) {
-      handleFirestoreError(err, editingLoad ? OperationType.UPDATE : OperationType.CREATE, 'loadPlans');
-    } finally {
-      setProcessing(false);
-    }
-  };
-
-  const handleDeleteLoadPlan = async (load: LoadPlan) => {
-    let restoreStock = false;
-    
-    if (load.status === 'shipped') {
-      restoreStock = window.confirm(
-        `This load is marked SHIPPED. Would you like to RESTORE the box weights (${load.totalWeight.toLocaleString()} lbs) back into real-time yard inventory stock?`
-      );
-    } else {
-      if (!window.confirm(`Are you sure you want to delete load plan ${load.loadNumber}?`)) return;
-    }
-    
-    setProcessing(true);
-    try {
-      if (restoreStock) {
-        for (const box of load.boxes) {
-          if (box.materialId && (box.weight || 0) > 0) {
-            await setDoc(doc(db, 'inventory', box.materialId), {
-              materialId: box.materialId,
-              currentWeight: increment(box.weight || 0),
-              lastUpdated: new Date().toISOString()
-            }, { merge: true });
-          }
-        }
-      }
-
-      await deleteDoc(doc(db, 'loadPlans', load.id));
-      if (selectedLoadId === load.id) {
-        setSelectedLoadId(null);
-      }
-
-      await logAuditEvent(
-        'loadPlan',
-        load.id,
-        'delete',
-        undefined,
-        `Deleted load plan ${load.loadNumber} (Restored stock: ${restoreStock ? 'Yes' : 'No'})`
-      );
-    } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, 'loadPlans');
-    } finally {
-      setProcessing(false);
-    }
-  };
-
-  const handleShipDraftLoad = async (load: LoadPlan) => {
-    const shouldDeduct = window.confirm(
-      `Are you sure you want to transition ${load.loadNumber} to SHIPPED status? This will deduct ${load.totalWeight.toLocaleString()} lbs from your active yard inventory.`
-    );
-    if (!shouldDeduct) return;
-
-    setProcessing(true);
-    try {
-      await updateDoc(doc(db, 'loadPlans', load.id), {
-        status: 'shipped',
-        recordedAt: new Date().toISOString(),
-        recordedBy: profile?.email || 'System'
-      });
-
-      for (const box of load.boxes) {
-        if (box.materialId && (box.weight || 0) > 0) {
-          await setDoc(doc(db, 'inventory', box.materialId), {
-            materialId: box.materialId,
-            currentWeight: increment(-(box.weight || 0)),
-            lastUpdated: new Date().toISOString()
-          }, { merge: true });
-        }
-      }
-
-      await logAuditEvent(
-        'loadPlan',
-        load.id,
-        'update',
-        { before: load, after: { ...load, status: 'shipped' } },
-        `Shipped draft load ${load.loadNumber} and deducted weights from active yard inventory.`
-      );
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, 'loadPlans');
     } finally {
       setProcessing(false);
     }
@@ -2047,15 +1753,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
             </button>
           </nav>
           
-          {activeTab === 'planner' ? (
-            <button
-              onClick={handleOpenCreateLoad}
-              className="px-6 py-4.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-2xl text-xs font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-100 cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              New Load Plan
-            </button>
-          ) : activeTab === 'conversions' ? (
+          {activeTab === 'conversions' ? (
             <button
               onClick={() => handleOpenConversionModal()}
               className="px-6 py-4.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-2xl text-xs font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-100 cursor-pointer"
@@ -4108,201 +3806,6 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
                   {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
                   Confirm Conversion
                 </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Create / Edit Load Plan Modal */}
-      {showLoadModal && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-6 z-50 animate-in fade-in duration-200 overflow-y-auto" role="dialog" aria-modal="true">
-          <div className="bg-white rounded-[2.5rem] w-full max-w-4xl p-10 border border-slate-100 shadow-2xl relative space-y-8 animate-in zoom-in-95 duration-200 my-8">
-            <button
-              onClick={() => handleCloseLoadModal(false)}
-              className="absolute top-8 right-8 w-11 h-11 flex items-center justify-center text-slate-300 hover:text-slate-500 hover:bg-slate-50 rounded-xl transition-all active:scale-95"
-              aria-label="Close modal"
-            >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div>
-              <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">
-                {editingLoad ? 'Edit Flatbed Load Plan' : 'Create Flatbed Load Plan'}
-              </h2>
-              <p className="text-xs text-slate-400 font-black uppercase tracking-widest mt-1">
-                Configure Carrier details and assign Gaylord boxes to the 8 physical flatbed slots
-              </p>
-            </div>
-
-            <form onSubmit={(e) => handleSubmitLoadPlan(e, editingLoad?.status === 'shipped' ? 'shipped' : 'draft')} className="space-y-8">
-              {/* Basic Carrier & Shipment Info */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 bg-slate-50 p-6 rounded-2xl border border-slate-200/50">
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Driver / Carrier Name</label>
-                  <input
-                    required
-                    type="text"
-                    className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                    placeholder="e.g. Acme Transport Truck #4"
-                    value={loadCarrier}
-                    onChange={(e) => setLoadCarrier(e.target.value)}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Shipment Target Date</label>
-                  <div className="relative group">
-                    <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-blue-600 transition-colors pointer-events-none" />
-                    <input
-                      required
-                      type="date"
-                      className="w-full pl-10 pr-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                      value={loadDate}
-                      onChange={(e) => setLoadDate(e.target.value)}
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Inventory Action</label>
-                  <label className="flex items-center gap-3 px-4 py-3 bg-white border border-slate-200 rounded-xl cursor-pointer hover:bg-slate-50/50 transition-all">
-                    <input
-                      type="checkbox"
-                      className="w-4 h-4 text-blue-600 border-slate-300 rounded focus:ring-blue-500"
-                      checked={deductFromStock}
-                      onChange={(e) => setDeductFromStock(e.target.checked)}
-                    />
-                    <span className="text-[11px] font-black text-slate-700 uppercase tracking-wide">Deduct on Ship Out</span>
-                  </label>
-                </div>
-
-                <div className="md:col-span-3 space-y-2">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Load Notes / Instructions</label>
-                  <textarea
-                    className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-blue-500 min-h-[60px] resize-none"
-                    placeholder="Provide shipping instructions, Melt Shop details, or destination logs..."
-                    value={loadNotes}
-                    onChange={(e) => setLoadNotes(e.target.value)}
-                  />
-                </div>
-              </div>
-
-              {/* The 8 Boxes Slot Configuration */}
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-black text-slate-900 uppercase tracking-tight">Gaylord Box Assignments (8 Slots)</span>
-                  <span className="text-[10px] font-mono text-slate-400 uppercase tracking-widest">
-                    Pallet capacity is locked to flatbed truck specs
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-h-[350px] overflow-y-auto pr-2 scrollbar-thin">
-                  {draftBoxes.map((box, idx) => {
-                    return (
-                      <div key={idx} className="p-5 border border-slate-200/80 bg-slate-50/40 rounded-2xl flex flex-col gap-3 relative">
-                        <div className="flex justify-between items-center border-b border-slate-100 pb-2">
-                          <span className="text-xs font-black text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
-                            <span className="w-5 h-5 flex items-center justify-center bg-slate-200 text-slate-700 text-[10px] font-mono rounded-md">
-                              {idx + 1}
-                            </span>
-                            Slot {idx + 1} Pallet
-                          </span>
-                          {box.materialId ? (
-                            <span className="text-[9px] font-black text-blue-600 bg-blue-50 px-2 py-0.5 rounded border border-blue-100 uppercase tracking-wider">
-                              Assigned
-                            </span>
-                          ) : (
-                            <span className="text-[9px] font-black text-slate-400 bg-slate-100 px-2 py-0.5 rounded border border-slate-200 uppercase tracking-wider">
-                              Unassigned
-                            </span>
-                          )}
-                        </div>
-
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                          <div className="space-y-1.5">
-                            <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Material</label>
-                            <select
-                              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-bold outline-none focus:ring-1 focus:ring-blue-500"
-                              value={box.materialId}
-                              onChange={(e) => handleUpdateBoxSlot(idx, 'materialId', e.target.value)}
-                            >
-                              <option value="">-- Empty Slot --</option>
-                              {materials.map(m => (
-                                <option key={m.id} value={m.id}>
-                                  {m.code} - {m.name}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-
-                          <div className="space-y-1.5">
-                            <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Box Weight (lbs)</label>
-                            <input
-                              type="number"
-                              disabled={!box.materialId}
-                              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs font-bold outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-40"
-                              placeholder="Weight in lbs"
-                              value={box.weight || ''}
-                              onChange={(e) => handleUpdateBoxSlot(idx, 'weight', Number(e.target.value))}
-                            />
-                          </div>
-                        </div>
-
-                        <div className="space-y-1">
-                          <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Box Note / Correction Log</label>
-                          <input
-                            type="text"
-                            disabled={!box.materialId}
-                            className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-[11px] outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-40"
-                            placeholder="e.g. Mixed copper scrap box #A"
-                            value={box.notes || ''}
-                            onChange={(e) => handleUpdateBoxSlot(idx, 'notes', e.target.value)}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Action Buttons */}
-              <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-6 border-t border-slate-100">
-                <span className="text-xs font-black text-slate-500 uppercase tracking-widest">
-                  Total Planned Weight:{' '}
-                  <span className="text-slate-900 font-mono text-base">
-                    {draftBoxes.reduce((sum, b) => sum + (b.materialId ? Number(b.weight || 0) : 0), 0).toLocaleString()} lbs
-                  </span>
-                </span>
-
-                <div className="flex items-center gap-3 w-full sm:w-auto">
-                  <button
-                    type="button"
-                    onClick={() => handleCloseLoadModal(false)}
-                    className="flex-1 sm:flex-none px-6 py-3.5 border border-slate-200 text-slate-500 rounded-xl text-xs font-black uppercase tracking-widest hover:bg-slate-50 transition-all"
-                  >
-                    Cancel
-                  </button>
-                  
-                  <button
-                    type="button"
-                    disabled={processing}
-                    onClick={(e) => handleSubmitLoadPlan(e, 'draft')}
-                    className="flex-1 sm:flex-none px-6 py-3.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-black uppercase tracking-widest transition-all disabled:opacity-50"
-                  >
-                    Save Draft
-                  </button>
-
-                  <button
-                    type="submit"
-                    disabled={processing}
-                    onClick={(e) => handleSubmitLoadPlan(e, 'shipped')}
-                    className="flex-1 sm:flex-none px-6 py-3.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all disabled:opacity-50 flex items-center justify-center gap-2 shadow-lg"
-                  >
-                    {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Truck className="w-4 h-4" />}
-                    Ship Out Now
-                  </button>
-                </div>
               </div>
             </form>
           </div>

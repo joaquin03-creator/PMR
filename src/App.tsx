@@ -148,7 +148,6 @@ export default function App() {
           canManageCash: true,
           canApproveChanges: demoRole === 'manager',
           canOpenCloseSessions: true,
-          canRetroactivePriceAdjustments: demoRole === 'manager',
         };
 
         const demoProfile: UserProfile = {
@@ -213,7 +212,6 @@ export default function App() {
               canManageCash: true,
               canApproveChanges: demoRole === 'manager',
               canOpenCloseSessions: true,
-              canRetroactivePriceAdjustments: demoRole === 'manager',
             };
             
             const demoProfile: UserProfile = {
@@ -299,7 +297,6 @@ export default function App() {
               canManageCash: true,
               canApproveChanges: data.role === 'manager',
               canOpenCloseSessions: true,
-              canRetroactivePriceAdjustments: data.role === 'manager',
               ...(data.permissions || {}) // Preserve existing settings
             };
             
@@ -364,7 +361,6 @@ export default function App() {
                 canManageCash: true, // Allow cash drawer management for demo roles
                 canApproveChanges: targetRole === 'manager',
                 canOpenCloseSessions: true,
-                canRetroactivePriceAdjustments: targetRole === 'manager',
               };
               
               const newProfile: UserProfile = {

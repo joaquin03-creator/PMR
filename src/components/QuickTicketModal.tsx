@@ -741,7 +741,7 @@ export default function QuickTicketModal({
       setOhioCheckMessage(`FLAGGED — matches Do-Not-Buy entry: ${localMatch.reason || 'listed'}`);
     } else {
       setQtOhioDatabaseStatus('cleared');
-      setOhioCheckMessage(`Cleared against local Do-Not-Buy list (${count} entries). Live state portal unavailable.`);
+      setOhioCheckMessage(`Cleared against local Do-Not-Buy list (${count} entries).`);
     }
   };
 
@@ -767,41 +767,10 @@ export default function QuickTicketModal({
     const currentList = dnbListRef.current.length > 0 ? dnbListRef.current : doNotBuyList;
     const localMatch = currentList.find((entry) => namesMatch(entry.name, nameToCheck));
 
-    try {
-      const response = await fetch("/api/check-ohio-db", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: nameToCheck,
-          idNumber: idNum || qtCustomer?.idNumber || qtNewCustomer.idNumber || ''
-        })
-      });
-      if (!response.ok) throw new Error("Portal responded with an error");
-      const res = await response.json();
-
-      if (res.success) {
-        // If EITHER the live portal OR the local list flags them, they are flagged.
-        if (res.status === 'flagged' || localMatch) {
-          setQtOhioDatabaseStatus('flagged');
-          setOhioCheckMessage(
-            localMatch
-              ? `FLAGGED — matches Do-Not-Buy entry: ${localMatch.reason || 'listed'}`
-              : (res.message || 'Flagged in state registry')
-          );
-        } else {
-          setQtOhioDatabaseStatus('cleared');
-          setOhioCheckMessage(`Cleared — ${res.source === 'state_portal' ? 'live state database' : 'local registry'}`);
-        }
-      } else {
-        // API returned but not success — fall back to local result
-        applyLocalResult(localMatch, nameToCheck);
-      }
-    } catch (err) {
-      console.warn("Live Ohio portal unreachable, using local Do-Not-Buy list:", err);
-      applyLocalResult(localMatch, nameToCheck);
-    } finally {
-      setIsCheckingOhioPortal(false);
-    }
+    // The local list is the only source checked. The former /api/check-ohio-db call was a
+    // stub that never contacted the state and always answered "cleared".
+    applyLocalResult(localMatch, nameToCheck);
+    setIsCheckingOhioPortal(false);
   };
 
   // Run Ohio DPS check after ticket finalization
@@ -809,42 +778,44 @@ export default function QuickTicketModal({
     if (!ticketId || !customerName) return;
     setIsRunningPostDpsCheck(true);
     try {
-      const response = await fetch("/api/check-ohio-db", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: customerName,
-          idNumber: idNum || ''
-        })
-      });
-      const res = await response.json();
-      if (res.success) {
-        const newStatus = res.status as 'cleared' | 'flagged';
-        setPostDpsResult({ status: newStatus, message: res.message });
-        setQtOhioDatabaseStatus(newStatus);
-        
-        // Update ticket in Firestore
-        const ticketRef = doc(db, 'buyTickets', ticketId);
-        await updateDoc(ticketRef, {
-          ohioDatabaseStatus: newStatus,
-          ohioCheckUpdatedAt: new Date().toISOString()
-        });
-
-        if (printedTicket) {
-          setPrintedTicket({
-            ...printedTicket,
-            ohioDatabaseStatus: newStatus
-          });
-        }
-
-        await logAuditEvent(
-          'buyTicket',
-          ticketId,
-          'update',
-          { after: { ohioDatabaseStatus: newStatus } },
-          `Post-ticket Ohio DPS check completed: ${newStatus.toUpperCase()} for ${customerName}`
-        );
+      // Checked against the local Do-Not-Buy list (see runOhioCheck). Never record a result
+      // from a list that has not loaded.
+      let attempts = 0;
+      while (!dnbLoadedRef.current && attempts < 25) {
+        await new Promise((r) => setTimeout(r, 200));
+        attempts++;
       }
+      if (!dnbLoadedRef.current) throw new Error('Do-Not-Buy list has not loaded');
+      const currentList = dnbListRef.current.length > 0 ? dnbListRef.current : doNotBuyList;
+      const localMatch = currentList.find((entry) => namesMatch(entry.name, customerName));
+      const newStatus: 'cleared' | 'flagged' = localMatch ? 'flagged' : 'cleared';
+      const message = localMatch
+        ? `FLAGGED — matches Do-Not-Buy entry: ${localMatch.reason || 'listed'}`
+        : `Cleared against local Do-Not-Buy list (${currentList.length} entries).`;
+      setPostDpsResult({ status: newStatus, message });
+      setQtOhioDatabaseStatus(newStatus);
+      
+      // Update ticket in Firestore
+      const ticketRef = doc(db, 'buyTickets', ticketId);
+      await updateDoc(ticketRef, {
+        ohioDatabaseStatus: newStatus,
+        ohioCheckUpdatedAt: new Date().toISOString()
+      });
+
+      if (printedTicket) {
+        setPrintedTicket({
+          ...printedTicket,
+          ohioDatabaseStatus: newStatus
+        });
+      }
+
+      await logAuditEvent(
+        'buyTicket',
+        ticketId,
+        'update',
+        { after: { ohioDatabaseStatus: newStatus } },
+        `Post-ticket Do-Not-Buy list check completed: ${newStatus.toUpperCase()} for ${customerName}`
+      );
     } catch (err) {
       console.error("Error running post-ticket DPS check:", err);
     } finally {
@@ -1485,10 +1456,10 @@ export default function QuickTicketModal({
                 <p className="text-xs text-slate-600">
                   {postDpsResult?.message || (
                     (printedTicket?.ohioDatabaseStatus === 'cleared' || qtOhioDatabaseStatus === 'cleared')
-                      ? 'Seller successfully verified against Ohio Homeland Security Do-Not-Buy registry.'
+                      ? 'Seller checked against the local copy of the Ohio DPS Do-Not-Buy list.'
                       : (printedTicket?.ohioDatabaseStatus === 'flagged' || qtOhioDatabaseStatus === 'flagged')
                       ? 'WARNING: Seller is marked as flagged on the Do-Not-Buy registry.'
-                      : 'DPS check was deferred during ticket creation. You can run the live state verification below to update the ticket record.'
+                      : 'The Do-Not-Buy check was deferred during ticket creation. Run it below to update the ticket record.'
                   )}
                 </p>
 
@@ -1505,7 +1476,7 @@ export default function QuickTicketModal({
                     className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center gap-2 transition-all shadow cursor-pointer disabled:opacity-50"
                   >
                     <RefreshCw className={cn("w-3.5 h-3.5", isRunningPostDpsCheck && "animate-spin")} />
-                    <span>{isRunningPostDpsCheck ? "Verifying..." : "Run Ohio DPS Check Now"}</span>
+                    <span>{isRunningPostDpsCheck ? "Verifying..." : "Run Do-Not-Buy Check Now"}</span>
                   </button>
 
 
@@ -2222,7 +2193,7 @@ export default function QuickTicketModal({
                           <p className="text-[11px] text-slate-500 mt-0.5">
                             {ohioCheckMessage || (
                               qtOhioDatabaseStatus === 'cleared' 
-                                ? 'Seller cleared in Ohio Homeland Security Portal & Local Database' 
+                                ? 'Seller cleared against the local copy of the Ohio DPS Do-Not-Buy list' 
                                 : qtOhioDatabaseStatus === 'flagged'
                                 ? 'Prohibited: Seller flagged on Do-Not-Buy registry'
                                 : 'DPS verification pending. You may continue the ticket and verify after.'

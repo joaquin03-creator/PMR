@@ -470,38 +470,15 @@ export default function Dashboard({ profile }: DashboardProps) {
 
     setIsCheckingOhioPortal(true);
     setOhioCheckMessage(null);
-    try {
-      const response = await fetch("/api/check-ohio-db", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: nameToCheck,
-          idNumber: idNum || qtCustomer?.idNumber || qtNewCustomer.idNumber || ''
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error("Portal check API responded with an error");
-      }
-
-      const res = await response.json();
-      if (res.success) {
-        setQtOhioDatabaseStatus(res.status);
-        setOhioCheckMessage(`${res.message} (${res.source === 'state_portal' ? 'Live State Database' : 'Local Offline Database Sync'})`);
-      }
-    } catch (err) {
-      console.error("Error executing auto Ohio check in Dashboard:", err);
-      const localMatch = doNotBuyList.find(entry => namesMatch(entry.name, nameToCheck));
-      if (localMatch) {
-        setQtOhioDatabaseStatus('flagged');
-        setOhioCheckMessage(`Connection failed. Local offline fallback match found: ${localMatch.reason}`);
-      } else {
-        setQtOhioDatabaseStatus('cleared');
-        setOhioCheckMessage("Connection failed. Cleared against local offline Do-Not-Buy database.");
-      }
-    } finally {
-      setIsCheckingOhioPortal(false);
+    const localMatch = doNotBuyList.find(entry => namesMatch(entry.name, nameToCheck));
+    if (localMatch) {
+      setQtOhioDatabaseStatus('flagged');
+      setOhioCheckMessage(`FLAGGED — matches Do-Not-Buy entry: ${localMatch.reason || 'listed'}`);
+    } else {
+      setQtOhioDatabaseStatus('cleared');
+      setOhioCheckMessage(`Cleared against local Do-Not-Buy list (${doNotBuyList.length} entries).`);
     }
+    setIsCheckingOhioPortal(false);
   };
 
   // Automatically trigger Ohio Homeland Security check when customer is selected or name is updated
@@ -1236,7 +1213,7 @@ export default function Dashboard({ profile }: DashboardProps) {
       return item.overridePrice !== (item.material?.buyPrice || 0);
     });
 
-    const restrictRetroactive = profile?.role === 'cashier' && !profile?.permissions?.canRetroactivePriceAdjustments;
+    const restrictRetroactive = profile?.role === 'cashier';
 
     if ((hasOverrides || (restrictRetroactive && anyAdjustments)) && profile?.role === 'cashier') {
       setShowPinModal(true);
@@ -2066,7 +2043,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                 <div>
                   <div className="flex justify-between items-start">
                     <span className="px-2.5 py-1 bg-amber-50 text-amber-800 text-[10px] font-black uppercase tracking-widest rounded-lg">
-                      {d.type === 'quick' ? 'Quick Buy' : 'Full Buy'} (Step {d.step || 1})
+                      Quick Ticket (Step {d.step || 1})
                     </span>
                     <span className="text-[10px] text-slate-400 font-mono">
                       {d.timestamp ? new Date(d.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
@@ -2088,18 +2065,14 @@ export default function Dashboard({ profile }: DashboardProps) {
                 <div className="flex gap-2 pt-2 border-t border-slate-100">
                   <button
                     onClick={() => {
-                      if (d.type === 'quick') {
-                        openQuickTicket(d.id);
-                        setTimeout(() => {
-                          const input = document.querySelector('[data-material-search]') as HTMLInputElement;
-                          if (input) {
-                            input.focus({ preventScroll: false });
-                            input.click();
-                          }
-                        }, 350);
-                      } else {
-                        openQuickTicket();
-                      }
+                      openQuickTicket(d.id);
+                      setTimeout(() => {
+                        const input = document.querySelector('[data-material-search]') as HTMLInputElement;
+                        if (input) {
+                          input.focus({ preventScroll: false });
+                          input.click();
+                        }
+                      }, 350);
                     }}
                     className="flex-grow py-2.5 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition-all text-center cursor-pointer"
                   >

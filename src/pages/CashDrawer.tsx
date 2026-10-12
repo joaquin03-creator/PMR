@@ -3436,7 +3436,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                     <div className="space-y-1">
                       <h4 className="text-sm font-black text-amber-900 uppercase tracking-wide">Gaps Detected in Reconciliation history</h4>
                       <p className="text-xs text-amber-700 font-medium">
-                        The following days had cash transactions (buy tickets created) but no cash drawer session was opened or closed. Resolve these gaps to complete your financial audits.
+                        The following days had cash transactions (buy tickets created) but no cash drawer session was opened or closed. Creating a session for one of these days is optional; it never blocks opening today.
                       </p>
                     </div>
                   </div>
@@ -3505,7 +3505,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                 }}
                                 className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-xs"
                               >
-                                Resolve Day
+                                Create Session (Optional)
                               </button>
                             )}
                           </div>
@@ -7292,7 +7292,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           <div className="bg-white rounded-[2.5rem] p-6 md:p-10 max-w-4xl w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
             <div className="flex items-center justify-between border-b border-slate-100 pb-4 mb-6">
               <div>
-                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Resolve Gap Day Retroactively</h3>
+                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Create Session for a Past Day</h3>
                 <p className="text-slate-500 font-medium text-xs uppercase tracking-widest">Create retroactive open/close session for {retroactiveDate}</p>
               </div>
               <button 
@@ -7491,7 +7491,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   className="flex-[2] px-6 py-4 bg-amber-600 hover:bg-amber-700 text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-xl shadow-amber-600/10 flex items-center justify-center gap-2"
                 >
                   {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                  Resolve & Create Session
+                  Create Session
                 </button>
               </div>
             </form>

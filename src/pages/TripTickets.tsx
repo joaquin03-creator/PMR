@@ -1176,7 +1176,7 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                           <p className="text-sm font-black text-slate-900">{inv.invoiceNumber}</p>
                           <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{inv.buyerName}</p>
                         </div>
-                        <p className="text-xs font-black text-blue-600">${inv.totalAmount.toLocaleString()}</p>
+                        <p className="text-xs font-black text-slate-500">{inv.date ? new Date(inv.date).toLocaleDateString() : ''} • {(inv.totalWeight || 0).toLocaleString()} lb</p>
                       </div>
                     </button>
                   ))}
