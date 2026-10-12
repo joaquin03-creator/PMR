@@ -173,12 +173,33 @@ function SearchableMaterialSelector({
 const InvoiceDocument = ({ 
   invoice, 
   materials, 
-  className = "" 
+  className = "",
+  detailed = false
 }: { 
   invoice: Invoice; 
   materials: Material[]; 
   className?: string;
+  /** false (default) = one row per material; true = one row per box. */
+  detailed?: boolean;
 }) => {
+  // Summary: every box of a material (at one price) added together. Detailed: the
+  // invoice's own per-box lines. Same columns either way; the invoice is unchanged.
+  const rows = detailed
+    ? invoice.materials.map(line => {
+        const hasGross = line.grossWeight !== undefined && line.grossWeight > 0;
+        return {
+          materialId: line.materialId,
+          customName: line.customName || undefined,
+          salePrice: line.salePrice,
+          boxCount: 1,
+          boxNumber: line.boxNumber,
+          netWeight: line.weight,
+          grossWeight: hasGross ? (line.grossWeight as number) : null,
+          tareWeight: hasGross ? (line.tareWeight || 0) : null,
+          amount: line.weight * line.salePrice,
+        };
+      })
+    : consolidateInvoiceLines(invoice.materials).map(row => ({ ...row, boxNumber: undefined as string | number | undefined }));
   return (
     <div className={cn(
       "bg-white px-6 py-4 font-sans text-slate-900 invoice-container relative flex flex-col min-h-0 w-full max-w-[1000px] print:max-w-none mx-auto",
@@ -262,8 +283,7 @@ const InvoiceDocument = ({
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100 font-sans">
-            {/* One row per material (and price): every box of it added together. The invoice itself keeps its per-box lines. */}
-            {consolidateInvoiceLines(invoice.materials).map((row, idx) => {
+            {rows.map((row, idx) => {
               const material = materials.find(m => m.id === row.materialId);
               const unit = material?.unit || 'lb';
               return (
@@ -271,7 +291,7 @@ const InvoiceDocument = ({
                   <td className="py-3 text-left">
                     <div className="space-y-0.5">
                       <p className="text-sm font-black text-slate-900 uppercase tracking-tight">
-                        {row.customName || material?.name || 'Unknown Material'}
+                        {row.boxNumber ? `${row.boxNumber}: ` : ''}{row.customName || material?.name || 'Unknown Material'}
                       </p>
                       <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
                         Code: {material?.code || '-'}{row.boxCount > 1 ? ` • ${row.boxCount} boxes` : ''}
@@ -377,6 +397,12 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [showInvoicePreview, setShowInvoicePreview] = useState(false);
+  // Printed invoice layout: one row per material (default) or one row per box.
+  // Starts on Summary every time an invoice is opened.
+  const [invoiceDetailed, setInvoiceDetailed] = useState(false);
+  useEffect(() => {
+    if (!showInvoicePreview) setInvoiceDetailed(false);
+  }, [showInvoicePreview]);
   const [autoPrint, setAutoPrint] = useState(false);
   const [processing, setProcessing] = useState(false);
 
@@ -2075,6 +2101,23 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                   </button>
                 )}
 
+                {!isEditing && (
+                  <div className="flex items-center bg-slate-100 rounded-xl p-1" title="Summary prints one row per material. Detailed prints every box.">
+                    {([['Summary', false], ['Detailed', true]] as const).map(([label, value]) => (
+                      <button
+                        key={label}
+                        onClick={() => setInvoiceDetailed(value)}
+                        className={cn(
+                          "px-4 py-2 rounded-lg font-black text-xs uppercase tracking-widest transition-all",
+                          invoiceDetailed === value ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400 hover:text-slate-600'
+                        )}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
                 <button 
                   onClick={() => {
                     if (!settings.debugPrintMode) window.print();
@@ -2329,7 +2372,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                   </div>
                 </div>
               ) : (
-                <InvoiceDocument invoice={selectedInvoice} materials={materials} />
+                <InvoiceDocument invoice={selectedInvoice} materials={materials} detailed={invoiceDetailed} />
               )}
             </div>
           </div>
