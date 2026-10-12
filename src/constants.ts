@@ -12,5 +12,7 @@ export const handleImageError = (e: React.SyntheticEvent<HTMLImageElement, Event
   }
 };
 export const COMPANY_EMAIL = "preferredmetalsrecycling@gmail.com";
+// Contact printed on the Bill of Lading (shipping/logistics contact).
+export const BOL_CONTACT_EMAIL = "tiffany@preferredmetalsrecycling.com";
 export const COMPANY_WEBSITE = "www.preferredmetalsrecycling.com";
 export const APP_VERSION = "1.0.0-rc2";

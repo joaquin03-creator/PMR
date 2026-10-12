@@ -1,6 +1,6 @@
 import React from 'react';
 import { TripTicket, Material } from '../types';
-import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE } from '../constants';
+import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, BOL_CONTACT_EMAIL, COMPANY_WEBSITE } from '../constants';
 import { BrandLogo } from './BrandLogo';
 import { cn } from '../lib/utils';
 
@@ -53,7 +53,7 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
             {COMPANY_NAME}
           </h1>
           <p className="text-[10px] text-slate-500 font-medium tracking-wide">
-            {COMPANY_WEBSITE} • {COMPANY_EMAIL}
+            {COMPANY_WEBSITE} • {BOL_CONTACT_EMAIL}
           </p>
           <p className="text-[10px] text-slate-600 font-semibold">
             {COMPANY_ADDRESS} • Tel: {COMPANY_PHONE}
