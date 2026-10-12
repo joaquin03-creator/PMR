@@ -132,7 +132,6 @@ export default function Layout({ user, profile }: LayoutProps) {
 
   const navItems = [
     { name: 'Dashboard', path: '/', icon: LayoutDashboard },
-    { name: 'Buy Tickets', path: '/buy-tickets', icon: DollarSign },
     { name: 'Cash Drawer', path: '/cash-drawer', icon: Wallet, permission: 'canManageCash' as const },
     { name: 'Trip Tickets', path: '/trip-tickets', icon: Truck },
     { name: 'Invoices', path: '/invoices', icon: FileText },

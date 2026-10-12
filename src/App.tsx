@@ -10,7 +10,6 @@ import Dashboard from './pages/Dashboard';
 import ManagePrices from './pages/ManagePrices';
 import Inventory from './pages/Inventory';
 import Reports from './pages/Reports';
-import BuyTickets from './pages/BuyTickets';
 import TripTickets from './pages/TripTickets';
 import Invoices from './pages/Invoices';
 import Customers from './pages/Customers';
@@ -821,7 +820,8 @@ export default function App() {
                 element={user ? <Layout user={user} profile={profile} /> : <Navigate to="/login" />}
               >
                 <Route index element={<Dashboard profile={profile} />} />
-                <Route path="buy-tickets" element={<BuyTickets profile={profile} />} />
+                {/* Buy Tickets page removed 2026-10-11 (all tickets go through Quick Ticket); old bookmarks land on the Dashboard. */}
+                <Route path="buy-tickets" element={<Navigate to="/" replace />} />
                 <Route path="trip-tickets" element={<TripTickets profile={profile} />} />
                 <Route path="customers" element={<Customers profile={profile} />} />
                 <Route path="ticket-history" element={<TicketHistory profile={profile} />} />

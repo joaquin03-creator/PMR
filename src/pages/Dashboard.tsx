@@ -44,7 +44,6 @@ import { safeSetItem } from '../lib/safeStorage';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArcGauge } from '../components/ArcGauge';
 import ManagerPinModal from '../components/ManagerPinModal';
-import BuyTicketModal from '../components/BuyTicketModal';
 import { CameraCapture } from '../components/CameraCapture';
 import { ScaleCaptureButton } from '../components/ScaleCaptureButton';
 import SignaturePad from '../components/SignaturePad';
@@ -298,7 +297,6 @@ export default function Dashboard({ profile }: DashboardProps) {
 
   // Quick Ticket State
   const [showQuickTicket, setShowQuickTicket] = useState(false);
-  const [showFullTicket, setShowFullTicket] = useState(false);
   const [isCustomerLookupOpen, setIsCustomerLookupOpen] = useState(false);
   const [customerSearch, setCustomerSearch] = useState('');
   const [step, setStep] = useState(1);
@@ -361,7 +359,6 @@ export default function Dashboard({ profile }: DashboardProps) {
   const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [drafts, setDrafts] = useState<any[]>([]);
-  const [resumeDraftId, setResumeDraftId] = useState<string | null>(null);
   const [isReadingID, setIsReadingID] = useState(false);
   const [isUSBScannerOpen, setIsUSBScannerOpen] = useState(false);
   const [usbScanFeedback, setUsbScanFeedback] = useState<{ type: 'success' | 'new', message: string } | null>(null);
@@ -1843,7 +1840,7 @@ export default function Dashboard({ profile }: DashboardProps) {
           title: count === 1 ? '1 Ticket Needs Data Review' : `${count} Tickets Need Data Review`,
           description,
           actionText: 'Review Tickets',
-          actionHref: '/buy-tickets',
+          actionHref: '/ticket-history?filter=today',
           canDismiss: true
         });
       }
@@ -2101,7 +2098,7 @@ export default function Dashboard({ profile }: DashboardProps) {
                           }
                         }, 350);
                       } else {
-                        navigate('/buy-tickets');
+                        openQuickTicket();
                       }
                     }}
                     className="flex-grow py-2.5 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition-all text-center cursor-pointer"
@@ -2300,7 +2297,7 @@ export default function Dashboard({ profile }: DashboardProps) {
         <section className={cn("bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden", settings.theme === 'dark' && "bg-slate-900 border-slate-800")} aria-label="Recent Activity">
           <div className={cn("p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50", settings.theme === 'dark' && "bg-slate-800 border-slate-700")}>
             <h3 className={cn("font-black text-slate-900 uppercase tracking-widest text-xs", settings.theme === 'dark' && "text-white")}>Today's Transactions</h3>
-            <Link to="/buy-tickets" className="text-xs font-black text-blue-600 hover:text-blue-700 uppercase tracking-widest outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-md px-1">View All</Link>
+            <Link to="/ticket-history?filter=today" className="text-xs font-black text-blue-600 hover:text-blue-700 uppercase tracking-widest outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-md px-1">View All</Link>
           </div>
           <div className="divide-y divide-slate-50 dark:divide-slate-800">
             {todayTickets.slice(0, settings.compactMode ? 3 : 5).map((ticket) => (
@@ -4407,16 +4404,6 @@ export default function Dashboard({ profile }: DashboardProps) {
         isOpen={showPinModal}
         onClose={() => setShowPinModal(false)}
         onSuccess={() => saveQuickTicket()}
-      />
-
-      <BuyTicketModal 
-        isOpen={showFullTicket}
-        onClose={() => {
-          setShowFullTicket(false);
-          setResumeDraftId(null);
-        }}
-        profile={profile}
-        resumeDraftId={resumeDraftId}
       />
 
       {dbHistoryAlert && dbHistoryAlert.isOpen && (

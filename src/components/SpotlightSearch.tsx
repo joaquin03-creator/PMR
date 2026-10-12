@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { useSettings } from '../context/SettingsContext';
+import { useQuickTicket } from '../context/QuickTicketContext';
 import { Material, Customer, BuyTicket, UserProfile } from '../types';
 
 interface SpotlightSearchProps {
@@ -129,12 +130,12 @@ export default function SpotlightSearch({ isOpen, onClose, profile }: SpotlightS
 
   // Helper roles
   const isManager = profile?.role === 'manager';
+  const { openQuickTicket } = useQuickTicket();
 
   // Navigation Items
   const navItems = useMemo(() => {
     const items = [
       { name: 'Dashboard', path: '/', icon: LayoutDashboard },
-      { name: 'Buy Tickets', path: '/buy-tickets', icon: DollarSign },
       { name: 'Cash Drawer', path: '/cash-drawer', icon: Wallet, permission: 'canManageCash' },
       { name: 'Trip Tickets', path: '/trip-tickets', icon: Truck },
       { name: 'Invoices', path: '/invoices', icon: FileText, permission: 'canManageInvoices' },
@@ -258,7 +259,7 @@ export default function SpotlightSearch({ isOpen, onClose, profile }: SpotlightS
           if (isManager) {
             navigate(`/manage-prices?search=${encodeURIComponent(m.code)}`);
           } else {
-            navigate(`/buy-tickets?materialId=${encodeURIComponent(m.id)}`);
+            openQuickTicket();
           }
           onClose();
         },
@@ -328,7 +329,7 @@ export default function SpotlightSearch({ isOpen, onClose, profile }: SpotlightS
       });
 
     return [...matchedPages, ...matchedToggles, ...matchedMaterials, ...matchedCustomers, ...matchedTickets];
-  }, [searchQuery, navItems, configToggles, materials, customers, tickets, isManager, navigate, onClose]);
+  }, [searchQuery, navItems, configToggles, materials, customers, tickets, isManager, navigate, onClose, openQuickTicket]);
 
   // Group items by category for stunning visual breakdown
   const groupedItems = useMemo(() => {
