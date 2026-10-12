@@ -33,7 +33,7 @@ import { cn, generateTicketId } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import ManagerPinModal from '../components/ManagerPinModal';
-import TripTicketDocument from '../components/TripTicketDocument';
+import TripTicketDocument, { getTripGrossWeight } from '../components/TripTicketDocument';
 
 export default function TripTickets({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
@@ -125,13 +125,31 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
     }]);
   };
 
-  const handleRemoveMaterial = (materialId: string) => {
-    setSelectedMaterials(prev => prev.filter(m => m.materialId !== materialId));
+  // Lines are addressed by position, not materialId: a ticket filled from an invoice has one
+  // line per box, and several boxes can hold the same material.
+  const handleRemoveMaterial = (index: number) => {
+    setSelectedMaterials(prev => prev.filter((_, idx) => idx !== index));
   };
 
-  const handleWeightChange = (materialId: string, weight: number) => {
-    setSelectedMaterials(prev => prev.map(m => 
-      m.materialId === materialId ? { ...m, weight } : m
+  // Keeps gross - tare = material weight after an edit (the same relation Invoices uses), so a
+  // tare carried in from an invoice never goes stale. Never stores undefined (Firestore rejects it).
+  const withConsistentTare = (line: TripTicketMaterial): TripTicketMaterial => {
+    const { grossWeight, tareWeight: _tare, ...rest } = line;
+    if (!(grossWeight !== undefined && grossWeight > 0)) return rest;
+    const tare = Math.round((grossWeight - line.weight) * 100) / 100;
+    return tare > 0 ? { ...rest, grossWeight, tareWeight: tare } : { ...rest, grossWeight };
+  };
+
+  const handleWeightChange = (index: number, weight: number) => {
+    setSelectedMaterials(prev => prev.map((m, idx) =>
+      idx === index ? withConsistentTare({ ...m, weight }) : m
+    ));
+  };
+
+  // Gross weight is optional; a blank/zero entry clears it.
+  const handleGrossWeightChange = (index: number, grossWeight: number) => {
+    setSelectedMaterials(prev => prev.map((m, idx) =>
+      idx === index ? withConsistentTare({ ...m, grossWeight }) : m
     ));
   };
 
@@ -665,32 +683,55 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                       <p className="text-xs font-bold uppercase tracking-widest">Empty Load</p>
                     </div>
                   ) : (
-                    selectedMaterials.map((item) => {
+                    selectedMaterials.map((item, idx) => {
                       const material = materials.find(m => m.id === item.materialId);
                       return (
-                        <div key={item.materialId} className="space-y-2 p-4 bg-slate-50 rounded-2xl border border-slate-100 group">
+                        <div key={idx} className="space-y-2 p-4 bg-slate-50 rounded-2xl border border-slate-100 group">
                           <div className="flex items-center justify-between gap-4">
                             <div className="flex-1 min-w-0">
-                              <p className="text-sm font-bold text-slate-900 truncate">{material?.name}</p>
+                              <p className="text-sm font-bold text-slate-900 truncate">
+                                {item.boxNumber ? `${item.boxNumber}: ` : ''}{item.customName || material?.name || 'Unknown Material'}
+                              </p>
                               <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Sale: ${item.salePrice}/{material?.unit}</p>
                             </div>
                             <button 
-                              onClick={() => handleRemoveMaterial(item.materialId)}
+                              onClick={() => handleRemoveMaterial(idx)}
                               className="p-2 text-slate-300 hover:text-red-500 rounded-xl transition-colors"
                             >
                               <X className="w-4 h-4" />
                             </button>
                           </div>
-                          <div className="relative">
-                            <input
-                              type="number"
-                              className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-black focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-                              placeholder="Enter Weight"
-                              value={item.weight || ''}
-                              onChange={(e) => handleWeightChange(item.materialId, Number(e.target.value))}
-                            />
-                            <span className="absolute right-4 top-1/2 -translate-y-1/2 text-[10px] font-black text-slate-400 uppercase">{material?.unit}</span>
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="space-y-1">
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Material Weight</label>
+                              <div className="relative">
+                                <input
+                                  type="number"
+                                  className="w-full px-3 py-3 bg-white border border-slate-200 rounded-xl text-sm font-black focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                                  placeholder="Net"
+                                  value={item.weight || ''}
+                                  onChange={(e) => handleWeightChange(idx, Number(e.target.value))}
+                                />
+                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-black text-slate-400 uppercase">{material?.unit}</span>
+                              </div>
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Gross Weight</label>
+                              <div className="relative">
+                                <input
+                                  type="number"
+                                  className="w-full px-3 py-3 bg-white border border-slate-200 rounded-xl text-sm font-black focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                                  placeholder="Optional"
+                                  value={item.grossWeight || ''}
+                                  onChange={(e) => handleGrossWeightChange(idx, Number(e.target.value))}
+                                />
+                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-black text-slate-400 uppercase">lb</span>
+                              </div>
+                            </div>
                           </div>
+                          {!!item.grossWeight && item.grossWeight < item.weight && (
+                            <p className="text-[10px] font-bold text-amber-700">Gross is less than the material weight — check the numbers.</p>
+                          )}
                         </div>
                       );
                     })
@@ -709,8 +750,16 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
 
                 <div className="pt-4 border-t border-slate-100 space-y-2">
                   <div className="flex justify-between text-xs font-black text-slate-400 uppercase tracking-widest">
-                    <span>Total Weight</span>
+                    <span>Material Weight</span>
                     <span className="text-slate-900">{selectedMaterials.reduce((sum, m) => sum + m.weight, 0).toLocaleString()} lb</span>
+                  </div>
+                  <div className="flex justify-between text-xs font-black text-slate-400 uppercase tracking-widest">
+                    <span>Gross Weight</span>
+                    <span className="text-slate-900">
+                      {getTripGrossWeight(selectedMaterials) !== null
+                        ? `${getTripGrossWeight(selectedMaterials)!.toLocaleString()} lb`
+                        : selectedMaterials.some(m => m.grossWeight) ? 'Incomplete' : 'Write in on BOL'}
+                    </span>
                   </div>
                   <div className="flex justify-between text-xs font-black text-slate-400 uppercase tracking-widest">
                     <span>Estimated Value</span>
@@ -932,6 +981,9 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                         </div>
                         <div className="text-right">
                           <p className="text-lg font-black text-slate-900">{item.weight.toLocaleString()} lb</p>
+                          {!!item.grossWeight && (
+                            <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Gross: {item.grossWeight.toLocaleString()} lb</p>
+                          )}
                           <p className="text-[10px] text-blue-600 font-black uppercase tracking-widest">${(item.weight * item.salePrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                         </div>
                       </div>
@@ -1022,8 +1074,13 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                   <p className="text-sm font-black text-indigo-600 uppercase">{selectedTicket.createdByName || 'System'}</p>
                 </div>
                 <div className="space-y-1">
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Net Material Weight</p>
+                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Material Weight</p>
                   <p className="text-3xl font-black text-slate-900">{(selectedTicket.totalWeight || 0).toLocaleString()} lb</p>
+                  {getTripGrossWeight(selectedTicket.materials) !== null && (
+                    <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest text-right">
+                      Gross Weight: {getTripGrossWeight(selectedTicket.materials)!.toLocaleString()} lb
+                    </p>
+                  )}
                 </div>
                 <div className="text-right space-y-1">
                   <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Estimated Value</p>

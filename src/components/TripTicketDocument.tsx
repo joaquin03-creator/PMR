@@ -10,6 +10,15 @@ interface TripTicketDocumentProps {
   className?: string;
 }
 
+/**
+ * Total gross weight of a load: the sum of each line's gross weight. Returns null unless
+ * EVERY line has a gross weight, so a partial figure is never printed as the load's gross.
+ */
+export function getTripGrossWeight(lines: TripTicket['materials']): number | null {
+  if (lines.length === 0 || lines.some((m) => !(m.grossWeight !== undefined && m.grossWeight > 0))) return null;
+  return lines.reduce((sum, m) => sum + (m.grossWeight || 0), 0);
+}
+
 export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
   ticket,
   materials,
@@ -25,6 +34,7 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
   const hasAnyGrossTare = ticket.materials.some(
     (m) => (m.grossWeight !== undefined && m.grossWeight > 0) || (m.tareWeight !== undefined && m.tareWeight > 0)
   );
+  const totalGrossWeight = getTripGrossWeight(ticket.materials);
 
   return (
     <div
@@ -142,11 +152,11 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
               </th>
               {hasAnyGrossTare && (
                 <th className="py-1 px-1.5 text-right text-[9px] font-black uppercase tracking-wider text-slate-600 w-32">
-                  Gross / Tare (lb)
+                  Gross Weight
                 </th>
               )}
               <th className="py-1 px-1.5 text-right text-[9px] font-black uppercase tracking-wider text-slate-600 w-28">
-                Net Weight
+                Material Weight
               </th>
             </tr>
           </thead>
@@ -177,10 +187,13 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
                     </div>
                   </td>
                   {hasAnyGrossTare && (
-                    <td className="py-1 px-1.5 text-right text-[10px] text-slate-600 font-mono leading-none">
+                    <td className="py-1 px-1.5 text-right text-[11px] font-black text-slate-900 font-mono leading-none">
                       {hasRowGrossTare ? (
                         <span>
-                          G: {(item.grossWeight || 0).toLocaleString()} | T: {(item.tareWeight || 0).toLocaleString()}
+                          {item.grossWeight ? `${item.grossWeight.toLocaleString()} lb` : '-'}
+                          {item.tareWeight ? (
+                            <span className="block text-[9px] font-medium text-slate-500 mt-0.5">Tare: {item.tareWeight.toLocaleString()} lb</span>
+                          ) : null}
                         </span>
                       ) : (
                         <span className="text-slate-300">-</span>
@@ -228,9 +241,9 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
 
         <div className="w-72 space-y-1.5 text-right flex flex-col items-end shrink-0">
           <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 w-full text-right print:bg-transparent print:border-slate-300 space-y-2">
-            {/* Net Material Weight */}
+            {/* Material Weight (net) */}
             <div>
-              <p className="text-[9px] font-black uppercase tracking-widest text-slate-500">NET MATERIAL WEIGHT</p>
+              <p className="text-[9px] font-black uppercase tracking-widest text-slate-500">MATERIAL WEIGHT</p>
               <p className="text-lg font-black text-slate-900 font-mono mt-0.5 leading-none">
                 {(ticket.totalWeight || 0).toLocaleString()} <span className="text-[11px] text-slate-500 font-sans">lb</span>
               </p>
@@ -239,17 +252,27 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
               </p>
             </div>
 
-            {/* Total Load Weight (Gross Write-in Box for Pallets & Boxes) */}
-            <div className="pt-2 border-t border-dashed border-slate-300 text-left">
-              <div className="flex items-center justify-between">
-                <p className="text-[10px] font-black uppercase tracking-widest text-slate-900">TOTAL LOAD WEIGHT</p>
-                <span className="text-[8px] font-bold uppercase tracking-wider text-slate-400">(Manual Gross Wt)</span>
+            {/* Gross Weight: printed when every line has one, otherwise a write-in box */}
+            {totalGrossWeight !== null ? (
+              <div className="pt-2 border-t border-dashed border-slate-300">
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-500">GROSS WEIGHT</p>
+                <p className="text-lg font-black text-slate-900 font-mono mt-0.5 leading-none">
+                  {totalGrossWeight.toLocaleString()} <span className="text-[11px] text-slate-500 font-sans">lb</span>
+                </p>
+                <p className="text-[8px] font-bold text-slate-400 mt-0.5">Material + Packaging</p>
               </div>
-              <div className="mt-1 h-8 border-2 border-slate-900 rounded-lg bg-white flex items-center justify-between px-3 print:bg-transparent">
-                <span className="text-[9px] font-sans font-medium text-slate-300 select-none italic no-print">Enter Gross Scale Wt...</span>
-                <span className="text-[11px] font-black text-slate-900 font-mono ml-auto">LBS</span>
+            ) : (
+              <div className="pt-2 border-t border-dashed border-slate-300 text-left">
+                <div className="flex items-center justify-between">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-900">GROSS WEIGHT</p>
+                  <span className="text-[8px] font-bold uppercase tracking-wider text-slate-400">(Write In)</span>
+                </div>
+                <div className="mt-1 h-8 border-2 border-slate-900 rounded-lg bg-white flex items-center justify-between px-3 print:bg-transparent">
+                  <span className="text-[9px] font-sans font-medium text-slate-300 select-none italic no-print">Enter Gross Scale Wt...</span>
+                  <span className="text-[11px] font-black text-slate-900 font-mono ml-auto">LBS</span>
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </div>
       </div>
