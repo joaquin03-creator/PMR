@@ -692,7 +692,9 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                               <p className="text-sm font-bold text-slate-900 truncate">
                                 {item.boxNumber ? `${item.boxNumber}: ` : ''}{item.customName || material?.name || 'Unknown Material'}
                               </p>
-                              <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Sale: ${item.salePrice}/{material?.unit}</p>
+                              {material?.code && (
+                                <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Code: {material.code}</p>
+                              )}
                             </div>
                             <button 
                               onClick={() => handleRemoveMaterial(idx)}
@@ -760,10 +762,6 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                         ? `${getTripGrossWeight(selectedMaterials)!.toLocaleString()} lb`
                         : selectedMaterials.some(m => m.grossWeight) ? 'Incomplete' : 'Write in on BOL'}
                     </span>
-                  </div>
-                  <div className="flex justify-between text-xs font-black text-slate-400 uppercase tracking-widest">
-                    <span>Estimated Value</span>
-                    <span className="text-blue-600">${selectedMaterials.reduce((sum, m) => sum + (m.weight * m.salePrice), 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                   </div>
                 </div>
 
@@ -976,7 +974,7 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                           <span className="w-8 h-8 bg-slate-50 rounded-full flex items-center justify-center text-xs font-black text-slate-400">{idx + 1}</span>
                           <div>
                             <p className="text-sm font-black text-slate-900">{material?.name || 'Unknown Material'}</p>
-                            <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Sale Price: ${item.salePrice.toFixed(2)}</p>
+                            <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{item.boxNumber ? `${item.boxNumber} • ` : ''}Code: {material?.code || '-'}</p>
                           </div>
                         </div>
                         <div className="text-right">
@@ -984,7 +982,6 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                           {!!item.grossWeight && (
                             <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Gross: {item.grossWeight.toLocaleString()} lb</p>
                           )}
-                          <p className="text-[10px] text-blue-600 font-black uppercase tracking-widest">${(item.weight * item.salePrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                         </div>
                       </div>
                     );
@@ -1081,10 +1078,6 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                       Gross Weight: {getTripGrossWeight(selectedTicket.materials)!.toLocaleString()} lb
                     </p>
                   )}
-                </div>
-                <div className="text-right space-y-1">
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Estimated Value</p>
-                  <p className="text-4xl font-black text-blue-600">${(selectedTicket.totalValue || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                 </div>
               </div>
             </div>
