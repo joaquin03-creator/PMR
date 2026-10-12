@@ -1,4 +1,9 @@
-export const COMPANY_LOGO_URL = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 350'%3E%3Cg transform='translate(50, 50)'%3E%3Cpath d='M0 250 L125 0 L250 250 Z' fill='%23B87333' /%3E%3Cpath d='M50 210 L125 60 L200 210 Z' fill='%23ffffff' opacity='0.3'/%3E%3C/g%3E%3Cg transform='translate(350, 100)' font-family='Arial, sans-serif' fill='%2310213C'%3E%3Ctext font-size='40' font-weight='700' letter-spacing='6'%3EPREFERRED%3C/text%3E%3Ctext y='90' font-size='110' font-weight='900' letter-spacing='1'%3EMETALS%3C/text%3E%3Ctext y='160' font-size='35' font-weight='400' letter-spacing='16'%3E%26 RECYCLING%3C/text%3E%3C/g%3E%3C/svg%3E";
+// The real PMR logo, print version: copper mark + navy lettering on a transparent
+// background (the website artwork sits on a dark navy panel, which would print as
+// a solid block). Inlined so it prints offline and on a cold cache.
+import companyLogoPrint from './assets/pmr-logo-print.png?inline';
+
+export const COMPANY_LOGO_URL = companyLogoPrint;
 export const COMPANY_NAME = "Preferred Metals & Recycling";
 export const COMPANY_ADDRESS = "5619 Montgomery Rd.";
 export const COMPANY_PHONE = "(513) 840-5274";

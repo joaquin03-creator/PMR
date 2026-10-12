@@ -60,8 +60,8 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
           </p>
         </div>
         <div className="flex flex-col items-end">
-          <div className="h-10 w-auto flex items-center justify-end">
-            <BrandLogo className="h-full w-auto object-contain grayscale opacity-80" grayscale />
+          <div className="h-12 w-auto flex items-center justify-end">
+            <BrandLogo className="h-full w-auto object-contain" />
           </div>
           <span className="text-[9px] font-black uppercase tracking-widest text-slate-500 mt-0.5">
             Bill of Lading / Dispatch Ticket

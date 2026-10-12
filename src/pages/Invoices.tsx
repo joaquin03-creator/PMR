@@ -194,8 +194,8 @@ const InvoiceDocument = ({
           <p className="text-sm text-slate-500 font-bold mt-1">{COMPANY_ADDRESS}</p>
           <p className="text-sm text-slate-500 mt-1">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
         </div>
-        <div className="h-14 w-auto flex items-center justify-center">
-          <BrandLogo className="h-full w-auto object-contain grayscale opacity-60" grayscale />
+        <div className="h-20 w-auto flex items-center justify-center">
+          <BrandLogo className="h-full w-auto object-contain" />
         </div>
       </div>
 
