@@ -8,6 +8,7 @@ import { LoadEconomicsSummary } from '../components/LoadEconomicsSummary';
 import { logAuditEvent } from '../lib/audit';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
+import { consolidateInvoiceLines } from '../lib/invoiceSummary';
 import { roundNetWeight } from '../lib/weightUtils';
 import { 
   FileText, 
@@ -253,42 +254,44 @@ const InvoiceDocument = ({
           <thead>
             <tr className="border-b-2 border-slate-900">
               <th className="py-4 text-left text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Description</th>
-              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Quantity</th>
+              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Gross</th>
+              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Tare</th>
+              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Net</th>
               <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Unit Price</th>
               <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Total</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100 font-sans">
-            {invoice.materials.map((item, idx) => {
-              const material = materials.find(m => m.id === item.materialId);
-              const showBoxDetails = item.boxNumber !== undefined || item.grossWeight !== undefined || item.tareWeight !== undefined;
+            {/* One row per material (and price): every box of it added together. The invoice itself keeps its per-box lines. */}
+            {consolidateInvoiceLines(invoice.materials).map((row, idx) => {
+              const material = materials.find(m => m.id === row.materialId);
+              const unit = material?.unit || 'lb';
               return (
                 <tr key={idx} className="group border-b border-slate-100 last:border-none">
                   <td className="py-3 text-left">
                     <div className="space-y-0.5">
                       <p className="text-sm font-black text-slate-900 uppercase tracking-tight">
-                        {item.boxNumber ? `${item.boxNumber}: ` : ''}{item.customName || material?.name || 'Unknown Material'}
+                        {row.customName || material?.name || 'Unknown Material'}
                       </p>
                       <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
-                        Code: {material?.code || '-'} {item.slotIndex !== undefined ? `• Flatbed Slot ${item.slotIndex + 1}` : ''}
+                        Code: {material?.code || '-'}{row.boxCount > 1 ? ` • ${row.boxCount} boxes` : ''}
                       </p>
                     </div>
                   </td>
-                  <td className="py-3 text-right">
-                    <div className="space-y-0.5 text-right font-sans">
-                      <p className="text-sm font-bold text-slate-900">{item.weight.toLocaleString()} {material?.unit || 'lb'}</p>
-                      {showBoxDetails && (
-                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">
-                          G: {item.grossWeight || 0} lb | T: {item.tareWeight || 0} lb
-                        </p>
-                      )}
-                    </div>
+                  <td className="py-3 text-right font-sans">
+                    <p className="text-sm font-bold text-slate-500">{row.grossWeight !== null ? `${row.grossWeight.toLocaleString()} ${unit}` : '—'}</p>
                   </td>
                   <td className="py-3 text-right font-sans">
-                    <p className="text-sm font-bold text-slate-500">${item.salePrice.toFixed(2)}</p>
+                    <p className="text-sm font-bold text-slate-500">{row.tareWeight !== null ? `${row.tareWeight.toLocaleString()} ${unit}` : '—'}</p>
                   </td>
                   <td className="py-3 text-right font-sans">
-                    <p className="text-sm font-black text-slate-900">${(item.weight * item.salePrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                    <p className="text-sm font-bold text-slate-900">{row.netWeight.toLocaleString()} {unit}</p>
+                  </td>
+                  <td className="py-3 text-right font-sans">
+                    <p className="text-sm font-bold text-slate-500">${row.salePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</p>
+                  </td>
+                  <td className="py-3 text-right font-sans">
+                    <p className="text-sm font-black text-slate-900">${row.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
                   </td>
                 </tr>
               );
