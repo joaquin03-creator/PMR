@@ -48,22 +48,17 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
 
       {/* Header Section */}
       <div className="flex justify-between items-start mb-2 text-left">
-        <div className="space-y-0.5 max-w-lg">
-          <h1 className="text-xl font-black uppercase tracking-tight text-slate-900 leading-tight">
-            {COMPANY_NAME}
-          </h1>
-          <p className="text-[10px] text-slate-500 font-medium tracking-wide">
-            {COMPANY_WEBSITE} • {COMPANY_EMAIL}
-          </p>
+        <div className="h-12 w-auto flex items-center justify-start">
+          <BrandLogo className="h-full w-auto object-contain" />
+        </div>
+        <div className="flex flex-col items-end space-y-0.5 text-right">
           <p className="text-[10px] text-slate-600 font-semibold">
             {COMPANY_ADDRESS} • Tel: {COMPANY_PHONE}
           </p>
-        </div>
-        <div className="flex flex-col items-end">
-          <div className="h-12 w-auto flex items-center justify-end">
-            <BrandLogo className="h-full w-auto object-contain" />
-          </div>
-          <span className="text-[9px] font-black uppercase tracking-widest text-slate-500 mt-0.5">
+          <p className="text-[10px] text-slate-500 font-medium tracking-wide">
+            {COMPANY_WEBSITE} • {COMPANY_EMAIL}
+          </p>
+          <span className="text-[9px] font-black uppercase tracking-widest text-slate-500">
             Bill of Lading / Dispatch Ticket
           </span>
         </div>

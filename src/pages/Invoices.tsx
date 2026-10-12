@@ -188,14 +188,13 @@ const InvoiceDocument = ({
       
       {/* Header */}
       <div className="flex justify-between items-start mb-4 text-left text-xs">
-        <div className="space-y-1">
-          <h1 className="text-4xl font-black uppercase tracking-tight text-slate-900">{COMPANY_NAME}</h1>
-          <p className="text-sm text-slate-400 font-medium tracking-wide mt-0.5">{COMPANY_WEBSITE}</p>
-          <p className="text-sm text-slate-500 font-bold mt-1">{COMPANY_ADDRESS}</p>
-          <p className="text-sm text-slate-500 mt-1">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
-        </div>
         <div className="h-20 w-auto flex items-center justify-center">
           <BrandLogo className="h-full w-auto object-contain" />
+        </div>
+        <div className="space-y-1 text-right">
+          <p className="text-sm text-slate-500 font-bold">{COMPANY_ADDRESS}</p>
+          <p className="text-sm text-slate-500">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
+          <p className="text-sm text-slate-400 font-medium tracking-wide">{COMPANY_WEBSITE}</p>
         </div>
       </div>
 
