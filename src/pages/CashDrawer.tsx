@@ -61,6 +61,7 @@ import { safeSetItem, clearSessionDrafts, pruneDraftStorage } from '../lib/safeS
 import {
   calculateExpectedCash,
   calculateOverShort,
+  calculateDenomTotal as lockedDenomTotal,
   runCashLogicSelfTest,
   isCashPayoutTicket
 } from '../lib/cashLogicLock';
@@ -1916,22 +1917,21 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
   }, [expectedCash, selectedSession?.id, selectedSession?.expectedCash, sessionTotalsReady]);
 
-  const calculateDenomTotal = (denoms: DenominationCount) => {
-    const d = ensureDenomTotals(denoms);
-    const sum = (
-      (d.hundreds || 0) +
-      (d.fifties || 0) +
-      (d.twenties || 0) +
-      (d.tens || 0) +
-      (d.fives || 0) +
-      (d.ones || 0) +
-      (d.dollarCoins || 0) +
-      (d.halfDollars || 0) +
-      (d.quarters || 0) +
-      (d.dimes || 0) +
-      (d.nickels || 0)
-    );
-    return Math.round(sum * 100) / 100;
+  // Every count form holds DOLLAR amounts, so the total is the locked plain sum. It used to
+  // run ensureDenomTotals first, whose counts-vs-dollars guess fired on a half-typed entry
+  // (e.g. "1" in twenties while counting the loose bills) and multiplied EVERY box by its face
+  // value: 2026-10-15 autosaved $465,020 for $6,201 entered. ensureDenomTotals stays for
+  // loading stored records only.
+  const calculateDenomTotal = (denoms: DenominationCount) => lockedDenomTotal(denoms);
+
+  // The Finalize Provisional pop-up takes bill/coin COUNTS; convert to dollar amounts
+  // before totalling or storing, like every other count form.
+  const finalizeCountsToDollars = (counts: DenominationCount): DenominationCount => {
+    const converted = { ...initialDenominations };
+    denominationsList.forEach(d => {
+      converted[d.key] = Math.round((counts[d.key] || 0) * d.value * 100) / 100;
+    });
+    return converted;
   };
 
   // ─── PROVISIONAL & CATCH-UP RECONCILIATION ACTIONS ───────────────────
@@ -2251,7 +2251,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     try {
       let actualCash = 0;
       if (useFinalizeDenoms) {
-        actualCash = calculateDenomTotal(finalizeDenoms);
+        actualCash = calculateDenomTotal(finalizeCountsToDollars(finalizeDenoms));
       } else {
         actualCash = parseFloat(quickFinalizeCash) || 0;
       }
@@ -2276,7 +2276,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         closedBy: profile.email,
         provisionalFinalizedAt: now,
         provisionalFinalizedBy: profile.email,
-        ...(useFinalizeDenoms ? { closingDenominations: finalizeDenoms } : {}),
+        ...(useFinalizeDenoms ? { closingDenominations: finalizeCountsToDollars(finalizeDenoms) } : {}),
         ...(sessionNotes ? { notes: sessionNotes } : {})
       };
 
@@ -2292,7 +2292,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         'close',
         {
           before: { status: 'provisional', actualCash: provisionalSessionToFinalize.actualCash ?? null, overShort: 0 },
-          after: { status: 'closed', actualCash, overShort: diff, closingDenominations: finalizeDenoms }
+          after: { status: 'closed', actualCash, overShort: diff, closingDenominations: useFinalizeDenoms ? finalizeCountsToDollars(finalizeDenoms) : null }
         },
         `Provisional ${provisionalSessionToFinalize.date} finalized: assumed $${assumedStr}, actual $${actualStr}, true over/short $${diffStr}.`
       );
@@ -5997,7 +5997,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   <div className="p-4 bg-blue-50 rounded-2xl border border-blue-200 flex items-center justify-between">
                     <span className="text-xs font-black uppercase text-blue-900 tracking-wider">Counted Total</span>
                     <span className="text-2xl font-mono font-black text-blue-900">
-                      ${calculateDenomTotal(finalizeDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      ${calculateDenomTotal(finalizeCountsToDollars(finalizeDenoms)).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </span>
                   </div>
                 </div>
@@ -6023,7 +6023,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
               {/* Over/Short preview */}
               {(() => {
                 const enteredCash = useFinalizeDenoms
-                  ? calculateDenomTotal(finalizeDenoms)
+                  ? calculateDenomTotal(finalizeCountsToDollars(finalizeDenoms))
                   : parseFloat(quickFinalizeCash) || 0;
                 const diff = calculateOverShort(enteredCash, provisionalSessionToFinalize.expectedCash);
                 return (
