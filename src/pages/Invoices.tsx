@@ -8,7 +8,7 @@ import { LoadEconomicsSummary } from '../components/LoadEconomicsSummary';
 import { logAuditEvent } from '../lib/audit';
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
-import { consolidateInvoiceLines } from '../lib/invoiceSummary';
+import { groupInvoiceLines, InvoiceSummaryRow } from '../lib/invoiceSummary';
 import { roundNetWeight } from '../lib/weightUtils';
 import { 
   FileText, 
@@ -179,27 +179,57 @@ const InvoiceDocument = ({
   invoice: Invoice; 
   materials: Material[]; 
   className?: string;
-  /** false (default) = one row per material; true = one row per box. */
+  /** false (default) = one row per material; true = each material's subtotal row followed by its boxes. */
   detailed?: boolean;
 }) => {
-  // Summary: every box of a material (at one price) added together. Detailed: the
-  // invoice's own per-box lines. Same columns either way; the invoice is unchanged.
-  const rows = detailed
-    ? invoice.materials.map(line => {
-        const hasGross = line.grossWeight !== undefined && line.grossWeight > 0;
-        return {
-          materialId: line.materialId,
-          customName: line.customName || undefined,
-          salePrice: line.salePrice,
-          boxCount: 1,
-          boxNumber: line.boxNumber,
-          netWeight: line.weight,
-          grossWeight: hasGross ? (line.grossWeight as number) : null,
-          tareWeight: hasGross ? (line.tareWeight || 0) : null,
-          amount: line.weight * line.salePrice,
-        };
-      })
-    : consolidateInvoiceLines(invoice.materials).map(row => ({ ...row, boxNumber: undefined as string | number | undefined }));
+  // Both views list materials A-Z, like the owner's Google Sheet. Summary: one row per
+  // material (at one price). Detailed: that same row as a subtotal, then every box under
+  // it. Display only; the invoice is unchanged.
+  const materialOf = (materialId: string) => materials.find(m => m.id === materialId);
+  const nameOf = (row: { materialId: string; customName?: string }) =>
+    row.customName || materialOf(row.materialId)?.name || 'Unknown Material';
+  const groups = groupInvoiceLines(invoice.materials, nameOf);
+  const boxRowOf = (line: Invoice['materials'][number]): InvoiceSummaryRow => {
+    const hasGross = line.grossWeight !== undefined && line.grossWeight > 0;
+    return {
+      materialId: line.materialId,
+      customName: line.customName || undefined,
+      salePrice: line.salePrice,
+      boxCount: 1,
+      netWeight: line.weight,
+      grossWeight: hasGross ? (line.grossWeight as number) : null,
+      tareWeight: hasGross ? (line.tareWeight || 0) : null,
+      amount: line.weight * line.salePrice,
+    };
+  };
+  // Grand totals for the last table row. Gross/Tare only when EVERY box has a gross
+  // (same rule as each material row); dollars are the invoice's stored total.
+  const allHaveGross = invoice.materials.length > 0 && invoice.materials.every(l => l.grossWeight !== undefined && l.grossWeight > 0);
+  const totalNet = invoice.materials.reduce((s, l) => s + l.weight, 0);
+  const totalGross = allHaveGross ? invoice.materials.reduce((s, l) => s + (l.grossWeight || 0), 0) : null;
+  const totalTare = allHaveGross ? invoice.materials.reduce((s, l) => s + (l.tareWeight || 0), 0) : null;
+  const units = new Set(invoice.materials.map(l => materialOf(l.materialId)?.unit || 'lb'));
+  const totalUnit = units.size === 1 ? Array.from(units)[0] : '';
+
+  const weightCells = (row: InvoiceSummaryRow, unit: string, strong: boolean) => (
+    <>
+      <td className="py-2 text-right font-sans">
+        <p className="text-sm font-bold text-slate-500">{row.grossWeight !== null ? `${row.grossWeight.toLocaleString()} ${unit}` : '—'}</p>
+      </td>
+      <td className="py-2 text-right font-sans">
+        <p className="text-sm font-bold text-slate-500">{row.tareWeight !== null ? `${row.tareWeight.toLocaleString()} ${unit}` : '—'}</p>
+      </td>
+      <td className="py-2 text-right font-sans">
+        <p className={cn("text-sm text-slate-900", strong ? 'font-black' : 'font-bold')}>{row.netWeight.toLocaleString()} {unit}</p>
+      </td>
+      <td className="py-2 text-right font-sans">
+        <p className="text-sm font-bold text-slate-500">${row.salePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</p>
+      </td>
+      <td className="py-2 text-right font-sans">
+        <p className={cn("text-sm text-slate-900", strong ? 'font-black' : 'font-bold')}>${row.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+      </td>
+    </>
+  );
   return (
     <div className={cn(
       "bg-white px-6 py-4 font-sans text-slate-900 invoice-container relative flex flex-col min-h-0 w-full max-w-[1000px] print:max-w-none mx-auto",
@@ -282,41 +312,52 @@ const InvoiceDocument = ({
               <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Total</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-100 font-sans">
-            {rows.map((row, idx) => {
-              const material = materials.find(m => m.id === row.materialId);
+          <tbody className="font-sans">
+            {groups.map((group, gIdx) => {
+              const row = group.summary;
+              const material = materialOf(row.materialId);
               const unit = material?.unit || 'lb';
               return (
-                <tr key={idx} className="group border-b border-slate-100 last:border-none">
-                  <td className="py-3 text-left">
-                    <div className="space-y-0.5">
-                      <p className="text-sm font-black text-slate-900 uppercase tracking-tight">
-                        {row.boxNumber ? `${row.boxNumber}: ` : ''}{row.customName || material?.name || 'Unknown Material'}
-                      </p>
-                      <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
-                        Code: {material?.code || '-'}{row.boxCount > 1 ? ` • ${row.boxCount} boxes` : ''}
-                      </p>
-                    </div>
-                  </td>
-                  <td className="py-3 text-right font-sans">
-                    <p className="text-sm font-bold text-slate-500">{row.grossWeight !== null ? `${row.grossWeight.toLocaleString()} ${unit}` : '—'}</p>
-                  </td>
-                  <td className="py-3 text-right font-sans">
-                    <p className="text-sm font-bold text-slate-500">{row.tareWeight !== null ? `${row.tareWeight.toLocaleString()} ${unit}` : '—'}</p>
-                  </td>
-                  <td className="py-3 text-right font-sans">
-                    <p className="text-sm font-bold text-slate-900">{row.netWeight.toLocaleString()} {unit}</p>
-                  </td>
-                  <td className="py-3 text-right font-sans">
-                    <p className="text-sm font-bold text-slate-500">${row.salePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</p>
-                  </td>
-                  <td className="py-3 text-right font-sans">
-                    <p className="text-sm font-black text-slate-900">${row.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-                  </td>
-                </tr>
+                <React.Fragment key={gIdx}>
+                  <tr className={cn("border-b border-slate-100", detailed && 'bg-slate-50 print:bg-slate-50 border-t border-slate-200')}>
+                    <td className="py-2 text-left">
+                      <div className="space-y-0.5">
+                        <p className="text-sm font-black text-slate-900 uppercase tracking-tight">{nameOf(row)}</p>
+                        <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
+                          Code: {material?.code || '-'} • {row.boxCount} {row.boxCount === 1 ? 'box' : 'boxes'}
+                        </p>
+                      </div>
+                    </td>
+                    {weightCells(row, unit, true)}
+                  </tr>
+                  {detailed && group.lines.map((line, lIdx) => (
+                    <tr key={`${gIdx}-${lIdx}`} className="border-b border-slate-100">
+                      <td className="py-1.5 pl-4 text-left">
+                        <p className="text-xs font-bold text-slate-600 uppercase tracking-tight">
+                          {line.boxNumber ? `${line.boxNumber}` : nameOf(line)}
+                        </p>
+                      </td>
+                      {weightCells(boxRowOf(line), unit, false)}
+                    </tr>
+                  ))}
+                </React.Fragment>
               );
             })}
           </tbody>
+          <tfoot>
+            <tr className="border-t-2 border-slate-900">
+              <td className="py-3 text-left">
+                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-900">
+                  Total • {invoice.materials.length} {invoice.materials.length === 1 ? 'box' : 'boxes'}
+                </p>
+              </td>
+              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">{totalGross !== null ? `${totalGross.toLocaleString()} ${totalUnit}` : '—'}</p></td>
+              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">{totalTare !== null ? `${totalTare.toLocaleString()} ${totalUnit}` : '—'}</p></td>
+              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">{totalNet.toLocaleString()} {totalUnit}</p></td>
+              <td />
+              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">${invoice.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p></td>
+            </tr>
+          </tfoot>
         </table>
       </div>
 
@@ -2102,7 +2143,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                 )}
 
                 {!isEditing && (
-                  <div className="flex items-center bg-slate-100 rounded-xl p-1" title="Summary prints one row per material. Detailed prints every box.">
+                  <div className="flex items-center bg-slate-100 rounded-xl p-1" title="Summary prints one row per material. Detailed prints each material with its boxes under it.">
                     {([['Summary', false], ['Detailed', true]] as const).map(([label, value]) => (
                       <button
                         key={label}
