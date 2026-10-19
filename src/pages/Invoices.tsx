@@ -1019,6 +1019,22 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
     }
   };
 
+  // Buyer renames (customName) apply to a material, not one box: a box added later takes
+  // the name already used for that material, and renaming one box renames the other boxes
+  // of that material that still carried the old name. A box given a different name on
+  // purpose keeps it.
+  const inheritedCustomName = (lines: TripTicketMaterial[], materialId: string, skipIndex: number) =>
+    lines.find((l, i) => i !== skipIndex && l.materialId === materialId && l.customName)?.customName;
+  const renameMaterialLines = (lines: TripTicketMaterial[], index: number, name: string): TripTicketMaterial[] => {
+    const target = lines[index];
+    const previous = target.customName || '';
+    return lines.map((l, i) =>
+      i === index || (target.materialId && l.materialId === target.materialId && (l.customName || '') === previous)
+        ? { ...l, customName: name }
+        : l
+    );
+  };
+
   const updateInvoiceField = (field: keyof Invoice, value: any) => {
     if (!selectedInvoice) return;
     setSelectedInvoice({ ...selectedInvoice, [field]: value } as Invoice);
@@ -1026,6 +1042,11 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
 
   const updateInvoiceMaterial = (index: number, field: keyof TripTicketMaterial, value: any) => {
     if (!selectedInvoice) return;
+    if (field === 'customName') {
+      // Weights and prices are untouched, so the totals stay as they are.
+      setSelectedInvoice({ ...selectedInvoice, materials: renameMaterialLines(selectedInvoice.materials, index, value) } as Invoice);
+      return;
+    }
     const newMaterials = [...selectedInvoice.materials];
     
     // Convert value appropriately
@@ -1045,6 +1066,8 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       if (mat) {
         updatedItem.salePrice = mat.salePrice;
       }
+      const inherited = inheritedCustomName(newMaterials, value, index);
+      if (inherited && !updatedItem.customName) updatedItem.customName = inherited;
     }
 
     // Recalculate Net Weight if grossWeight or tareWeight changes
@@ -1072,13 +1095,17 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
     const material = materials.find(m => m.id === materialId);
     if (!material) return;
 
-    setSelectedMaterials(prev => [...prev, {
-      materialId,
-      weight: 0,
-      salePrice: material.salePrice,
-      grossWeight: 0,
-      tareWeight: 0
-    }]);
+    setSelectedMaterials(prev => {
+      const inherited = inheritedCustomName(prev, materialId, -1);
+      return [...prev, {
+        materialId,
+        weight: 0,
+        salePrice: material.salePrice,
+        grossWeight: 0,
+        tareWeight: 0,
+        ...(inherited ? { customName: inherited } : {})
+      }];
+    });
   };
 
   const handleRemoveLineItem = (index: number) => {
@@ -1096,17 +1123,23 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
   };
 
   const handleUpdateLineItem = (index: number, field: keyof TripTicketMaterial, value: any) => {
+    if (field === 'customName') {
+      setSelectedMaterials(prev => renameMaterialLines(prev, index, value));
+      return;
+    }
     setSelectedMaterials(prev => prev.map((item, idx) => {
       if (idx !== index) return item;
       
       const updated = { ...item, [field]: value };
       
-      // If materialId changes, pre-populate the salePrice
+      // If materialId changes, pre-populate the salePrice (and the buyer's name for that material)
       if (field === 'materialId') {
         const mat = materials.find(m => m.id === value);
         if (mat) {
           updated.salePrice = mat.salePrice;
         }
+        const inherited = inheritedCustomName(prev, value, index);
+        if (inherited && !updated.customName) updated.customName = inherited;
       }
       
       // If grossWeight or tareWeight changes, re-calculate Net Weight (weight)
