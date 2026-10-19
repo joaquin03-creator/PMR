@@ -690,7 +690,7 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                           <div className="flex items-center justify-between gap-4">
                             <div className="flex-1 min-w-0">
                               <p className="text-sm font-bold text-slate-900 truncate">
-                                {item.boxNumber ? `${item.boxNumber}: ` : ''}{item.customName || material?.name || 'Unknown Material'}
+                                {item.customName || material?.name || 'Unknown Material'}
                               </p>
                               {material?.code && (
                                 <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Code: {material.code}</p>
@@ -974,7 +974,7 @@ export default function TripTickets({ profile }: { profile: UserProfile | null }
                           <span className="w-8 h-8 bg-slate-50 rounded-full flex items-center justify-center text-xs font-black text-slate-400">{idx + 1}</span>
                           <div>
                             <p className="text-sm font-black text-slate-900">{material?.name || 'Unknown Material'}</p>
-                            <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{item.boxNumber ? `${item.boxNumber} • ` : ''}Code: {material?.code || '-'}</p>
+                            <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Code: {material?.code || '-'}</p>
                           </div>
                         </div>
                         <div className="text-right">

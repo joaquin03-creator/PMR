@@ -1099,7 +1099,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       materialId,
       weight: 0,
       salePrice: material.salePrice,
-      boxNumber: `Box #${prev.length + 1}`,
       grossWeight: 0,
       tareWeight: 0
     }]);
@@ -1114,7 +1113,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
       materialId: '',
       weight: 0,
       salePrice: 0,
-      boxNumber: `Box #${prev.length + 1}`,
       grossWeight: 0,
       tareWeight: 0
     }]);
@@ -1530,7 +1528,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
 
               <div className="space-y-4">
                 <div className="flex items-center justify-between px-1">
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Box # / Line Items</label>
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Line Items</label>
                   <span className="text-[10px] font-black text-blue-600 uppercase tracking-widest bg-blue-50 px-2 py-1 rounded-md">
                     {selectedMaterials.length} Boxes Selected
                   </span>
@@ -1549,7 +1547,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                       <table className="w-full text-left border-collapse text-xs min-w-[750px]">
                         <thead>
                           <tr className="border-b border-slate-200 text-slate-400 font-black uppercase tracking-widest text-[9px]">
-                            <th className="py-3 px-2">Box Label</th>
                             <th className="py-3 px-2">Flatbed Slot</th>
                             <th className="py-3 px-2">Material</th>
                             <th className="py-3 px-2 text-right">Gross (lb)</th>
@@ -1568,15 +1565,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
 
                             return (
                               <tr key={idx} className="hover:bg-slate-50/50 transition-colors">
-                                <td className="py-3 px-2">
-                                  <input
-                                    type="text"
-                                    className="w-20 px-2 py-1.5 bg-white border border-slate-200 rounded-lg font-black text-slate-800 outline-none focus:border-blue-500"
-                                    placeholder="Box #"
-                                    value={item.boxNumber || ''}
-                                    onChange={(e) => handleUpdateLineItem(idx, 'boxNumber', e.target.value)}
-                                  />
-                                </td>
                                 <td className="py-3 px-2">
                                   <select
                                     className="w-28 px-2 py-1.5 bg-white border border-slate-200 rounded-lg font-bold text-slate-700 outline-none focus:border-blue-500"
@@ -2025,9 +2013,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                                             </span>
                                             <div>
                                               <p className="font-bold text-slate-900">{matName}</p>
-                                              {item.boxNumber && (
-                                                <p className="text-[10px] text-slate-400 font-semibold">{item.boxNumber}</p>
-                                              )}
                                             </div>
                                           </div>
                                           <div className="flex items-center gap-8 text-right">
@@ -2304,13 +2289,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                             <tr key={idx} className="group border-b border-slate-100 last:border-none">
                               <td className="py-3 text-left space-y-2">
                                 <div className="flex items-center gap-2">
-                                  <input 
-                                    type="text"
-                                    value={item.boxNumber || ''}
-                                    onChange={(e) => updateInvoiceMaterial(idx, 'boxNumber', e.target.value)}
-                                    placeholder="Box #"
-                                    className="w-20 text-xs font-black text-slate-900 bg-slate-50 border border-slate-200 px-2 py-1 rounded outline-none"
-                                  />
                                   <select
                                     className="w-28 text-xs font-bold text-slate-700 bg-slate-50 border border-slate-200 px-2 py-1 rounded outline-none"
                                     value={item.slotIndex !== undefined ? item.slotIndex : ''}
