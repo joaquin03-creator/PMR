@@ -1,6 +1,6 @@
 import React from 'react';
 import { TripTicket, Material } from '../types';
-import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE } from '../constants';
+import { COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE } from '../constants';
 import { BrandLogo } from './BrandLogo';
 import { cn } from '../lib/utils';
 
@@ -260,13 +260,6 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
               </div>
             )}
           </div>
-        </div>
-      </div>
-
-      {/* Security & System Footer */}
-      <div className="mt-2.5 pt-1.5 border-t border-slate-200 flex justify-between items-center text-[8px] font-bold uppercase tracking-wider text-slate-400 opacity-60 avoid-break">
-        <div>
-          {COMPANY_NAME} • LOGISTICS DISPATCH SYSTEM
         </div>
       </div>
     </div>

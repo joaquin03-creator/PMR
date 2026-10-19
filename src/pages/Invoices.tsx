@@ -245,7 +245,7 @@ const InvoiceDocument = ({
       <div className="absolute top-0 left-0 w-full h-2 bg-slate-900 no-print" />
       
       {/* Header */}
-      <div className="flex justify-between items-center mb-2 text-left">
+      <div className="flex justify-between items-center mb-3 pb-2 border-b border-slate-100 text-left">
         <div className="h-14 w-auto flex items-center justify-center">
           <BrandLogo className="h-full w-auto object-contain" />
         </div>
@@ -253,16 +253,6 @@ const InvoiceDocument = ({
           <p className="text-slate-600 font-semibold">{COMPANY_ADDRESS}</p>
           <p className="text-slate-500">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
           <p className="text-slate-400 tracking-wide">{COMPANY_WEBSITE}</p>
-        </div>
-      </div>
-
-      <div className="text-center mb-3 border-y border-slate-100 py-1">
-        <div className="flex items-center justify-center gap-6 text-[8px] font-bold uppercase tracking-[0.35em] text-slate-300">
-          <span>Industrial Scrap Solutions</span>
-          <div className="w-1.5 h-1.5 rounded-full bg-slate-100" />
-          <span>Global Logistics</span>
-          <div className="w-1.5 h-1.5 rounded-full bg-slate-100" />
-          <span>Commercial Recycling</span>
         </div>
       </div>
 
@@ -2175,16 +2165,6 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                        <h2 className="text-2xl font-black uppercase text-slate-900 tracking-tight">Editing Invoice</h2>
                        <BrandLogo className="h-10 opacity-20" grayscale />
                     </div>
-
-                  <div className="text-center space-y-1 mb-4 border-y border-slate-100 py-2">
-                    <div className="flex items-center justify-center gap-8 text-[10px] font-bold uppercase tracking-[0.4em] text-slate-300">
-                      <span>Industrial Scrap Solutions</span>
-                      <div className="w-2 h-2 rounded-full bg-slate-100" />
-                      <span>Global Logistics</span>
-                      <div className="w-2 h-2 rounded-full bg-slate-100" />
-                      <span>Commercial Recycling</span>
-                    </div>
-                  </div>
 
                   <div className="grid grid-cols-2 gap-8 mb-6 text-left">
                     <div className="space-y-8">
