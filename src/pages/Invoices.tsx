@@ -334,7 +334,7 @@ const InvoiceDocument = ({
                     <tr key={`${gIdx}-${lIdx}`} className="border-b border-slate-100">
                       <td className="py-1.5 pl-4 text-left">
                         <p className="text-xs font-bold text-slate-600 uppercase tracking-tight">
-                          {line.boxNumber ? `${line.boxNumber}` : nameOf(line)}
+                          {nameOf(line)}
                         </p>
                       </td>
                       {weightCells(boxRowOf(line), unit, false)}
