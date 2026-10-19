@@ -28,6 +28,7 @@
     @page { margin: 0.25in; size: letter portrait; }
     @page landscape-document { size: letter landscape; margin: 0.25in; }
     @page bol-portrait-document { size: letter portrait; margin: 0.25in; }
+    @page invoice-portrait-document { size: letter portrait; margin: 0.35in; }
     
     html, body {
       background: white !important;
@@ -126,7 +127,7 @@
 
     /* Document replicas should display as clean, non-absolute relative blocks inside page flow */
     #printable-invoice {
-      page: landscape-document !important;
+      page: invoice-portrait-document !important;
       visibility: visible !important; 
       position: relative !important; 
       display: flex !important;
@@ -156,6 +157,16 @@
       background: white !important; 
       box-shadow: none !important;
       border: none !important;
+    }
+    /* Invoice rows: keep the compact spacing set on the page instead of the generic print padding above. */
+    #printable-invoice table.invoice-lines th,
+    #printable-invoice table.invoice-lines td {
+      padding-top: 2px !important;
+      padding-bottom: 2px !important;
+      padding-left: 4px !important;
+      padding-right: 4px !important;
+      line-height: 1.25 !important;
+      word-break: normal !important;
     }
     #printable-invoice tr, .bol-container tr,
     #printable-invoice .avoid-break, .bol-container .avoid-break {

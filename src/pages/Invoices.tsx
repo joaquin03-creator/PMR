@@ -6,7 +6,7 @@ import { Material, TripTicket, Invoice, TripTicketMaterial, Customer, UserProfil
 import { ReconcileShipmentModal } from '../components/ReconcileShipmentModal';
 import { LoadEconomicsSummary } from '../components/LoadEconomicsSummary';
 import { logAuditEvent } from '../lib/audit';
-import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
+import { COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
 import { groupInvoiceLines, InvoiceSummaryRow } from '../lib/invoiceSummary';
 import { roundNetWeight } from '../lib/weightUtils';
@@ -211,105 +211,100 @@ const InvoiceDocument = ({
   const units = new Set(invoice.materials.map(l => materialOf(l.materialId)?.unit || 'lb'));
   const totalUnit = units.size === 1 ? Array.from(units)[0] : '';
 
-  const weightCells = (row: InvoiceSummaryRow, unit: string, strong: boolean) => (
-    <>
-      <td className="py-2 text-right font-sans">
-        <p className="text-sm font-bold text-slate-500">{row.grossWeight !== null ? `${row.grossWeight.toLocaleString()} ${unit}` : '—'}</p>
-      </td>
-      <td className="py-2 text-right font-sans">
-        <p className="text-sm font-bold text-slate-500">{row.tareWeight !== null ? `${row.tareWeight.toLocaleString()} ${unit}` : '—'}</p>
-      </td>
-      <td className="py-2 text-right font-sans">
-        <p className={cn("text-sm text-slate-900", strong ? 'font-black' : 'font-bold')}>{row.netWeight.toLocaleString()} {unit}</p>
-      </td>
-      <td className="py-2 text-right font-sans">
-        <p className="text-sm font-bold text-slate-500">${row.salePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</p>
-      </td>
-      <td className="py-2 text-right font-sans">
-        <p className={cn("text-sm text-slate-900", strong ? 'font-black' : 'font-bold')}>${row.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
-      </td>
-    </>
-  );
+  // One unit for the whole invoice (the usual case) goes in the column headings, so the
+  // cells carry bare numbers; a mixed-unit invoice keeps the unit on every figure.
+  const cellUnit = totalUnit ? '' : null;
+  const fmtWeight = (value: number | null, unit: string) =>
+    value === null ? '—' : `${value.toLocaleString()}${cellUnit === null ? ` ${unit}` : ''}`;
+  const money = (value: number, maxDigits = 2) =>
+    `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: maxDigits })}`;
+  const headUnit = totalUnit ? ` (${totalUnit})` : '';
+
+  const weightCells = (row: InvoiceSummaryRow, unit: string, strong: boolean) => {
+    // Sizes sit on the inner span: the app-wide print rule forces every table cell to 8pt.
+    const text = (color: string, bold: string) =>
+      cn(strong ? 'text-[11px]' : 'text-[10.5px]', color, strong ? bold : 'font-normal');
+    return (
+      <>
+        <td className="py-1 px-1 text-right tabular-nums"><span className={text('text-slate-500', 'font-semibold')}>{fmtWeight(row.grossWeight, unit)}</span></td>
+        <td className="py-1 px-1 text-right tabular-nums"><span className={text('text-slate-500', 'font-semibold')}>{fmtWeight(row.tareWeight, unit)}</span></td>
+        <td className="py-1 px-1 text-right tabular-nums"><span className={text('text-slate-900', 'font-bold')}>{fmtWeight(row.netWeight, unit)}</span></td>
+        <td className="py-1 px-1 text-right tabular-nums"><span className={text('text-slate-500', 'font-semibold')}>{money(row.salePrice, 4)}</span></td>
+        <td className="py-1 pl-1 text-right tabular-nums"><span className={text('text-slate-900', 'font-bold')}>{money(row.amount)}</span></td>
+      </>
+    );
+  };
+  const th = "py-1.5 px-1 text-right";
+  const thText = "text-[9px] font-bold uppercase tracking-wider text-slate-500";
   return (
     <div className={cn(
-      "bg-white px-6 py-4 font-sans text-slate-900 invoice-container relative flex flex-col min-h-0 w-full max-w-[1000px] print:max-w-none mx-auto",
+      "bg-white px-6 py-4 font-sans text-slate-900 invoice-container relative flex flex-col min-h-0 w-full max-w-[1000px] print:max-w-none print:px-0 print:py-0 mx-auto",
       className
     )}>
       {/* Decorative Elements */}
       <div className="absolute top-0 left-0 w-full h-2 bg-slate-900 no-print" />
       
       {/* Header */}
-      <div className="flex justify-between items-start mb-4 text-left text-xs">
-        <div className="h-20 w-auto flex items-center justify-center">
+      <div className="flex justify-between items-center mb-2 text-left">
+        <div className="h-14 w-auto flex items-center justify-center">
           <BrandLogo className="h-full w-auto object-contain" />
         </div>
-        <div className="space-y-1 text-right">
-          <p className="text-sm text-slate-500 font-bold">{COMPANY_ADDRESS}</p>
-          <p className="text-sm text-slate-500">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
-          <p className="text-sm text-slate-400 font-medium tracking-wide">{COMPANY_WEBSITE}</p>
+        <div className="space-y-0.5 text-right text-[11px] leading-tight">
+          <p className="text-slate-600 font-semibold">{COMPANY_ADDRESS}</p>
+          <p className="text-slate-500">{COMPANY_PHONE} | {COMPANY_EMAIL}</p>
+          <p className="text-slate-400 tracking-wide">{COMPANY_WEBSITE}</p>
         </div>
       </div>
 
-      <div className="text-center space-y-1 mb-4 border-y border-slate-100 py-2">
-        <div className="flex items-center justify-center gap-8 text-[10px] font-bold uppercase tracking-[0.4em] text-slate-300">
+      <div className="text-center mb-3 border-y border-slate-100 py-1">
+        <div className="flex items-center justify-center gap-6 text-[8px] font-bold uppercase tracking-[0.35em] text-slate-300">
           <span>Industrial Scrap Solutions</span>
-          <div className="w-2 h-2 rounded-full bg-slate-100" />
+          <div className="w-1.5 h-1.5 rounded-full bg-slate-100" />
           <span>Global Logistics</span>
-          <div className="w-2 h-2 rounded-full bg-slate-100" />
+          <div className="w-1.5 h-1.5 rounded-full bg-slate-100" />
           <span>Commercial Recycling</span>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-8 mb-6 text-left">
-        <div className="space-y-8">
-          <div className="space-y-2">
-            <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Bill To</p>
-            <div className="space-y-3">
-              <p className="text-2xl font-black text-slate-900 uppercase tracking-tight">{invoice.buyerName}</p>
-              {invoice.buyerAddress ? (
-                <p className="text-sm text-slate-500 whitespace-pre-wrap">{invoice.buyerAddress}</p>
-              ) : (
-                <p className="text-sm text-slate-500 italic">Buyer Information Pending</p>
-              )}
-              {invoice.buyerPhone && (
-                <p className="text-sm text-slate-500">{invoice.buyerPhone}</p>
-              )}
-            </div>
-          </div>
+      <div className="grid grid-cols-2 gap-6 mb-3 text-left">
+        <div className="space-y-0.5">
+          <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-400">Bill To</p>
+          <p className="text-lg leading-tight font-black text-slate-900 uppercase tracking-tight">{invoice.buyerName}</p>
+          {invoice.buyerAddress ? (
+            <p className="text-[11px] text-slate-500 whitespace-pre-wrap leading-snug">{invoice.buyerAddress}</p>
+          ) : (
+            <p className="text-[11px] text-slate-500 italic">Buyer Information Pending</p>
+          )}
+          {invoice.buyerPhone && (
+            <p className="text-[11px] text-slate-500">{invoice.buyerPhone}</p>
+          )}
         </div>
-        <div className="space-y-8 text-right">
-          <div className="grid grid-cols-2 gap-8 justify-items-end">
-            <div className="space-y-1 text-right">
-              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Invoice #</p>
-              <p className="text-sm font-bold">{invoice.invoiceNumber}</p>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 justify-items-end content-start">
+          {([
+            ['Invoice #', invoice.invoiceNumber],
+            ['Date', new Date(invoice.date).toLocaleDateString()],
+            ['Due Date', new Date(invoice.dueDate).toLocaleDateString()],
+            ['Terms', invoice.paymentTerms || 'Net 30'],
+          ] as const).map(([label, value]) => (
+            <div key={label} className="text-right leading-tight">
+              <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-400">{label}</p>
+              <p className="text-xs font-bold">{value}</p>
             </div>
-            <div className="space-y-1 text-right">
-              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Date</p>
-              <p className="text-sm font-bold">{new Date(invoice.date).toLocaleDateString()}</p>
-            </div>
-            <div className="space-y-1 text-right">
-              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Due Date</p>
-              <p className="text-sm font-bold">{new Date(invoice.dueDate).toLocaleDateString()}</p>
-            </div>
-            <div className="space-y-1 text-right">
-              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Terms</p>
-              <p className="text-sm font-bold">{invoice.paymentTerms || 'Net 30'}</p>
-            </div>
-          </div>
+          ))}
         </div>
       </div>
 
       {/* Table */}
       <div className="flex-1">
-        <table className="w-full border-collapse">
+        <table className="w-full border-collapse invoice-lines">
           <thead>
             <tr className="border-b-2 border-slate-900">
-              <th className="py-4 text-left text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Description</th>
-              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Gross</th>
-              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Tare</th>
-              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Net</th>
-              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Unit Price</th>
-              <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Total</th>
+              <th className={cn(th, 'text-left')}><span className={thText}>Description</span></th>
+              <th className={th}><span className={thText}>Gross{headUnit}</span></th>
+              <th className={th}><span className={thText}>Tare{headUnit}</span></th>
+              <th className={th}><span className={thText}>Net{headUnit}</span></th>
+              <th className={th}><span className={thText}>Unit Price</span></th>
+              <th className={cn(th, 'pr-0')}><span className={thText}>Total</span></th>
             </tr>
           </thead>
           <tbody className="font-sans">
@@ -320,28 +315,24 @@ const InvoiceDocument = ({
               return (
                 <React.Fragment key={gIdx}>
                   <tr className={cn("border-b border-slate-100", detailed && 'bg-slate-50 print:bg-slate-50 border-t border-slate-200')}>
-                    <td className="py-2 text-left">
-                      <div className="space-y-0.5">
-                        <p className="text-sm font-black text-slate-900 uppercase tracking-tight">{nameOf(row)}</p>
-                        {row.boxCount > 1 && (
-                          detailed ? (
-                            // Says outright that this row's weights are the material's total, not one box.
-                            <p className="text-[10px] text-slate-600 font-black uppercase tracking-widest">Material Total ({row.boxCount} boxes)</p>
-                          ) : (
-                            <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{row.boxCount} boxes</p>
-                          )
-                        )}
-                      </div>
+                    <td className="py-1 pr-1 text-left leading-tight">
+                      <span className="text-[11px] font-bold text-slate-900 uppercase">{nameOf(row)}</span>
+                      {row.boxCount > 1 && (
+                        detailed ? (
+                          // Says outright that this row's weights are the material's total, not one box.
+                          <span className="ml-1.5 text-[8.5px] text-slate-500 font-bold uppercase tracking-wider whitespace-nowrap">Material Total ({row.boxCount} boxes)</span>
+                        ) : (
+                          <span className="ml-1.5 text-[8.5px] text-slate-400 font-bold uppercase tracking-wider whitespace-nowrap">{row.boxCount} boxes</span>
+                        )
+                      )}
                     </td>
                     {weightCells(row, unit, true)}
                   </tr>
                   {/* A one-box material's row already shows that box, so it gets no second line. */}
                   {detailed && group.lines.length > 1 && group.lines.map((line, lIdx) => (
                     <tr key={`${gIdx}-${lIdx}`} className="border-b border-slate-100">
-                      <td className="py-1.5 pl-4 text-left">
-                        <p className="text-xs font-bold text-slate-600 uppercase tracking-tight">
-                          {nameOf(line)}
-                        </p>
+                      <td className="py-0.5 pl-4 pr-1 text-left leading-tight">
+                        <span className="text-[10.5px] text-slate-600 uppercase">{nameOf(line)}</span>
                       </td>
                       {weightCells(boxRowOf(line), unit, false)}
                     </tr>
@@ -351,52 +342,46 @@ const InvoiceDocument = ({
             })}
           </tbody>
           <tfoot>
-            <tr className="border-t-2 border-slate-900">
-              <td className="py-3 text-left">
-                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-900">
+            <tr className="border-t-2 border-slate-900 text-[11px] font-black text-slate-900 tabular-nums">
+              <td className="py-1.5 pr-1 text-left">
+                <span className="text-[9px] uppercase tracking-[0.2em]">
                   Total • {invoice.materials.length} {invoice.materials.length === 1 ? 'box' : 'boxes'}
-                </p>
+                </span>
               </td>
-              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">{totalGross !== null ? `${totalGross.toLocaleString()} ${totalUnit}` : '—'}</p></td>
-              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">{totalTare !== null ? `${totalTare.toLocaleString()} ${totalUnit}` : '—'}</p></td>
-              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">{totalNet.toLocaleString()} {totalUnit}</p></td>
+              <td className="py-1.5 px-1 text-right"><span className="text-[11px]">{fmtWeight(totalGross, totalUnit)}</span></td>
+              <td className="py-1.5 px-1 text-right"><span className="text-[11px]">{fmtWeight(totalTare, totalUnit)}</span></td>
+              <td className="py-1.5 px-1 text-right"><span className="text-[11px]">{fmtWeight(totalNet, totalUnit)}</span></td>
               <td />
-              <td className="py-3 text-right"><p className="text-sm font-black text-slate-900">${invoice.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p></td>
+              <td className="py-1.5 pl-1 text-right"><span className="text-[11px]">{money(invoice.totalAmount)}</span></td>
             </tr>
           </tfoot>
         </table>
       </div>
 
       {/* Footer Totals */}
-      <div className="mt-4 pt-4 border-t-2 border-slate-900 flex justify-between items-start text-left">
-        <div className="flex-1 space-y-4">
-          <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Notes & Instructions</p>
-          <div className="p-4 bg-slate-50/50 rounded-2xl border border-slate-100 min-h-[60px] w-full max-w-lg">
-             <p className="text-sm text-slate-600 leading-relaxed italic">{invoice.notes || 'No additional notes.'}</p>
+      <div className="mt-3 pt-2 border-t border-slate-300 flex justify-between items-start gap-6 text-left avoid-break">
+        <div className="flex-1 space-y-1">
+          <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-400">Notes & Instructions</p>
+          <div className="px-3 py-1.5 bg-slate-50/50 rounded-lg border border-slate-100 w-full max-w-lg">
+             <p className="text-[11px] text-slate-600 leading-snug italic">{invoice.notes || 'No additional notes.'}</p>
           </div>
         </div>
-        <div className="w-80 space-y-3">
-          <div className="flex justify-between items-center py-2 border-b border-slate-100">
-            <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Subtotal</span>
-            <span className="text-sm font-bold text-slate-900">${invoice.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+        <div className="w-60 text-xs">
+          <div className="flex justify-between items-center py-0.5 border-b border-slate-100">
+            <span className="text-[9px] font-bold uppercase tracking-widest text-slate-400">Subtotal</span>
+            <span className="font-semibold tabular-nums">{money(invoice.totalAmount)}</span>
           </div>
-          <div className="flex justify-between items-center py-2 border-b border-slate-100">
-            <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Taxes (0%)</span>
-            <span className="text-sm font-bold text-slate-900">$0.00</span>
+          <div className="flex justify-between items-center py-0.5 border-b border-slate-100">
+            <span className="text-[9px] font-bold uppercase tracking-widest text-slate-400">Taxes (0%)</span>
+            <span className="font-semibold tabular-nums">$0.00</span>
           </div>
-          <div className="flex justify-between items-center py-6">
-            <span className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-900">Total Amount</span>
-            <span className="text-3xl font-black text-slate-900 tracking-tighter">${invoice.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+          <div className="flex justify-between items-center pt-1.5">
+            <span className="text-[9px] font-black uppercase tracking-[0.25em] text-slate-900">Total Amount</span>
+            <span className="text-xl font-black text-slate-900 tracking-tight tabular-nums">{money(invoice.totalAmount)}</span>
           </div>
         </div>
       </div>
 
-      <div className="mt-8 pt-4 border-t border-slate-100 flex justify-end items-end opacity-40">
-        <div className="text-right">
-          <p className="text-[8px] font-black uppercase tracking-widest text-slate-900">{COMPANY_NAME}</p>
-          <p className="text-[7px] font-bold text-slate-400 uppercase tracking-tight">Industrial Recycling Systems • {COMPANY_WEBSITE}</p>
-        </div>
-      </div>
     </div>
   );
 };
