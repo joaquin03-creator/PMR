@@ -25,10 +25,10 @@
   }
   
   @media print {
+    /* One page style for everything. Invoice and BOL used to name their own @page; a
+       named page forces a page break after the element, so whatever followed it in the
+       app printed as a trailing blank page. */
     @page { margin: 0.25in; size: letter portrait; }
-    @page landscape-document { size: letter landscape; margin: 0.25in; }
-    @page bol-portrait-document { size: letter portrait; margin: 0.25in; }
-    @page invoice-portrait-document { size: letter portrait; margin: 0.35in; }
     
     html, body {
       background: white !important;
@@ -127,7 +127,6 @@
 
     /* Document replicas should display as clean, non-absolute relative blocks inside page flow */
     #printable-invoice {
-      page: invoice-portrait-document !important;
       visibility: visible !important; 
       position: relative !important; 
       display: flex !important;
@@ -143,7 +142,6 @@
       border: none !important;
     }
     .bol-container { 
-      page: bol-portrait-document !important;
       visibility: visible !important; 
       position: relative !important; 
       display: flex !important;
