@@ -170,7 +170,6 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
                   <td className="py-1 px-1.5 text-left">
                     <div className="space-y-0.2">
                       <p className="text-[11px] font-bold text-slate-900 uppercase tracking-tight leading-snug">
-                        {item.boxNumber ? `${item.boxNumber}: ` : ''}
                         {item.customName || material?.name || 'Unknown Material'}
                       </p>
                       <div className="flex items-center gap-2 text-[9px] text-slate-500 font-medium leading-none">
