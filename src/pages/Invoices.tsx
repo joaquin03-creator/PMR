@@ -323,14 +323,15 @@ const InvoiceDocument = ({
                     <td className="py-2 text-left">
                       <div className="space-y-0.5">
                         <p className="text-sm font-black text-slate-900 uppercase tracking-tight">{nameOf(row)}</p>
-                        <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
-                          Code: {material?.code || '-'} • {row.boxCount} {row.boxCount === 1 ? 'box' : 'boxes'}
-                        </p>
+                        {row.boxCount > 1 && (
+                          <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{row.boxCount} boxes</p>
+                        )}
                       </div>
                     </td>
                     {weightCells(row, unit, true)}
                   </tr>
-                  {detailed && group.lines.map((line, lIdx) => (
+                  {/* A one-box material's row already shows that box, so it gets no second line. */}
+                  {detailed && group.lines.length > 1 && group.lines.map((line, lIdx) => (
                     <tr key={`${gIdx}-${lIdx}`} className="border-b border-slate-100">
                       <td className="py-1.5 pl-4 text-left">
                         <p className="text-xs font-bold text-slate-600 uppercase tracking-tight">
