@@ -8,7 +8,7 @@ import { LoadEconomicsSummary } from '../components/LoadEconomicsSummary';
 import { logAuditEvent } from '../lib/audit';
 import { COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
-import { groupInvoiceLines, InvoiceSummaryRow } from '../lib/invoiceSummary';
+import { groupInvoiceLines, InvoiceSummaryRow, invoiceTotals, invoiceWeightDelta, withoutUndefined } from '../lib/invoiceSummary';
 import { roundNetWeight } from '../lib/weightUtils';
 import { 
   FileText, 
@@ -989,9 +989,41 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
 
   const handleSaveEditedInvoice = async () => {
     if (!selectedInvoice) return;
+    setActionError(null);
+    const lines = selectedInvoice.materials || [];
+    if (lines.length === 0) {
+      alert('An invoice needs at least one box.');
+      return;
+    }
+    const missing = lines.findIndex(l => !l.materialId);
+    if (missing !== -1) {
+      alert(`Line ${missing + 1} has no material. Pick one or remove that line.`);
+      return;
+    }
+    const empty = lines.filter(l => !(Number(l.weight) > 0)).length;
+    if (empty > 0 && !confirm(`${empty} box${empty === 1 ? ' has' : 'es have'} no net weight. Save anyway?`)) return;
+
     setProcessing(true);
     try {
-      await updateDoc(doc(db, 'invoices', selectedInvoice.id), {
+      // Compare with the stored invoice, not the copy on screen.
+      const storedSnap = await getDoc(doc(db, 'invoices', selectedInvoice.id));
+      const stored = storedSnap.exists() ? ({ id: storedSnap.id, ...storedSnap.data() } as Invoice) : null;
+
+      // A paid invoice already took its boxes out of inventory. Move inventory by the
+      // difference per material so the book matches the edited invoice.
+      const inventoryDelta = stored?.inventoryDeducted ? invoiceWeightDelta(stored.materials || [], lines) : {};
+      const deltaEntries = Object.entries(inventoryDelta);
+      if (stored?.reconciledAt && (deltaEntries.length > 0 || lines.length !== (stored.materials || []).length)) {
+        if (!confirm(`${selectedInvoice.invoiceNumber} has already been reconciled. Its reconciliation will not be redone, so the shipment economics will no longer match the edited boxes. Save anyway?`)) {
+          setProcessing(false);
+          return;
+        }
+      }
+
+      const totals = invoiceTotals(lines);
+      const batch = writeBatch(db);
+      const timestamp = new Date().toISOString();
+      batch.update(doc(db, 'invoices', selectedInvoice.id), {
         buyerName: selectedInvoice.buyerName,
         buyerAddress: selectedInvoice.buyerAddress || '',
         buyerPhone: selectedInvoice.buyerPhone || '',
@@ -999,17 +1031,37 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
         dueDate: selectedInvoice.dueDate,
         paymentTerms: selectedInvoice.paymentTerms || 'Net 30',
         notes: selectedInvoice.notes || '',
-        materials: selectedInvoice.materials,
-        totalWeight: selectedInvoice.totalWeight,
-        totalAmount: selectedInvoice.totalAmount
+        materials: lines.map(withoutUndefined),
+        totalWeight: totals.totalWeight,
+        totalAmount: totals.totalAmount
       });
+      deltaEntries.forEach(([matId, delta]) => {
+        batch.set(doc(db, 'inventory', matId), {
+          materialId: matId,
+          currentWeight: increment(-delta),
+          lastUpdated: timestamp
+        }, { merge: true });
+      });
+      await batch.commit();
+
+      const deltaNote = deltaEntries.length > 0
+        ? ` — inventory moved: ${deltaEntries.map(([matId, d]) => {
+            const mat = materials.find(m => m.id === matId);
+            return `${d > 0 ? '−' : '+'}${Math.abs(d).toLocaleString()} lb ${mat?.name || matId}`;
+          }).join(', ')}`
+        : '';
       await logAuditEvent(
         'invoice',
         selectedInvoice.id,
         'update',
-        { after: selectedInvoice },
-        `Saved edited invoice ${selectedInvoice.invoiceNumber}`
+        {
+          before: stored ? { materials: stored.materials, totalWeight: stored.totalWeight, totalAmount: stored.totalAmount } : null,
+          after: { ...selectedInvoice, ...totals },
+          ...(deltaEntries.length > 0 ? { inventoryDelta } : {})
+        },
+        `Saved edited invoice ${selectedInvoice.invoiceNumber} (${stored?.materials?.length ?? '?'} → ${lines.length} boxes)${deltaNote}`
       );
+      setSelectedInvoice({ ...selectedInvoice, ...totals });
       setIsEditing(false);
       setAutoPrint(true);
     } catch (error) {
@@ -1017,6 +1069,44 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
     } finally {
       setProcessing(false);
     }
+  };
+
+  const handleCancelEdit = () => {
+    if (!selectedInvoice) return;
+    if (!confirm('Discard the changes to this invoice?')) return;
+    const stored = invoices.find(i => i.id === selectedInvoice.id);
+    if (stored) setSelectedInvoice(stored);
+    setIsEditing(false);
+  };
+
+  // Editing an existing invoice: add a box (blank, or another box of the same material,
+  // price and name right under it) or remove one. Totals follow.
+  const addInvoiceBox = (copyFromIndex?: number) => {
+    if (!selectedInvoice) return;
+    const lines = [...selectedInvoice.materials];
+    const source = copyFromIndex !== undefined ? lines[copyFromIndex] : undefined;
+    const box: TripTicketMaterial = {
+      materialId: source?.materialId || '',
+      weight: 0,
+      salePrice: source?.salePrice || 0,
+      grossWeight: 0,
+      tareWeight: 0,
+      ...(source?.customName ? { customName: source.customName } : {})
+    };
+    if (copyFromIndex !== undefined) lines.splice(copyFromIndex + 1, 0, box);
+    else lines.push(box);
+    setSelectedInvoice({ ...selectedInvoice, materials: lines, ...invoiceTotals(lines) } as Invoice);
+  };
+
+  const removeInvoiceBox = (index: number) => {
+    if (!selectedInvoice) return;
+    const line = selectedInvoice.materials[index];
+    if (Number(line?.weight) > 0) {
+      const name = line.customName || materials.find(m => m.id === line.materialId)?.name || 'this box';
+      if (!confirm(`Remove ${name} (${Number(line.weight).toLocaleString()} lb) from the invoice?`)) return;
+    }
+    const lines = selectedInvoice.materials.filter((_, i) => i !== index);
+    setSelectedInvoice({ ...selectedInvoice, materials: lines, ...invoiceTotals(lines) } as Invoice);
   };
 
   // Buyer renames (customName) apply to a material, not one box: a box added later takes
@@ -2088,14 +2178,23 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
               </div>
               <div className="flex items-center gap-3">
                 {isEditing ? (
-                  <button 
-                    onClick={handleSaveEditedInvoice}
-                    disabled={processing}
-                    className="px-6 py-3 bg-blue-600 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-blue-700 transition-all flex items-center gap-2 shadow-lg shadow-blue-200 disabled:opacity-50"
-                  >
-                    {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                    Save Changes
-                  </button>
+                  <>
+                    <button
+                      onClick={handleCancelEdit}
+                      disabled={processing}
+                      className="px-6 py-3 bg-white border border-slate-200 text-slate-600 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-slate-50 transition-all disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleSaveEditedInvoice}
+                      disabled={processing}
+                      className="px-6 py-3 bg-blue-600 text-white rounded-xl font-black text-xs uppercase tracking-widest hover:bg-blue-700 transition-all flex items-center gap-2 shadow-lg shadow-blue-200 disabled:opacity-50"
+                    >
+                      {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                      Save Changes
+                    </button>
+                  </>
                 ) : (
                   <button 
                     onClick={() => setIsEditing(true)}
@@ -2280,6 +2379,7 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                           <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Quantity</th>
                           <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Unit Price</th>
                           <th className="py-4 text-right text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Total</th>
+                          <th className="py-4 w-20" />
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 font-sans">
@@ -2361,11 +2461,45 @@ export default function Invoices({ profile }: { profile: UserProfile | null }) {
                               <td className="py-3 text-right">
                                 <p className="text-xs font-black text-slate-900">${(item.weight * item.salePrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                               </td>
+                              <td className="py-3 pl-3 text-right">
+                                <div className="flex items-center justify-end gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => addInvoiceBox(idx)}
+                                    disabled={!item.materialId}
+                                    title="Add another box of this material under this line"
+                                    className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all disabled:opacity-30"
+                                  >
+                                    <Plus className="w-4 h-4" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => removeInvoiceBox(idx)}
+                                    title="Remove this box"
+                                    className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              </td>
                             </tr>
                           );
                         })}
                       </tbody>
                     </table>
+                    <button
+                      type="button"
+                      onClick={() => addInvoiceBox()}
+                      className="mt-4 w-full py-3 border-2 border-dashed border-slate-200 rounded-xl text-xs font-black uppercase tracking-widest text-slate-500 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 transition-all flex items-center justify-center gap-2"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Add Box
+                    </button>
+                    {selectedInvoice.inventoryDeducted && (
+                      <p className="mt-3 text-[11px] font-bold text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                        This invoice is paid, so its boxes are already out of inventory. Saving moves inventory by whatever weight you add or remove.
+                      </p>
+                    )}
                   </div>
 
                   <div className="mt-4 pt-4 border-t-2 border-slate-900 flex justify-between items-start text-left">

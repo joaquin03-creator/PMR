@@ -93,3 +93,37 @@ export function groupInvoiceLines(
       a.summary.salePrice - b.summary.salePrice
     );
 }
+
+/** An invoice's stored totals, from its lines (same terms the New Invoice form uses). */
+export function invoiceTotals(lines: TripTicketMaterial[]): { totalWeight: number; totalAmount: number } {
+  return {
+    totalWeight: lines.reduce((sum, l) => sum + (Number(l.weight) || 0), 0),
+    totalAmount: lines.reduce((sum, l) => sum + (Number(l.weight) || 0) * (Number(l.salePrice) || 0), 0),
+  };
+}
+
+/**
+ * Net weight per material that an edit adds (positive) or takes off (negative):
+ * after minus before. Materials with no change are left out.
+ */
+export function invoiceWeightDelta(before: TripTicketMaterial[], after: TripTicketMaterial[]): Record<string, number> {
+  const sums = new Map<string, number>();
+  const add = (lines: TripTicketMaterial[], sign: number) =>
+    lines.forEach(l => {
+      if (!l.materialId) return;
+      sums.set(l.materialId, (sums.get(l.materialId) || 0) + sign * (Number(l.weight) || 0));
+    });
+  add(after, 1);
+  add(before, -1);
+  const delta: Record<string, number> = {};
+  sums.forEach((d, id) => {
+    const rounded = Math.round(d * 1000) / 1000;
+    if (rounded !== 0) delta[id] = rounded;
+  });
+  return delta;
+}
+
+/** Firestore rejects undefined values; drop those keys from a line before saving. */
+export function withoutUndefined<T extends object>(line: T): T {
+  return Object.fromEntries(Object.entries(line).filter(([, v]) => v !== undefined)) as T;
+}
