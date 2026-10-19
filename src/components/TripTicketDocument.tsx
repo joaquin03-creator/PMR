@@ -168,17 +168,9 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
                     {idx + 1}
                   </td>
                   <td className="py-1 px-1.5 text-left">
-                    <div className="space-y-0.2">
-                      <p className="text-[11px] font-bold text-slate-900 uppercase tracking-tight leading-snug">
-                        {item.customName || material?.name || 'Unknown Material'}
-                      </p>
-                      <div className="flex items-center gap-2 text-[9px] text-slate-500 font-medium leading-none">
-                        <span>Code: {material?.code || '-'}</span>
-                        {item.slotIndex !== undefined && (
-                          <span>• Slot {item.slotIndex + 1}</span>
-                        )}
-                      </div>
-                    </div>
+                    <p className="text-[11px] font-bold text-slate-900 uppercase tracking-tight leading-snug">
+                      {item.customName || material?.name || 'Unknown Material'}
+                    </p>
                   </td>
                   {hasAnyGrossTare && (
                     <td className="py-1 px-1.5 text-right text-[11px] font-black text-slate-900 font-mono leading-none">
@@ -275,9 +267,6 @@ export const TripTicketDocument: React.FC<TripTicketDocumentProps> = ({
       <div className="mt-2.5 pt-1.5 border-t border-slate-200 flex justify-between items-center text-[8px] font-bold uppercase tracking-wider text-slate-400 opacity-60 avoid-break">
         <div>
           {COMPANY_NAME} • LOGISTICS DISPATCH SYSTEM
-        </div>
-        <div>
-          HEX-TRIP-{ticket.id.toUpperCase()}
         </div>
       </div>
     </div>

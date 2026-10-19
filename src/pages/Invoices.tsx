@@ -386,11 +386,7 @@ const InvoiceDocument = ({
         </div>
       </div>
 
-      <div className="mt-8 pt-4 border-t border-slate-100 flex justify-between items-end opacity-40">
-        <div className="space-y-1">
-          <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">Security Verifier</p>
-          <p className="text-[7px] font-mono font-bold tracking-tighter">HEX-ID-{invoice.id.toUpperCase()}</p>
-        </div>
+      <div className="mt-8 pt-4 border-t border-slate-100 flex justify-end items-end opacity-40">
         <div className="text-right">
           <p className="text-[8px] font-black uppercase tracking-widest text-slate-900">{COMPANY_NAME}</p>
           <p className="text-[7px] font-bold text-slate-400 uppercase tracking-tight">Industrial Recycling Systems • {COMPANY_WEBSITE}</p>
