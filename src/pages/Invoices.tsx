@@ -326,7 +326,7 @@ const InvoiceDocument = ({
                         {row.boxCount > 1 && (
                           detailed ? (
                             // Says outright that this row's weights are the material's total, not one box.
-                            <p className="text-[10px] text-slate-600 font-black uppercase tracking-widest">Total of {row.boxCount} boxes ↓</p>
+                            <p className="text-[10px] text-slate-600 font-black uppercase tracking-widest">Material Total ({row.boxCount} boxes)</p>
                           ) : (
                             <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{row.boxCount} boxes</p>
                           )
