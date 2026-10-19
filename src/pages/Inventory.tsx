@@ -12,7 +12,8 @@ import {
   BuyTicket,
   Invoice,
   ConversionLog,
-  ProcessingShrinkAdjustment
+  ProcessingShrinkAdjustment,
+  MaterialReclassification
 } from '../types';
 import { 
   Package, 
@@ -64,6 +65,7 @@ import { COMPANY_NAME, handleImageError } from '../constants';
 import { BrandLogo } from '../components/BrandLogo';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
+import { reclassificationNetChange } from '../lib/reclassification';
 import { Hint } from '../components/Hint';
 
 interface SaleFormItem {
@@ -169,6 +171,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
   const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [shrinkAdjustments, setShrinkAdjustments] = useState<ProcessingShrinkAdjustment[]>([]);
+  const [reclassifications, setReclassifications] = useState<MaterialReclassification[]>([]);
 
   // TOOL 1 — Physical Count Mode State
   const [isCountMode, setIsCountMode] = useState(false);
@@ -252,6 +255,15 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       (error) => handleFirestoreError(error, OperationType.LIST, 'buyTickets')
     );
 
+    const unsubReclassifications = onSnapshot(
+      collection(db, 'materialReclassifications'),
+      (snapshot) => {
+        setReclassifications(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as MaterialReclassification[]);
+      },
+      // Not fatal: without this list the screen just shows tickets as recorded.
+      (error) => console.warn('Could not load material reclassifications:', error)
+    );
+
     const unsubInvoices = onSnapshot(
       collection(db, 'invoices'),
       (snapshot) => {
@@ -277,6 +289,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
       unsubBuyTickets();
       unsubInvoices();
       unsubShrinkAdjustments();
+      unsubReclassifications();
     };
   }, [profile]);
 
@@ -1240,6 +1253,13 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
     }
   }, [hasAnyPhysicalCount]);
 
+  // Reclassifications only count for tickets that still count (a voided ticket's weight
+  // was already taken back out).
+  const completedTicketIds = useMemo(
+    () => new Set(buyTickets.filter(t => t.status === 'completed').map(t => t.id)),
+    [buyTickets]
+  );
+
   // TOOL 2 — Variance Dashboard Computations
   const varianceData = useMemo(() => {
     return materials.map(mat => {
@@ -1265,7 +1285,10 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
             return sum + lines.reduce((s, m) => s + (m.weight || 0), 0);
           }, 0);
 
-        expected = baseline + (boughtSince - soldSince);
+        // Ticket lines re-labelled as another material after the sale moved book weight
+        // between materials when the reclassification was recorded.
+        const reclassifiedSince = reclassificationNetChange(reclassifications, mat.id, completedTicketIds, lastCountDate);
+        expected = baseline + (boughtSince - soldSince) + reclassifiedSince;
       } else {
         const boughtAllTime = buyTickets
           .filter(t => t.status === 'completed')
@@ -1281,7 +1304,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
             return sum + lines.reduce((s, m) => s + (m.weight || 0), 0);
           }, 0);
 
-        expected = boughtAllTime - soldAllTime;
+        expected = boughtAllTime - soldAllTime + reclassificationNetChange(reclassifications, mat.id, completedTicketIds);
       }
 
       const variance = actual - expected;
@@ -1318,7 +1341,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         lastPhysicalCountBy: inv?.lastPhysicalCountBy
       };
     });
-  }, [materials, inventory, buyTickets, invoices, sinceLastCountToggle]);
+  }, [materials, inventory, buyTickets, invoices, sinceLastCountToggle, reclassifications, completedTicketIds]);
 
   const flaggedVariances = useMemo(() => {
     return varianceData.filter(v => v.absVariance >= 5);
@@ -1359,7 +1382,8 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
           return sum + lines.reduce((s, m) => s + (m.weight || 0), 0);
         }, 0);
 
-      const expectedSinceReconciliation = lastReconciliation.physicalWeight + boughtSince - soldSince;
+      const expectedSinceReconciliation = lastReconciliation.physicalWeight + boughtSince - soldSince
+        + reclassificationNetChange(reclassifications, mat.id, completedTicketIds, lastReconciliation.timestamp);
       const residualVariance = actual - expectedSinceReconciliation;
 
       return {
@@ -1370,7 +1394,7 @@ export default function Inventory({ profile }: { profile: UserProfile | null }) 
         since: lastReconciliation.timestamp
       };
     });
-  }, [materials, inventory, buyTickets, invoices, shrinkAdjustments]);
+  }, [materials, inventory, buyTickets, invoices, shrinkAdjustments, reclassifications, completedTicketIds]);
 
   const flaggedResidualVariances = useMemo(
     () => residualVarianceData.filter(v => v.hasBaseline && v.absResidualVariance >= 5),

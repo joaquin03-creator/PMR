@@ -328,6 +328,21 @@ service cloud.firestore {
              (!('slipPhotoUrl' in data) || (data.slipPhotoUrl is string && data.slipPhotoUrl.size() <= 1000));
     }
 
+    function isValidMaterialReclassification(data) {
+      return data.keys().hasAll(['ticketId', 'ticketTimestamp', 'lineIndexes', 'fromMaterialId', 'toMaterialId', 'weight', 'timestamp', 'recordedBy', 'recordedByUid']) &&
+             data.ticketId is string && data.ticketId.size() <= 200 &&
+             data.ticketTimestamp is string &&
+             data.lineIndexes is list && data.lineIndexes.size() > 0 && data.lineIndexes.size() <= 100 &&
+             data.fromMaterialId is string && data.toMaterialId is string &&
+             data.fromMaterialId != data.toMaterialId &&
+             data.weight is number && data.weight >= 0 &&
+             data.timestamp is string &&
+             data.recordedBy is string &&
+             data.recordedByUid == request.auth.uid &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+             exists(/databases/$(database)/documents/buyTickets/$(data.ticketId));
+    }
+
     function isValidDailySnapshot(data) {
       return data.keys().hasAll(['date', 'timestamp', 'createdBy', 'materials', 'inventory', 'summary']) &&
              data.date is string && data.date.matches("^\\d{4}-\\d{2}-\\d{2}$") &&
@@ -615,6 +630,15 @@ service cloud.firestore {
     match /processingShrinkAdjustments/{adjustmentId} {
       allow read: if isStaff();
       allow create: if isManager() && isValidProcessingShrinkAdjustment(request.resource.data);
+      allow update: if false;
+      allow delete: if canDeleteData();
+    }
+
+    // Re-labels a completed ticket's lines as another material. Append-only: the
+    // ticket itself is never changed; a wrong entry is corrected by a new one.
+    match /materialReclassifications/{reclassificationId} {
+      allow read: if isStaff();
+      allow create: if isManager() && isValidMaterialReclassification(request.resource.data);
       allow update: if false;
       allow delete: if canDeleteData();
     }

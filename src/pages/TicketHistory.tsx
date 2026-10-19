@@ -9,7 +9,7 @@ useSettings } from '../context/SettingsContext';
 import {
 collection, onSnapshot, query, orderBy, doc, deleteDoc, updateDoc, increment, writeBatch } from 'firebase/firestore';
 import {
-BuyTicket, Customer, Material, UserProfile } from '../types';
+BuyTicket, Customer, Material, MaterialReclassification, UserProfile } from '../types';
 import {
 COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_WEBSITE, handleImageError } from '../constants';
 import {
@@ -35,6 +35,7 @@ import {
   AlertTriangle,
   AlertCircle,
   Edit2,
+  Shuffle,
 } from 'lucide-react';
 import {
 cn } from '../lib/utils';
@@ -52,12 +53,24 @@ isTonMaterial, formatUnitPrice, formatRateBreakdown } from '../lib/scrapPricing'
 import CustomerMaterialSearchPanel from '../components/CustomerMaterialSearchPanel';
 import { getCatalyticFollowUp, getCatalyticDailyLimitTicketIds, CATALYTIC_FOLLOW_UP_LABELS } from '../lib/catalyticUtils';
 import { updateTicketPaymentMethod } from '../lib/ticketPaymentMethod';
+import { groupReclassificationsByTicket, effectiveLineMaterialIds, withEffectiveMaterials } from '../lib/reclassification';
+import { MaterialAutocompleteInput } from '../components/MaterialAutocompleteInput';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
   const [buyTickets, setBuyTickets] = useState<BuyTicket[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
+  const [reclassifications, setReclassifications] = useState<MaterialReclassification[]>([]);
+  // Reclassify modal (manager): re-label some of a ticket's lines as another material.
+  const [reclassTicket, setReclassTicket] = useState<BuyTicket | null>(null);
+  const [reclassFromId, setReclassFromId] = useState('');
+  const [reclassLineIdx, setReclassLineIdx] = useState<number[]>([]);
+  const [reclassTarget, setReclassTarget] = useState<Material | null>(null);
+  const [reclassSearch, setReclassSearch] = useState('');
+  const [reclassSearchOpen, setReclassSearchOpen] = useState(false);
+  const [reclassNotes, setReclassNotes] = useState('');
+  const [reclassError, setReclassError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   // Search runs when it is SUBMITTED (Enter or the Search button), not on every keystroke:
@@ -168,10 +181,16 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       setMaterials(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Material[]);
     }, (error) => handleFirestoreError(error, OperationType.LIST, 'materials'));
 
+    const unsubReclass = onSnapshot(collection(db, 'materialReclassifications'), (snapshot) => {
+      setReclassifications(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as MaterialReclassification[]);
+    }, // Not fatal: without this list the screen just shows tickets as recorded.
+      (error) => console.warn('Could not load material reclassifications:', error));
+
     return () => {
       try { unsubBuy(); } catch (e) { console.warn('unsubBuy error', e); }
       try { unsubCustomers(); } catch (e) { console.warn('unsubCustomers error', e); }
       try { unsubMaterials(); } catch (e) { console.warn('unsubMaterials error', e); }
+      try { unsubReclass(); } catch (e) { console.warn('unsubReclass error', e); }
     };
   }, [profile]);
 
@@ -198,6 +217,8 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     return index;
   }, [materials]);
 
+  const reclassByTicket = useMemo(() => groupReclassificationsByTicket(reclassifications), [reclassifications]);
+
   // Tickets that put a seller past one catalytic converter in a day (flag only, never blocked).
   const catalyticDailyLimitTicketIds = useMemo(() => getCatalyticDailyLimitTicketIds(buyTickets, materials), [buyTickets, materials]);
 
@@ -218,9 +239,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       if (customerName.includes(search) || ticketId.includes(search)) return true;
 
       // Materials: a ticket's line items store only a materialId, so match the typed text
-      // against that material's NAME (contains) or CODE (exact) from the materials list.
-      return (ticket.materials || []).some(line => {
-        const mat = materialSearchIndex.get(line.materialId);
+      // against that material's NAME (contains) or CODE (exact) from the materials list --
+      // both the material the line was recorded as and any it was reclassified to.
+      const lineIds = [
+        ...(ticket.materials || []).map(line => line.materialId),
+        ...effectiveLineMaterialIds(ticket, reclassByTicket.get(ticket.id)),
+      ];
+      return lineIds.some(id => {
+        const mat = materialSearchIndex.get(id);
         return !!mat && (mat.name.includes(search) || mat.code === search);
       });
     });
@@ -254,13 +280,92 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       if (aValue > bValue) return sortConfig.direction === 'asc' ? 1 : -1;
       return 0;
     });
-  }, [buyTickets, customers, searchTerm, sortConfig, dateFilter, todayLocalDateString, materialSearchIndex]);
+  }, [buyTickets, customers, searchTerm, sortConfig, dateFilter, todayLocalDateString, materialSearchIndex, reclassByTicket]);
 
   const handleSort = (key: string) => {
     setSortConfig(prev => ({
       key,
       direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc'
     }));
+  };
+
+  const materialLabel = (id: string) => {
+    const m = materials.find(x => x.id === id);
+    return m ? `${m.code} - ${m.name}` : 'Unknown Material';
+  };
+
+  const openReclassify = (ticket: BuyTicket) => {
+    const ids = effectiveLineMaterialIds(ticket, reclassByTicket.get(ticket.id));
+    const first = ids[0] || '';
+    setReclassTicket(ticket);
+    setReclassFromId(first);
+    setReclassLineIdx(ids.flatMap((id, i) => (id === first ? [i] : [])));
+    setReclassTarget(null);
+    setReclassSearch('');
+    setReclassSearchOpen(false);
+    setReclassNotes('');
+    setReclassError(null);
+  };
+
+  // Moves the chosen lines' book weight to another material and records it. The ticket
+  // is NOT changed: it stays what the seller signed and what was reported to Ohio.
+  const handleReclassify = async () => {
+    if (!reclassTicket || !profile || profile.role !== 'manager') return;
+    const ticket = reclassTicket;
+    const ids = effectiveLineMaterialIds(ticket, reclassByTicket.get(ticket.id));
+    const lineIndexes = reclassLineIdx.filter(i => ids[i] === reclassFromId).sort((a, b) => a - b);
+    if (lineIndexes.length === 0) { setReclassError('Tick at least one line to reclassify.'); return; }
+    if (!reclassTarget) { setReclassError('Pick the material these lines really are.'); return; }
+    if (reclassTarget.id === reclassFromId) { setReclassError('That is the material the lines already count as.'); return; }
+
+    const weight = Math.round(lineIndexes.reduce((sum, i) => sum + (ticket.materials[i]?.netWeight || 0), 0) * 100) / 100;
+    const fromName = materialLabel(reclassFromId);
+    const toName = materialLabel(reclassTarget.id);
+    const notes = reclassNotes.trim();
+
+    setProcessing(true);
+    setReclassError(null);
+    try {
+      const timestamp = new Date().toISOString();
+      const batch = writeBatch(db);
+      const ref = doc(collection(db, 'materialReclassifications'));
+      const record: Omit<MaterialReclassification, 'id'> = {
+        ticketId: ticket.id,
+        ticketTimestamp: ticket.timestamp,
+        lineIndexes,
+        fromMaterialId: reclassFromId,
+        toMaterialId: reclassTarget.id,
+        weight,
+        timestamp,
+        recordedBy: profile.displayName || auth.currentUser?.email || 'Manager',
+        recordedByUid: auth.currentUser?.uid || '',
+        ...(notes ? { notes } : {}),
+      };
+      batch.set(ref, record);
+      batch.set(doc(db, 'inventory', reclassFromId), { materialId: reclassFromId, currentWeight: increment(-weight), lastUpdated: timestamp }, { merge: true });
+      batch.set(doc(db, 'inventory', reclassTarget.id), { materialId: reclassTarget.id, currentWeight: increment(weight), lastUpdated: timestamp }, { merge: true });
+      await batch.commit();
+
+      await logAuditEvent(
+        'buyTicket',
+        ticket.id,
+        'update',
+        {
+          before: { materialId: reclassFromId, lineIndexes, weight },
+          after: { materialId: reclassTarget.id, lineIndexes, weight, reclassificationId: ref.id }
+        },
+        `Reclassified ${lineIndexes.length} line${lineIndexes.length === 1 ? '' : 's'} (${weight.toLocaleString()} lb) on ticket #${ticket.id.toUpperCase()} from ${fromName} to ${toName}. Inventory moved; the ticket and its Ohio report are unchanged.${notes ? ` Notes: ${notes}` : ''}`
+      );
+
+      setReclassTicket(null);
+      setNotification({ type: 'success', message: `Reclassified ${weight.toLocaleString()} lb to ${toName}. Inventory has been moved.` });
+    } catch (error) {
+      console.error('Error reclassifying ticket lines:', error);
+      setReclassError('Could not save the reclassification. Nothing was changed. Check the connection and permissions, then try again.');
+      handleFirestoreError(error, OperationType.CREATE, 'materialReclassifications');
+    } finally {
+      setProcessing(false);
+    }
   };
 
   const handleVoidTicket = async (ticket: BuyTicket) => {
@@ -273,8 +378,9 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       // Update ticket status
       batch.update(doc(db, 'buyTickets', ticket.id), { status: 'voided' });
       
-      // Reverse inventory (Subtract intake)
-      for (const item of ticket.materials) {
+      // Reverse inventory (Subtract intake) -- from the material each line counts as now,
+      // since a reclassification already moved its weight there.
+      for (const item of withEffectiveMaterials(ticket, reclassByTicket.get(ticket.id)).materials) {
         const invRef = doc(db, 'inventory', item.materialId);
         batch.set(invRef, {
           materialId: item.materialId,
@@ -318,7 +424,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
       
       // Reverse inventory (only if it wasn't already voided)
       if (ticket.status !== 'voided') {
-        for (const item of ticket.materials) {
+        for (const item of withEffectiveMaterials(ticket, reclassByTicket.get(ticket.id)).materials) {
           const invRef = doc(db, 'inventory', item.materialId);
           batch.set(invRef, {
             materialId: item.materialId,
@@ -799,6 +905,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                           <p className="text-sm font-black text-slate-900 uppercase tracking-tight">
                             {new Date(ticket.timestamp).toLocaleDateString()}
                           </p>
+                          {reclassByTicket.has(ticket.id) && (
+                            <span
+                              className="px-1.5 py-0.5 bg-violet-100 text-violet-800 text-[8px] font-black uppercase rounded tracking-widest border border-violet-300"
+                              title="Some lines were reclassified to another material after the sale. The ticket itself is unchanged."
+                            >
+                              Reclassified
+                            </span>
+                          )}
                           {catalyticDailyLimitTicketIds.has(ticket.id) && (
                             <span
                               className="px-1.5 py-0.5 bg-red-100 text-red-800 text-[8px] font-black uppercase rounded tracking-widest border border-red-300"
@@ -1103,7 +1217,11 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                 <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Materials</p>
                 <div className="space-y-3">
                   {(selectedTicket.materials || []).map((item, idx) => {
-                    const material = materials.find(m => m.id === item.materialId);
+                    const ticketReclass = reclassByTicket.get(selectedTicket.id) || [];
+                    const effectiveId = effectiveLineMaterialIds(selectedTicket, ticketReclass)[idx];
+                    const lastReclass = [...ticketReclass].reverse().find(r => r.lineIndexes.includes(idx));
+                    const material = materials.find(m => m.id === effectiveId);
+                    const recordedAs = materials.find(m => m.id === item.materialId);
                     return (
                       <div key={idx} className="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3">
                         <div className="flex items-start justify-between gap-4">
@@ -1114,6 +1232,12 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                             <div className="space-y-3 flex-1">
                               <div>
                                 <p className="font-bold text-slate-900">{material?.name || 'Unknown Material'}</p>
+                                {effectiveId !== item.materialId && (
+                                  <p className="text-[11px] font-semibold text-violet-700">
+                                    Reclassified{lastReclass ? ` ${new Date(lastReclass.timestamp).toLocaleDateString()} by ${lastReclass.recordedBy}` : ''}. Sold, signed and reported to Ohio as {recordedAs?.name || 'Unknown Material'}.
+                                    {lastReclass?.notes ? ` Note: ${lastReclass.notes}` : ''}
+                                  </p>
+                                )}
                                 <p className="text-xs text-slate-500">
                                   Net Weight: {item.netWeight} lb
                                   {item.deductionWeight ? ` | Deduction: -${item.deductionWeight} lb ${item.deductionReason ? `(${item.deductionReason})` : ''}` : ''}
@@ -1192,7 +1316,15 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
               
               {profile?.role === 'manager' && (
                 <div className="flex gap-2">
-                  
+                  <button
+                    onClick={() => openReclassify(selectedTicket)}
+                    disabled={processing || selectedTicket?.status === 'voided' || selectedTicket?.status === 'cancelled' || (selectedTicket.materials || []).length === 0}
+                    title="Re-label lines as another material (e.g. one that has its own code now). Moves inventory only; the ticket and Ohio report stay as they are."
+                    className="flex items-center gap-2 px-6 py-4 bg-violet-50 text-violet-700 border border-violet-200 rounded-2xl font-bold hover:bg-violet-100 transition-all active:scale-95 disabled:opacity-50"
+                  >
+                    <Shuffle className="w-5 h-5" />
+                    Reclassify
+                  </button>
                   {profile.permissions?.canVoidTickets && (
 
                     <button 
@@ -1234,6 +1366,112 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
           </div>
         </div>
       )}
+
+      {/* Reclassify Modal */}
+      {reclassTicket && (() => {
+        const ids = effectiveLineMaterialIds(reclassTicket, reclassByTicket.get(reclassTicket.id));
+        const fromOptions = Array.from(new Set(ids));
+        const chosen = reclassLineIdx.filter(i => ids[i] === reclassFromId);
+        const chosenWeight = chosen.reduce((sum, i) => sum + (reclassTicket.materials[i]?.netWeight || 0), 0);
+        return (
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[120] flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="reclass-title">
+            <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+              <div className="p-6 border-b border-slate-100 flex items-start justify-between gap-4">
+                <div>
+                  <h2 id="reclass-title" className="text-lg font-black text-slate-900">Reclassify Material</h2>
+                  <p className="text-xs text-slate-500 font-medium">Ticket #{reclassTicket.id.toUpperCase()} · {new Date(reclassTicket.timestamp).toLocaleString()}</p>
+                </div>
+                <button onClick={() => setReclassTicket(null)} className="p-2 hover:bg-slate-100 rounded-xl" aria-label="Close"><X className="w-5 h-5 text-slate-500" /></button>
+              </div>
+
+              <div className="p-6 space-y-5">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">Lines currently counted as</label>
+                  <select
+                    value={reclassFromId}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setReclassFromId(id);
+                      setReclassLineIdx(ids.flatMap((x, i) => (x === id ? [i] : [])));
+                      setReclassError(null);
+                    }}
+                    className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold text-slate-900 outline-none focus:ring-2 focus:ring-violet-500"
+                  >
+                    {fromOptions.map(id => <option key={id} value={id}>{materialLabel(id)}</option>)}
+                  </select>
+                  <div className="space-y-1.5">
+                    {ids.map((id, i) => id !== reclassFromId ? null : (
+                      <label key={i} className="flex items-center justify-between gap-3 px-3 py-2 bg-slate-50 border border-slate-100 rounded-xl text-sm cursor-pointer">
+                        <span className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={reclassLineIdx.includes(i)}
+                            onChange={(e) => setReclassLineIdx(prev => e.target.checked ? [...prev, i] : prev.filter(x => x !== i))}
+                            className="w-4 h-4 accent-violet-600"
+                          />
+                          <span className="font-semibold text-slate-700">Line {i + 1}</span>
+                        </span>
+                        <span className="font-bold text-slate-900 tabular-nums">{(reclassTicket.materials[i]?.netWeight || 0).toLocaleString()} lb</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">Reclassify as</label>
+                  <MaterialAutocompleteInput
+                    id="reclass-target"
+                    materials={materials.filter(m => m.id !== reclassFromId)}
+                    value={reclassTarget}
+                    isOpen={reclassSearchOpen}
+                    searchValue={reclassSearch}
+                    onOpenChange={setReclassSearchOpen}
+                    onSearchChange={(v) => { setReclassSearch(v); setReclassTarget(null); }}
+                    onSelect={(m) => { setReclassTarget(m); setReclassSearch(`${m.code} - ${m.name}`); setReclassSearchOpen(false); setReclassError(null); }}
+                    placeholder="Type the new material's code or name..."
+                  />
+                  <p className="text-[11px] text-slate-500">Create the new material in Manage Prices first if it does not exist yet.</p>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">Notes (optional)</label>
+                  <textarea
+                    value={reclassNotes}
+                    onChange={(e) => setReclassNotes(e.target.value)}
+                    maxLength={2000}
+                    rows={2}
+                    placeholder="e.g. Brass tube / copper fin rads, bought before it had its own code"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-violet-500"
+                  />
+                </div>
+
+                <div className="p-4 bg-violet-50 border border-violet-200 rounded-2xl text-sm text-violet-900 space-y-1">
+                  <p className="font-bold">
+                    Moves {chosenWeight.toLocaleString()} lb from {materialLabel(reclassFromId)} to {reclassTarget ? `${reclassTarget.code} - ${reclassTarget.name}` : '…'} in inventory.
+                  </p>
+                  <p className="text-xs">The ticket itself (what the seller signed, the payout and the Ohio report) stays exactly as it is.</p>
+                </div>
+
+                {reclassError && (
+                  <p className="text-sm font-semibold text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2" role="alert">{reclassError}</p>
+                )}
+              </div>
+
+              <div className="p-6 bg-slate-50 border-t border-slate-100 flex gap-3">
+                <button onClick={() => setReclassTicket(null)} disabled={processing} className="px-5 py-3 border border-slate-200 rounded-2xl font-bold text-slate-600 hover:bg-white disabled:opacity-50">Cancel</button>
+                <button
+                  onClick={handleReclassify}
+                  disabled={processing || chosen.length === 0 || !reclassTarget}
+                  className="flex-1 py-3 bg-violet-600 text-white rounded-2xl font-bold hover:bg-violet-700 disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Shuffle className="w-4 h-4" />}
+                  Reclassify {chosen.length} line{chosen.length === 1 ? '' : 's'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Print Preview Modal */}
       {showPrintPreview && selectedTicket && (

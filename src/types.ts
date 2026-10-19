@@ -243,6 +243,30 @@ export interface ProcessingShrinkAdjustment {
   recordedBy: string;
 }
 
+/**
+ * A completed ticket's lines re-labelled as a different material after the fact (e.g. a
+ * material bought before it had its own code). Append-only. The ticket itself is NEVER
+ * changed: it stays what the seller signed and what was reported to Ohio. Only the
+ * inventory book weight moves (fromMaterialId -> toMaterialId, at `timestamp`).
+ */
+export interface MaterialReclassification {
+  id: string;
+  ticketId: string;
+  /** The ticket's own timestamp, for reference. */
+  ticketTimestamp: string;
+  /** Positions in ticket.materials that were re-labelled. */
+  lineIndexes: number[];
+  fromMaterialId: string;
+  toMaterialId: string;
+  /** Sum of those lines' netWeight -- the same weight the ticket added to inventory. */
+  weight: number;
+  notes?: string;
+  /** When the reclassification was recorded (when the book weight moved). */
+  timestamp: string;
+  recordedBy: string;
+  recordedByUid: string;
+}
+
 export interface ConversionLog {
   id?: string;
   sourceMatId: string;
