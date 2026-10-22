@@ -43,6 +43,7 @@ import { cn, generateTicketId, getCustomerDataGaps } from '../lib/utils';
 import { safeSetItem } from '../lib/safeStorage';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArcGauge } from '../components/ArcGauge';
+import { MarketStrip } from '../components/MarketStrip';
 import ManagerPinModal from '../components/ManagerPinModal';
 import { CameraCapture } from '../components/CameraCapture';
 import { ScaleCaptureButton } from '../components/ScaleCaptureButton';
@@ -1893,6 +1894,9 @@ export default function Dashboard({ profile }: DashboardProps) {
           </div>
         </div>
       </header>
+
+      {/* Market Strip (MANAGERS ONLY): customers can see the cashier screen, so no copper price there */}
+      {profile?.role === 'manager' && <MarketStrip />}
 
       {/* Performance Gauges Row (MANAGERS ONLY) */}
       {profile?.role === 'manager' && (
