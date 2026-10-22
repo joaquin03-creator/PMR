@@ -1,13 +1,13 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { auth, db } from '../firebase';
-import { collection, onSnapshot, doc, updateDoc, addDoc, query, orderBy, limit, getDocs, writeBatch, serverTimestamp } from 'firebase/firestore';
+import { collection, onSnapshot, doc, updateDoc, addDoc, query, orderBy, limit, getDocs, writeBatch, serverTimestamp, deleteField } from 'firebase/firestore';
 import { Material, PricingSnapshot } from '../types';
 import { Plus, Search, Edit2, TrendingUp, TrendingDown, Minus, Loader2, X, ShieldCheck, FileSpreadsheet, History, RotateCcw, AlertCircle, CheckCircle2, Lock, Sliders, Trash2, AlertTriangle, Copy } from 'lucide-react';
 import Papa from 'papaparse';
 import { cn } from '../lib/utils';
 import MaterialDuplicateManagerModal from '../components/MaterialDuplicateManagerModal';
-import { MarginPreview } from '../components/MarginPreview';
+import { MarginPreview, MarginLine } from '../components/MarginPreview';
 
 import { UserProfile } from '../types';
 
@@ -47,7 +47,6 @@ export default function ManagePrices({ profile }: ManagePricesProps) {
   const [seeding, setSeeding] = useState(false);
   const [updatingPin, setUpdatingPin] = useState(false);
   const [newPin, setNewPin] = useState(profile?.managerPin || '');
-  const [marginTarget, setMarginTarget] = useState<number | null>(null);
   
   // Google Sheets Sync State
   const [sheetId, setSheetId] = useState('');
@@ -118,9 +117,7 @@ export default function ManagePrices({ profile }: ManagePricesProps) {
       if (snap.exists() && snap.data().googleSheetUrl) {
         setSheetId(snap.data().googleSheetUrl);
       }
-      // Same margin target the Dashboard's Margin % gauge uses (flat or nested field).
-      const target = snap.exists() ? (snap.data().dailyMarginTarget ?? snap.data().dailyTargets?.margin) : undefined;
-      setMarginTarget(typeof target === 'number' && target > 0 ? target : null);
+
     }, (error) => {
       console.warn('System config snapshot failed in ManagePrices (using default/cached config):', error.message);
     });
@@ -794,9 +791,14 @@ To fix this:
     const oldMaterial = materials.find(m => m.id === id);
     
     try {
-      const finalUpdates = { ...editForm };
+      const finalUpdates: Record<string, any> = { ...editForm };
       if (finalUpdates.category) {
         finalUpdates.category = getCanonicalCategory(finalUpdates.category);
+      }
+      // A blank margin target removes it (Firestore rejects undefined/NaN).
+      if ('marginTarget' in finalUpdates) {
+        const t = finalUpdates.marginTarget;
+        finalUpdates.marginTarget = typeof t === 'number' && Number.isFinite(t) ? t : deleteField();
       }
       await updateDoc(doc(db, 'materials', id), {
         ...finalUpdates,
@@ -816,13 +818,15 @@ To fix this:
               code: oldMaterial.code,
               name: oldMaterial.name,
               buyPrice: oldMaterial.buyPrice,
-              salePrice: oldMaterial.salePrice
+              salePrice: oldMaterial.salePrice,
+              marginTarget: oldMaterial.marginTarget ?? null
             },
             after: {
               code: editForm.code,
               name: editForm.name,
               buyPrice: editForm.buyPrice,
-              salePrice: editForm.salePrice
+              salePrice: editForm.salePrice,
+              marginTarget: typeof editForm.marginTarget === 'number' && Number.isFinite(editForm.marginTarget) ? editForm.marginTarget : null
             }
           },
           `Manual price update for ${oldMaterial.name}`
@@ -1590,6 +1594,10 @@ To fix this:
               </div>
             </div>
 
+            {isEditing !== material.id && (
+              <MarginLine buyPrice={material.buyPrice} salePrice={material.salePrice} target={material.marginTarget} />
+            )}
+
             {isEditing === material.id && (
               <MarginPreview
                 currentBuy={material.buyPrice}
@@ -1597,7 +1605,8 @@ To fix this:
                 newBuy={editForm.buyPrice ?? material.buyPrice}
                 newSale={editForm.salePrice ?? material.salePrice}
                 unit={editForm.unit || material.unit}
-                target={marginTarget}
+                target={editForm.marginTarget ?? null}
+                onTargetChange={(t) => setEditForm(prev => ({ ...prev, marginTarget: t as number | undefined }))}
               />
             )}
 

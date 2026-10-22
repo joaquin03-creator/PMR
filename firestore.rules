@@ -132,6 +132,7 @@ service cloud.firestore {
              data.salePrice is number && data.salePrice >= 0 &&
              data.unit in ['lb', 'ton'] &&
              (!('description' in data) || (data.description is string && data.description.size() <= 1000)) &&
+             (!('marginTarget' in data) || (data.marginTarget is number && data.marginTarget >= 0 && data.marginTarget <= 100)) &&
              (!('updatedAt' in data) || (data.updatedAt is string || data.updatedAt is timestamp));
     }
 

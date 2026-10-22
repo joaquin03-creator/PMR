@@ -19,15 +19,17 @@ export interface MarginPreviewProps {
   newBuy: number;
   newSale: number;
   unit: string;
-  /** The shop's margin target (Dashboard Margin % gauge), if one is set. */
+  /** This material's target margin %, if one is set. */
   target?: number | null;
+  /** When given, the target is editable in the box (null = no target). */
+  onTargetChange?: (target: number | null) => void;
 }
 
 const pct = (v: number) => `${v < 0 ? "−" : ""}${Math.abs(v).toFixed(1)}%`;
 const money = (v: number) => `${v < 0 ? '−' : ''}$${Math.abs(v).toFixed(2)}`;
 
 /** Live preview of how a price edit changes a material's profit margin, shown before saving. */
-export function MarginPreview({ currentBuy, currentSale, newBuy, newSale, unit, target }: MarginPreviewProps) {
+export function MarginPreview({ currentBuy, currentSale, newBuy, newSale, unit, target, onTargetChange }: MarginPreviewProps) {
   const before = marginPercent(currentBuy, currentSale);
   const after = marginPercent(newBuy, newSale);
   const changed = Number(currentBuy) !== Number(newBuy) || Number(currentSale) !== Number(newSale);
@@ -56,7 +58,30 @@ export function MarginPreview({ currentBuy, currentSale, newBuy, newSale, unit, 
 
   return (
     <div className={cn('mx-5 mb-4 p-4 rounded-xl border space-y-2 transition-colors', toneClasses)} aria-live="polite">
-      <p className="text-xs font-medium text-slate-500 uppercase">Profit Margin {changed ? 'Preview' : ''}</p>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs font-medium text-slate-500 uppercase">Profit Margin {changed ? 'Preview' : ''}</p>
+        {onTargetChange && (
+          <label className="flex items-center gap-1.5 text-xs font-medium text-slate-500 uppercase">
+            Target
+            <input
+              type="number"
+              step="0.1"
+              min="0"
+              max="100"
+              inputMode="decimal"
+              value={typeof target === 'number' && Number.isFinite(target) ? target : ''}
+              onChange={(e) => {
+                const v = e.target.value;
+                onTargetChange(v === '' ? null : Math.min(100, Math.max(0, Number(v))));
+              }}
+              placeholder="none"
+              className="w-16 px-2 py-1 border border-slate-200 rounded-lg bg-white text-sm text-right text-slate-900 normal-case focus:outline-none focus:ring-2 focus:ring-blue-500"
+              aria-label="Target margin percent for this material"
+            />
+            %
+          </label>
+        )}
+      </div>
 
       {after === null ? (
         <p className="text-sm font-semibold text-slate-500">Enter a sale price to see the margin.</p>
@@ -94,6 +119,28 @@ export function MarginPreview({ currentBuy, currentSale, newBuy, newSale, unit, 
                 : `${(target! - after).toFixed(1)} pts below the ${pct(target!)} margin target.`}
             </p>
           ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** One-line margin vs target for a material card that is not being edited. */
+export function MarginLine({ buyPrice, salePrice, target }: { buyPrice: number; salePrice: number; target?: number | null }) {
+  const margin = marginPercent(buyPrice, salePrice);
+  if (margin === null) return null;
+  const hasTarget = typeof target === 'number' && target > 0;
+  const color =
+    margin <= 0 ? 'text-red-700'
+      : hasTarget ? (margin >= target! ? 'text-emerald-700' : 'text-amber-700')
+      : 'text-slate-700';
+  return (
+    <div className="px-5 pb-4 -mt-1 flex items-center gap-2 text-xs font-semibold text-slate-500">
+      <span>Margin <span className={cn('font-black tabular-nums', color)}>{pct(margin)}</span></span>
+      {hasTarget && (
+        <>
+          <span className="opacity-30">•</span>
+          <span className="tabular-nums">Target {pct(target!)}</span>
         </>
       )}
     </div>

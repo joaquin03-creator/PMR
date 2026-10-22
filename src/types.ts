@@ -45,6 +45,8 @@ export interface Material {
   buyPrice: number;
   salePrice: number;
   unit: 'lb' | 'ton';
+  /** Target profit margin % for this material ((sale − buy) / sale × 100). Unset = no target. */
+  marginTarget?: number;
   updatedAt: string;
   updatedBy?: string; // user email or name
   updatedByUid?: string;
