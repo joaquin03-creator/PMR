@@ -20,6 +20,10 @@ export interface CopperTickerProps {
 // tab. Popups stay allowed so a click still opens TradingView in a new tab.
 const WIDGET_HOST = 'https://www.tradingview-widget.com';
 const WIDGET_HEIGHT = 101; // the height TradingView's script forces for this widget
+// The price box inside that frame is ~67px tall with a 1px outline; the rest is empty.
+// The card shows only the box, with the outline cropped off, so the strip stays short.
+const VISIBLE_HEIGHT = 63;
+const CROP = 2; // px trimmed off each edge of the frame to hide the outline
 
 function widgetUrl(symbol: string): string {
   const settings = {
@@ -39,22 +43,26 @@ export function CopperTicker({ symbol = 'CAPITALCOM:COPPER', label = 'Copper · 
   return (
     <div
       className={cn(
-        'rounded-[22px] p-4 text-white shadow-lg flex flex-col min-h-[170px] w-[300px] max-w-full overflow-hidden',
+        'rounded-[22px] pl-4 pr-3 py-2.5 text-white shadow-lg flex items-center gap-3 w-[340px] max-w-full overflow-hidden',
         'bg-[linear-gradient(135deg,#3a2316_0%,#8a4b25_55%,#b8733a_100%)]',
         className
       )}
     >
-      <span className="text-[10px] font-black uppercase tracking-wider text-white/70">{label}</span>
-      <iframe
-        key={symbol}
-        src={widgetUrl(symbol)}
-        title={`${label} price`}
-        sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-        referrerPolicy="origin"
-        scrolling="no"
-        className="mt-1 w-full border-0 bg-transparent select-none"
-        style={{ height: WIDGET_HEIGHT, colorScheme: 'normal' }}
-      />
+      <span className="text-[10px] font-black uppercase tracking-wider text-white/70 leading-tight shrink-0">
+        {label.split(' · ').map(part => <span key={part} className="block">{part}</span>)}
+      </span>
+      <div className="relative flex-1 min-w-0 overflow-hidden" style={{ height: VISIBLE_HEIGHT }}>
+        <iframe
+          key={symbol}
+          src={widgetUrl(symbol)}
+          title={`${label} price`}
+          sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+          referrerPolicy="origin"
+          scrolling="no"
+          className="absolute border-0 bg-transparent select-none"
+          style={{ top: -CROP, left: -CROP, width: `calc(100% + ${CROP * 2}px)`, height: WIDGET_HEIGHT, colorScheme: 'normal' }}
+        />
+      </div>
     </div>
   );
 }

@@ -97,25 +97,26 @@ export function WeatherWidget({
       rel="noopener noreferrer"
       title="Open the National Weather Service forecast in a new tab"
       className={cn(
-        'rounded-[22px] p-4 text-white shadow-lg flex flex-col min-h-[170px] w-[170px] transition-all hover:brightness-110 hover:shadow-xl',
-        'bg-[linear-gradient(180deg,#3d7bd9_0%,#6aa6ec_100%)]',
+        'rounded-[22px] px-4 py-2.5 text-white shadow-lg flex items-center gap-3 w-[250px] min-h-[85px] transition-all hover:brightness-110 hover:shadow-xl',
+        'bg-[linear-gradient(135deg,#3d7bd9_0%,#6aa6ec_100%)]',
         className
       )}
     >
-      <span className="text-sm font-semibold truncate">{city}</span>
       {weather && sky ? (
         <>
-          <div className="flex items-center justify-between mt-1">
-            <span className="text-5xl font-extralight leading-none tracking-tight">{Math.round(weather.temperature)}°</span>
-            <span className="text-3xl leading-none" aria-hidden="true">{sky.icon}</span>
-          </div>
-          <div className="mt-auto">
-            <p className="text-xs font-semibold">{sky.label}</p>
-            <p className="text-xs font-semibold">H:{Math.round(weather.high)}° L:{Math.round(weather.low)}°</p>
+          <span className="text-4xl font-extralight leading-none tracking-tight tabular-nums">{Math.round(weather.temperature)}°</span>
+          <span className="text-2xl leading-none" aria-hidden="true">{sky.icon}</span>
+          <div className="min-w-0 ml-auto text-right">
+            <p className="text-sm font-semibold truncate leading-tight">{city}</p>
+            <p className="text-xs font-semibold leading-tight">{sky.label}</p>
+            <p className="text-xs font-semibold leading-tight">H:{Math.round(weather.high)}° L:{Math.round(weather.low)}°</p>
           </div>
         </>
       ) : (
-        <p className="mt-auto text-xs font-semibold text-white/80">{failed ? 'Weather unavailable' : 'Loading…'}</p>
+        <>
+          <span className="text-sm font-semibold truncate">{city}</span>
+          <span className="ml-auto text-xs font-semibold text-white/80">{failed ? 'Weather unavailable' : 'Loading…'}</span>
+        </>
       )}
     </a>
   );
