@@ -7,6 +7,7 @@ import { Plus, Search, Edit2, TrendingUp, TrendingDown, Minus, Loader2, X, Shiel
 import Papa from 'papaparse';
 import { cn } from '../lib/utils';
 import MaterialDuplicateManagerModal from '../components/MaterialDuplicateManagerModal';
+import { MarginPreview } from '../components/MarginPreview';
 
 import { UserProfile } from '../types';
 
@@ -46,6 +47,7 @@ export default function ManagePrices({ profile }: ManagePricesProps) {
   const [seeding, setSeeding] = useState(false);
   const [updatingPin, setUpdatingPin] = useState(false);
   const [newPin, setNewPin] = useState(profile?.managerPin || '');
+  const [marginTarget, setMarginTarget] = useState<number | null>(null);
   
   // Google Sheets Sync State
   const [sheetId, setSheetId] = useState('');
@@ -116,6 +118,9 @@ export default function ManagePrices({ profile }: ManagePricesProps) {
       if (snap.exists() && snap.data().googleSheetUrl) {
         setSheetId(snap.data().googleSheetUrl);
       }
+      // Same margin target the Dashboard's Margin % gauge uses (flat or nested field).
+      const target = snap.exists() ? (snap.data().dailyMarginTarget ?? snap.data().dailyTargets?.margin) : undefined;
+      setMarginTarget(typeof target === 'number' && target > 0 ? target : null);
     }, (error) => {
       console.warn('System config snapshot failed in ManagePrices (using default/cached config):', error.message);
     });
@@ -1584,6 +1589,17 @@ To fix this:
                 )}
               </div>
             </div>
+
+            {isEditing === material.id && (
+              <MarginPreview
+                currentBuy={material.buyPrice}
+                currentSale={material.salePrice}
+                newBuy={editForm.buyPrice ?? material.buyPrice}
+                newSale={editForm.salePrice ?? material.salePrice}
+                unit={editForm.unit || material.unit}
+                target={marginTarget}
+              />
+            )}
 
             {isEditing === material.id ? (
               <div className="px-5 pb-4 space-y-1">
