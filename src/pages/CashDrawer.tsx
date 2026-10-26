@@ -53,7 +53,7 @@ import {
   CalendarDays
 } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, Cell, XAxis, YAxis, Tooltip as RechartsTooltip, ReferenceLine, CartesianGrid } from 'recharts';
-import { cn } from '../lib/utils';
+import { cn, transactionTimestampFor } from '../lib/utils';
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
 import { useToast } from '../context/ToastContext';
@@ -67,6 +67,7 @@ import {
 } from '../lib/cashLogicLock';
 import { isProvisionalSession, getClosingBasis } from '../lib/provisionalCash';
 import { buildLedgerRows, LedgerRow } from '../lib/ledgerRows';
+import { ticketsAfterCount, sameDenominations } from '../lib/countTiming';
 import CashLedgerTable from '../components/CashLedgerTable';
 import { TicketPayoutExpander } from '../components/TicketPayoutExpander';
 
@@ -800,6 +801,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         actualCash = Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
         updateData.actualCash = actualCash;
         updateData.closingDenominations = physicalCountDenoms;
+        // When the count last changed -- the close step compares it with ticket times.
+        updateData.closingCountUpdatedAt = new Date().toISOString();
       }
       if (actualCash !== null) {
         updateData.overShort = Math.round((actualCash - expectedCashVal) * 100) / 100;
@@ -1130,13 +1133,17 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     const expectedCashVal = Math.round((openingCash + totalReplenishments - totalPayouts - totalExpenses) * 100) / 100;
     const actualCash = Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
     const overShort = Math.round((actualCash - expectedCashVal) * 100) / 100;
+    // Only a changed count moves the "counted at" time; saving the same figures again does not.
+    const countChanged = !sameDenominations(physicalCountDenoms, selectedSession.closingDenominations);
+    const countStamp = countChanged ? { closingCountUpdatedAt: new Date().toISOString() } : {};
     try {
       await updateDoc(doc(db, 'cashSessions', selectedSession.id), {
         openingCash,
         expectedCash: expectedCashVal,
         actualCash,
         overShort,
-        closingDenominations: physicalCountDenoms
+        closingDenominations: physicalCountDenoms,
+        ...countStamp
       });
 
       // Track in Audit Log
@@ -1172,7 +1179,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         expectedCash: expectedCashVal,
         actualCash,
         overShort,
-        closingDenominations: physicalCountDenoms
+        closingDenominations: physicalCountDenoms,
+        ...countStamp
       } : null);
 
       if (selectedSession.status === 'closed') {
@@ -1721,7 +1729,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   const handleCloseLedgerDay = (row: LedgerRow) => {
     const session = row.sessionId ? history.find(s => s.id === row.sessionId) : null;
     if (!session) return;
-    if (window.confirm(`Are you sure you want to finalize and close the session for ${session.date}?`)) {
+    const late = ticketsAfterCount(
+      recentTickets.filter(t => getTicketLocalDate(t.timestamp) === session.date),
+      session.closingCountUpdatedAt
+    );
+    const lateNote = late.tickets.length > 0
+      ? `\n\nNote: ${late.tickets.length} ticket${late.tickets.length === 1 ? '' : 's'} ($${late.total.toFixed(2)}) ${late.tickets.length === 1 ? 'was' : 'were'} written after the drawer count was last changed. If ${late.tickets.length === 1 ? 'it was' : 'they were'} paid from the drawer after the count, recount (or correct the count) first, or that amount shows as over today and short tomorrow.`
+      : '';
+    if (window.confirm(`Are you sure you want to finalize and close the session for ${session.date}?${lateNote}`)) {
       handleQuickCloseSession(session);
     }
   };
@@ -1835,6 +1850,13 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
       totalExpectedProfitOverall
     };
   }, [buyTickets, materials]);
+
+  // Tickets paid after the drawer count was last changed (shown in the close step; notice only).
+  const closeTargetSession = selectedSession || activeSession;
+  const lateTicketsAfterCount = useMemo(() => {
+    if (!closeTargetSession || ticketsLoadedForDate !== closeTargetSession.date) return { tickets: [] as BuyTicket[], total: 0 };
+    return ticketsAfterCount(buyTickets, closeTargetSession.closingCountUpdatedAt);
+  }, [buyTickets, ticketsLoadedForDate, closeTargetSession?.id, closeTargetSession?.date, closeTargetSession?.closingCountUpdatedAt]);
 
   const totalPayouts = useMemo(() => {
     const val = buyTickets.filter(t => isCashPayoutTicket(t.paymentMethod)).reduce((sum, t) => sum + t.totalAmount, 0);
@@ -2679,8 +2701,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
     try {
       const sessionDateStr = targetSession.date || todayStr;
-      const timePart = new Date().toISOString().split('T')[1] || '12:00:00.000Z';
-      const txTimestamp = `${sessionDateStr}T${timePart}`;
+      const txTimestamp = transactionTimestampFor(sessionDateStr, todayStr);
 
       const docRef = await addDoc(collection(db, 'cashTransactions'), {
         sessionId: targetSession.id,
@@ -2804,8 +2825,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
     try {
       const sessionDateStr = targetSession.date || todayStr;
-      const timePart = new Date().toISOString().split('T')[1] || '12:00:00.000Z';
-      const txTimestamp = `${sessionDateStr}T${timePart}`;
+      const txTimestamp = transactionTimestampFor(sessionDateStr, todayStr);
 
       const docRef = await addDoc(collection(db, 'cashTransactions'), {
         sessionId: targetSession.id,
@@ -2899,7 +2919,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         closedAt: new Date().toISOString(),
         closedBy: profile.email,
         notes: notes || targetSession.notes || '',
-        ...(useClosingDenoms ? { closingDenominations: physicalCountDenoms } : {})
+        ...(useClosingDenoms ? { closingDenominations: physicalCountDenoms } : {}),
+        // A count typed at close (or a changed one) is a count taken now.
+        ...(!useClosingDenoms || !sameDenominations(physicalCountDenoms, targetSession.closingDenominations)
+          ? { closingCountUpdatedAt: new Date().toISOString() }
+          : {})
       };
 
       await updateDoc(doc(db, 'cashSessions', targetSession.id), closedData);
@@ -7027,6 +7051,32 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                 <p className="text-2xl font-black text-blue-600 font-mono">{buyTickets.length} Tickets</p>
               </div>
             </div>
+
+            {lateTicketsAfterCount.tickets.length > 0 && closeTargetSession?.closingCountUpdatedAt && (
+              <div className="mb-8 p-5 bg-amber-50 border border-amber-300 rounded-[1.5rem] flex gap-3.5 items-start text-xs shadow-sm">
+                <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-1.5 text-left">
+                  <h4 className="font-black text-amber-900 uppercase tracking-tight text-[11px]">
+                    {lateTicketsAfterCount.tickets.length} ticket{lateTicketsAfterCount.tickets.length === 1 ? '' : 's'} (${lateTicketsAfterCount.total.toFixed(2)}) came after the count
+                  </h4>
+                  <p className="text-amber-800 font-bold leading-relaxed">
+                    The drawer count was last changed at{' '}
+                    {new Date(closeTargetSession.closingCountUpdatedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}.
+                    If {lateTicketsAfterCount.tickets.length === 1 ? 'this ticket was' : 'these tickets were'} paid from the drawer after that,
+                    recount (or correct the count below) before finalizing &mdash; otherwise that amount shows as over today and short tomorrow.
+                    If you already recounted, finalize as normal.
+                  </p>
+                  <ul className="text-amber-900 font-mono space-y-0.5">
+                    {lateTicketsAfterCount.tickets.slice(0, 6).map(t => (
+                      <li key={t.id}>
+                        {new Date(t.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} &middot; #{t.id.toUpperCase()} &middot; ${(t.totalAmount || 0).toFixed(2)}
+                      </li>
+                    ))}
+                    {lateTicketsAfterCount.tickets.length > 6 && <li>&hellip; and {lateTicketsAfterCount.tickets.length - 6} more</li>}
+                  </ul>
+                </div>
+              </div>
+            )}
 
             {/* Segmented Control */}
             <div className="flex bg-slate-100 p-1 rounded-2xl mb-8">

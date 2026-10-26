@@ -105,3 +105,16 @@ export async function compressImageToBase64(dataUrl: string, maxBytes: number): 
     img.src = dataUrl;
   });
 }
+
+// When a drawer transaction happened, for its timestamp. Today's session: the real moment it is
+// entered. A past day's session: that day, at the current local time of day. (The old code glued
+// the session's local date to the UTC time of day, which stamped anything entered after 8 PM
+// Eastern a full day early -- e.g. the $25,000 withdrawal of 10/20/2026 showed as 10/19.)
+// Drawer math groups transactions by session, not by this timestamp.
+export function transactionTimestampFor(sessionDate: string, today: string): string {
+  const now = new Date();
+  if (!sessionDate || sessionDate === today) return now.toISOString();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const onThatDay = new Date(`${sessionDate}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`);
+  return isNaN(onThatDay.getTime()) ? now.toISOString() : onThatDay.toISOString();
+}

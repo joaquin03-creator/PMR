@@ -59,6 +59,7 @@ import { TicketOutboxEntry, saveOutboxEntry, fireTicketWrites, finishTicket } fr
 import { PricingUnitBadge } from './PricingUnitBadge';
 import USBBarcodeScannerModal from './USBBarcodeScannerModal';
 import { useQuickTicket } from '../context/QuickTicketContext';
+import { RedoOf, buildRedoOf, redoDifference, findLikelyRedoSource, canRedoTicket } from '../lib/ticketRedo';
 
 function filterAndSortMaterials(materials: Material[], rawSearch: string): Material[] {
   if (!rawSearch || !rawSearch.trim()) return [];
@@ -215,6 +216,8 @@ export default function QuickTicketModal({
     idImageUrl?: string;
     ohioDatabaseStatus?: 'not_checked' | 'cleared' | 'flagged';
     idNumber?: string;
+    redoOfTicketId?: string;
+    redoPriorPayout?: number;
   } | null>(null);
 
   const [isRunningPostDpsCheck, setIsRunningPostDpsCheck] = useState(false);
@@ -240,6 +243,12 @@ export default function QuickTicketModal({
   const [showPinModal, setShowPinModal] = useState(false);
   const [activeDraftId, setActiveDraftId] = useState<string | null>(initialDraftId || null);
   const [unconfirmedDraft, setUnconfirmedDraft] = useState<{ id: string; data: any } | null>(null);
+
+  // Redo with new price (lib/ticketRedo.ts): the ticket this one replaces, voided once this one is saved.
+  const [qtRedoOf, setQtRedoOf] = useState<RedoOf | null>(null);
+  // This customer's latest tickets, to notice the same load being rung up again.
+  const [qtCustomerRecentTickets, setQtCustomerRecentTickets] = useState<BuyTicket[]>([]);
+  const canRedoTickets = profile?.role === 'manager' && !!profile?.permissions?.canVoidTickets;
 
   const [isUSBScannerOpen, setIsUSBScannerOpen] = useState(false);
   const [usbScanFeedback, setUsbScanFeedback] = useState<{ type: 'success' | 'new'; message: string } | null>(null);
@@ -314,11 +323,16 @@ export default function QuickTicketModal({
     setQtCreatedTicketId('');
     setQtVerificationStatus('idle');
     setShowPrintPreview(false);
+    setQtRedoOf(null);
+    setQtCustomerRecentTickets([]);
   };
 
   // Resume a draft and load its full state
   const handleResumeDraft = (draft: { id: string; data: any }) => {
     const d = draft.data;
+    // A redo starts from a clean slate so nothing from a ticket left open here carries into it.
+    if (d.redoOf) resetQuickTicket(false);
+    setQtRedoOf(d.redoOf || null);
     setActiveDraftId(draft.id);
     setUnconfirmedDraft(null);
 
@@ -553,6 +567,7 @@ export default function QuickTicketModal({
       qtIdImageUrl,
       qtSignatureUrl,
       qtOhioDatabaseStatus,
+      redoOf: qtRedoOf,
       selectedCustomer: qtCustomer
         ? {
             id: qtCustomer.id,
@@ -630,6 +645,7 @@ export default function QuickTicketModal({
     qtIdImageUrl,
     qtSignatureUrl,
     qtOhioDatabaseStatus,
+    qtRedoOf,
     activeDraftId,
     unconfirmedDraft,
     profile
@@ -696,11 +712,12 @@ export default function QuickTicketModal({
         collection(db, 'buyTickets'),
         where('customerId', '==', qtCustomer.id),
         orderBy('timestamp', 'desc'),
-        limit(1)
+        limit(3)
       );
 
       getDocs(qTickets)
         .then((snap) => {
+          setQtCustomerRecentTickets(snap.docs.map((d) => ({ id: d.id, ...d.data() } as BuyTicket)));
           if (!snap.empty) {
             const lastTicket = snap.docs[0].data();
             if (lastTicket.vehiclePlate && !qtCustomer.vehiclePlate) setQtVehiclePlate(lastTicket.vehiclePlate);
@@ -722,8 +739,17 @@ export default function QuickTicketModal({
           }
         })
         .catch((err) => console.warn('Could not load customer history:', err));
+    } else {
+      setQtCustomerRecentTickets([]);
     }
   }, [qtCustomer]);
+
+  // Same customer, same weights, already a completed ticket today: most likely the same load
+  // rung up again for a price fix. Only a notice -- never blocks the ticket.
+  const qtLikelyRedoSource = useMemo(() => {
+    if (qtRedoOf || qtSuccess || !qtCustomer) return null;
+    return findLikelyRedoSource(qtItems, qtCustomerRecentTickets.filter((t) => t.customerId === qtCustomer.id));
+  }, [qtRedoOf, qtSuccess, qtCustomer?.id, qtItems, qtCustomerRecentTickets]);
 
   // Ohio DPS Check & Do-Not-Buy matching
   const namesMatch = (dnbName: string, custName: string) => {
@@ -981,6 +1007,14 @@ export default function QuickTicketModal({
 
   // Submission handler
   const handleQuickTicketSubmit = async () => {
+    // A redo voids the original, which is only right on the same day (see canRedoTicket).
+    if (qtRedoOf && !canRedoTicket({ status: 'completed', timestamp: qtRedoOf.timestamp })) {
+      alert(
+        `Ticket #${qtRedoOf.ticketId.toUpperCase()} is from an earlier day, so this can't be a redo (voiding it would make that day's drawer short). ` +
+        `Close this ticket without saving and pay the difference from today's drawer as an expense (Ticket adjustment).`
+      );
+      return;
+    }
     // Compliance Hard Block Validations
     if (!qtSignatureUrl) {
       alert('Seller signature is required before finalizing the ticket.');
@@ -1116,6 +1150,10 @@ export default function QuickTicketModal({
         idNumber: isQtNewCustomer ? qtNewCustomer.idNumber || '' : qtCustomer?.idNumber || '',
         idExpiration: isQtNewCustomer ? qtNewCustomer.idExpiration || '' : qtCustomer?.idExpiration || ''
       };
+      if (qtRedoOf) {
+        ticketData.redoOfTicketId = qtRedoOf.ticketId;
+        ticketData.redoPriorPayout = qtRedoOf.totalAmount;
+      }
 
       // 1. Locally generated ticket ID
       const ticketId = generateTicketId('BUY');
@@ -1164,11 +1202,15 @@ export default function QuickTicketModal({
           .filter((i) => i.material && i.overridePrice !== undefined && i.overridePrice !== i.material.buyPrice)
           .map((i) => ({ materialName: i.material!.name, before: i.material!.buyPrice, after: i.overridePrice as number })),
         draftId: activeDraftId || null,
-        auditNote: `Quick Ticket created for ${customerName}`,
+        auditNote: qtRedoOf
+          ? `Quick Ticket created for ${customerName} -- redo of #${qtRedoOf.ticketId.toUpperCase()} with new price ($${qtRedoOf.totalAmount.toFixed(2)} already paid; difference $${redoDifference(calculatedFinalTotal, qtRedoOf.totalAmount).toFixed(2)})`
+          : `Quick Ticket created for ${customerName}`,
+        redoOf: qtRedoOf,
+        performedBy: profile?.email || auth.currentUser?.email || 'unknown',
         ticketConfirmed: false,
         // The draft is deleted immediately with the ticket write (see fireTicketWrites), so the
         // next Quick Ticket never offers to "resume" a ticket that was already completed.
-        issued: { customerUpdate: false, inventory: false, audit: false, draft: true },
+        issued: { customerUpdate: false, inventory: false, audit: false, draft: true, voidOriginal: false },
         attempts: 0
       };
       const safetyCopyStored = await saveOutboxEntry(outboxEntry);
@@ -1200,7 +1242,8 @@ export default function QuickTicketModal({
         loadPhotoUrl: qtLoadPhotoUrl || '',
         idImageUrl: qtIdImageUrl || '',
         ohioDatabaseStatus: qtOhioDatabaseStatus || 'not_checked',
-        idNumber: isQtNewCustomer ? qtNewCustomer.idNumber || '' : qtCustomer?.idNumber || ''
+        idNumber: isQtNewCustomer ? qtNewCustomer.idNumber || '' : qtCustomer?.idNumber || '',
+        ...(qtRedoOf ? { redoOfTicketId: qtRedoOf.ticketId, redoPriorPayout: qtRedoOf.totalAmount } : {})
       };
 
       setPrintedTicket(ticketSnapshot);
@@ -1226,7 +1269,8 @@ export default function QuickTicketModal({
             vehiclePlate: qtVehiclePlate || '',
             vehicleType: qtVehicleType || '',
             signatureUrl: qtSignatureUrl || '',
-            sellerAffirmed: !!(qtSignatureUrl)
+            sellerAffirmed: !!(qtSignatureUrl),
+            ...(qtRedoOf ? { redoOfTicketId: qtRedoOf.ticketId, redoPriorPayout: qtRedoOf.totalAmount } : {})
           };
 
           await printTicket(
@@ -1267,6 +1311,12 @@ export default function QuickTicketModal({
             `Ticket #${ticketId.toUpperCase()} for ${customerName} ($${calculatedFinalTotal.toFixed(2)}) was rejected by the server: ${result.error}. Keep the printed receipt and tell a manager — it is held on this device and will be retried.`
           );
           return;
+        }
+        if (result.voidOriginal === 'failed' && ticketData.redoOfTicketId) {
+          toastError(
+            'Old Ticket Not Voided Yet',
+            `Ticket #${ticketId.toUpperCase()} is saved, but #${String(ticketData.redoOfTicketId).toUpperCase()} could not be voided yet. It will be retried; if it still shows as completed in Ticket History, void it there.`
+          );
         }
         if (result.followUpFailed) {
           toastWarning('Ticket Saved', `Ticket #${ticketId.toUpperCase()} is saved, but a customer/inventory update did not go through. Tell a manager.`);
@@ -1369,6 +1419,54 @@ export default function QuickTicketModal({
 
         {/* Modal Body */}
         <div className="p-6 overflow-y-auto flex-1 space-y-6">
+          {/* Redo with new price: what this ticket replaces and what is left to pay */}
+          {!qtSuccess && qtRedoOf && (
+            <div className="p-4 bg-violet-50 border-2 border-violet-300 rounded-2xl flex flex-col sm:flex-row sm:items-center gap-3 text-left">
+              <RotateCcw className="w-5 h-5 text-violet-700 shrink-0" />
+              <div className="flex-1 space-y-0.5">
+                <p className="text-sm font-black text-violet-950">
+                  Redo of ticket #{qtRedoOf.ticketId.toUpperCase()} &mdash; ${qtRedoOf.totalAmount.toFixed(2)} already paid
+                </p>
+                <p className="text-xs text-violet-800">
+                  Fix the prices below. When this ticket is saved, #{qtRedoOf.ticketId.toUpperCase()} is voided and the
+                  customer is paid only the difference:{' '}
+                  <span className="font-black font-mono">${redoDifference(totalAmount, qtRedoOf.totalAmount).toFixed(2)}</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setQtRedoOf(null)}
+                className="text-xs font-bold text-violet-700 underline hover:text-violet-900 self-start sm:self-center"
+              >
+                Not a redo
+              </button>
+            </div>
+          )}
+          {!qtSuccess && !qtRedoOf && qtLikelyRedoSource && (
+            <div className="p-4 bg-amber-50 border border-amber-300 rounded-2xl flex flex-col sm:flex-row sm:items-center gap-3 text-left">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+              <div className="flex-1 space-y-0.5">
+                <p className="text-sm font-black text-amber-950">
+                  Same weights as ticket #{qtLikelyRedoSource.id.toUpperCase()} from today (${(qtLikelyRedoSource.totalAmount || 0).toFixed(2)})
+                </p>
+                <p className="text-xs text-amber-800">
+                  {canRedoTickets
+                    ? 'If this is a price fix for that load, make it a redo: the old ticket is voided when this one is saved, and the printout shows the difference to pay.'
+                    : 'If this is a price fix for that load, ask a manager to void the old ticket, or the drawer will count both payouts.'}
+                </p>
+              </div>
+              {canRedoTickets && (
+                <button
+                  type="button"
+                  onClick={() => setQtRedoOf(buildRedoOf(qtLikelyRedoSource, qtLikelyRedoSource.materials || []))}
+                  className="px-4 py-2 bg-amber-600 text-white rounded-xl text-xs font-black hover:bg-amber-700 self-start sm:self-center whitespace-nowrap"
+                >
+                  Make this a redo
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Post-Submission Success Screen */}
           {qtSuccess ? (
             <div className="py-8 px-4 text-center space-y-6 max-w-lg mx-auto">
@@ -1419,6 +1517,18 @@ export default function QuickTicketModal({
                     ${(printedTicket?.totalAmount ?? totalAmount).toFixed(2)}
                   </span>
                 </div>
+                {printedTicket?.redoOfTicketId && printedTicket.redoPriorPayout !== undefined && (
+                  <div className="mt-2 p-3 bg-violet-100 border-2 border-violet-400 rounded-xl text-center">
+                    <p className="text-[11px] font-bold text-violet-800">
+                      Replaces #{printedTicket.redoOfTicketId.toUpperCase()} &mdash; ${printedTicket.redoPriorPayout.toFixed(2)} already paid
+                    </p>
+                    <p className="text-xl font-black text-violet-950 font-mono">
+                      {redoDifference(printedTicket.totalAmount, printedTicket.redoPriorPayout) >= 0
+                        ? `PAY DIFFERENCE: $${redoDifference(printedTicket.totalAmount, printedTicket.redoPriorPayout).toFixed(2)}`
+                        : `CUSTOMER OWES BACK: $${Math.abs(redoDifference(printedTicket.totalAmount, printedTicket.redoPriorPayout)).toFixed(2)}`}
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Post-Ticket Ohio DPS Verification Card */}
@@ -2627,6 +2737,16 @@ export default function QuickTicketModal({
                               ${totalAmount.toFixed(2)}
                             </td>
                           </tr>
+                          {qtRedoOf && (
+                            <tr className="bg-violet-100 font-black text-xs text-violet-950">
+                              <td className="py-3 px-4 uppercase" colSpan={5}>
+                                Already paid on #{qtRedoOf.ticketId.toUpperCase()} (${qtRedoOf.totalAmount.toFixed(2)}) &mdash; pay difference
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono text-base">
+                                ${redoDifference(totalAmount, qtRedoOf.totalAmount).toFixed(2)}
+                              </td>
+                            </tr>
+                          )}
                         </tfoot>
                       </table>
                     </div>
@@ -2697,6 +2817,11 @@ export default function QuickTicketModal({
               <div className="text-right hidden sm:block">
                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-wider">Total Payout</p>
                 <p className="text-xl font-black text-green-600">${totalAmount.toFixed(2)}</p>
+                {qtRedoOf && (
+                  <p className="text-[11px] font-black text-violet-700">
+                    Pay difference ${redoDifference(totalAmount, qtRedoOf.totalAmount).toFixed(2)}
+                  </p>
+                )}
               </div>
 
               {step < 4 ? (
@@ -2877,7 +3002,10 @@ export default function QuickTicketModal({
                     vehiclePlate: printedTicket?.vehiclePlate || qtVehiclePlate || '',
                     vehicleType: printedTicket?.vehicleType || qtVehicleType || '',
                     signatureUrl: printedTicket?.signatureUrl || qtSignatureUrl || '',
-                    sellerAffirmed: printedTicket?.sellerAffirmed ?? !!(qtSignatureUrl)
+                    sellerAffirmed: printedTicket?.sellerAffirmed ?? !!(qtSignatureUrl),
+                    ...(printedTicket?.redoOfTicketId
+                      ? { redoOfTicketId: printedTicket.redoOfTicketId, redoPriorPayout: printedTicket.redoPriorPayout }
+                      : {})
                   };
 
                   await printTicket(

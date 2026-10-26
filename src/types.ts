@@ -123,6 +123,15 @@ export interface BuyTicket {
   ohioDatabaseStatus?: 'not_checked' | 'cleared' | 'flagged';
   backfilledAt?: string;
   backfilledFields?: string[];
+  // Redo with new price (lib/ticketRedo.ts): the replacement ticket names the one it
+  // replaces and what was already paid on it; the replaced ticket is voided and names
+  // its replacement. The replacement's totalAmount is the full payout, as always.
+  redoOfTicketId?: string;
+  redoPriorPayout?: number;
+  replacedByTicketId?: string;
+  voidedAt?: string;
+  voidedBy?: string;
+  voidReason?: string;
 }
 
 export interface TripTicketMaterial {
@@ -523,6 +532,9 @@ export interface CashSession {
   provisionalAssumedCash?: number;
   provisionalFinalizedAt?: string;
   provisionalFinalizedBy?: string;
+  // When closingDenominations last changed. Lets the close step point out tickets that
+  // were written after the drawer was counted. Not part of any cash formula.
+  closingCountUpdatedAt?: string;
 }
 
 export interface CashTransaction {

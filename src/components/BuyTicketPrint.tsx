@@ -102,6 +102,21 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
     ? ticket.totalAmount
     : calculatedTotalAmount;
 
+  // Redo with new price: this ticket replaces one that was already paid. Total payout stays the
+  // full amount; the block below says how much is left to hand over.
+  const redoPrior = ticket.redoOfTicketId && typeof ticket.redoPriorPayout === 'number' ? ticket.redoPriorPayout : null;
+  const redoDiff = redoPrior !== null ? Math.round((finalTotalAmount - redoPrior) * 100) / 100 : 0;
+  const redoBlock = redoPrior !== null ? (
+    <div style={{ border: '2px solid #000', padding: isThermal ? '4px' : '8px 10px', margin: isThermal ? '6px 0' : '10px 0', fontFamily: 'inherit' }}>
+      <div style={{ fontSize: isThermal ? '10px' : '12px' }}>
+        REPLACES TICKET #{String(ticket.redoOfTicketId).toUpperCase()} (VOIDED) &mdash; ALREADY PAID ${redoPrior.toFixed(2)}
+      </div>
+      <div style={{ fontSize: isThermal ? '16px' : '20px', fontWeight: 'bold', marginTop: '2px' }}>
+        {redoDiff >= 0 ? `PAY DIFFERENCE: $${redoDiff.toFixed(2)}` : `CUSTOMER OWES BACK: $${Math.abs(redoDiff).toFixed(2)}`}
+      </div>
+    </div>
+  ) : null;
+
   // Format vehicle info nicely
   const vehicleParts = [
     ticket.vehicleYear,
@@ -428,6 +443,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
               <span>${finalTotalAmount.toFixed(2)}</span>
             </div>
           </div>
+          {redoBlock}
         </>
       ) : (
         <table style={tableStyle}>
@@ -496,6 +512,7 @@ export const BuyTicketPrint: React.FC<BuyTicketPrintProps> = ({
           </tbody>
         </table>
       )}
+      {!isThermal && redoBlock}
 
       {/* Legal Compliance Statement */}
       <div style={legalBoxStyle}>

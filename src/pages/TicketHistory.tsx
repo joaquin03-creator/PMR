@@ -7,7 +7,7 @@ auth, db } from '../firebase';
 import {
 useSettings } from '../context/SettingsContext';
 import {
-collection, onSnapshot, query, orderBy, doc, deleteDoc, updateDoc, increment, writeBatch } from 'firebase/firestore';
+collection, onSnapshot, query, orderBy, doc, deleteDoc, updateDoc, increment, writeBatch, setDoc } from 'firebase/firestore';
 import {
 BuyTicket, Customer, Material, MaterialReclassification, UserProfile } from '../types';
 import {
@@ -36,6 +36,7 @@ import {
   AlertCircle,
   Edit2,
   Shuffle,
+  RotateCcw,
 } from 'lucide-react';
 import {
 cn } from '../lib/utils';
@@ -55,6 +56,8 @@ import { getCatalyticFollowUp, getCatalyticDailyLimitTicketIds, CATALYTIC_FOLLOW
 import { updateTicketPaymentMethod } from '../lib/ticketPaymentMethod';
 import { groupReclassificationsByTicket, effectiveLineMaterialIds, withEffectiveMaterials } from '../lib/reclassification';
 import { MaterialAutocompleteInput } from '../components/MaterialAutocompleteInput';
+import { useQuickTicket } from '../context/QuickTicketContext';
+import { buildRedoOf, redoDifference, canRedoTicket } from '../lib/ticketRedo';
 
 export default function TicketHistory({ profile }: { profile: UserProfile | null }) {
   const { settings } = useSettings();
@@ -99,10 +102,11 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
   }, [settings.receiptFormat, showPrintPreview]);
 
   const [autoPrint, setAutoPrint] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<{ type: 'void' | 'delete' | 'paymentMethod', ticket: BuyTicket, newPaymentMethod?: 'cash' | 'check' | 'eft' | 'other' } | null>(null);
+  const [confirmAction, setConfirmAction] = useState<{ type: 'void' | 'delete' | 'paymentMethod' | 'redo', ticket: BuyTicket, newPaymentMethod?: 'cash' | 'check' | 'eft' | 'other' } | null>(null);
   const [notification, setNotification] = useState<{ type: 'success' | 'error', message: string } | null>(null);
   const [showPinModal, setShowPinModal] = useState(false);
-  const [pendingAction, setPendingAction] = useState<{ type: 'void' | 'delete', ticket: BuyTicket } | null>(null);
+  const [pendingAction, setPendingAction] = useState<{ type: 'void' | 'delete' | 'redo', ticket: BuyTicket } | null>(null);
+  const { openQuickTicket } = useQuickTicket();
   const [sortConfig, setSortConfig] = useState<{ key: string; direction: 'asc' | 'desc' }>({
     key: 'timestamp',
     direction: 'desc'
@@ -415,6 +419,67 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
     }
   };
 
+  // Redo with new price (lib/ticketRedo.ts): open Quick Ticket on a draft copied from this ticket
+  // -- same customer, weights and photos, a fresh signature. Nothing changes here: this ticket is
+  // voided only once the new one is saved, and the new printout shows the difference to pay.
+  const handleStartRedo = (ticket: BuyTicket) => {
+    if (!profile || profile.role !== 'manager' || !canRedoTicket(ticket)) return;
+    const customer = customers.find((c) => c.id === ticket.customerId);
+    if (!customer) {
+      setConfirmAction(null);
+      setNotification({ type: 'error', message: 'Customer record not found for this ticket. Ring the new ticket in Quick Ticket and void this one.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    const userEmail = auth.currentUser?.email || profile.email || 'unknown';
+    const draftRef = doc(collection(db, 'ticketDrafts'));
+    const draft = {
+      userId: auth.currentUser?.uid || 'anonymous',
+      createdBy: userEmail,
+      createdByEmail: userEmail,
+      createdByName: profile.displayName || 'Staff',
+      type: 'quick',
+      step: 1,
+      qtStep: 1,
+      status: 'draft',
+      timestamp: now,
+      lastUpdated: now,
+      updatedAt: now,
+      qtItems: (ticket.materials || []).map((m) => ({
+        id: Math.random().toString(36).substr(2, 9),
+        material: materials.find((x) => x.id === m.materialId) || null,
+        gross: Number(m.grossWeight) || 0,
+        tare: Number(m.tareWeight) || 0,
+        deduction: Number(m.deductionWeight) || 0,
+        overridePrice: Number(m.pricePerUnit) || 0,
+        unit: m.unit || 'lb',
+        materialSearch: '',
+        isDropdownOpen: false,
+        photoUrl: m.photoUrl || ''
+      })),
+      qtCustomer: customer,
+      isQtNewCustomer: false,
+      qtVehiclePlate: ticket.vehiclePlate || '',
+      qtVehicleType: ticket.vehicleType || '',
+      qtCustomerPhotoUrl: ticket.customerPhotoUrl || '',
+      qtVehiclePhotoUrl: ticket.vehiclePhotoUrl || '',
+      qtLoadPhotoUrl: ticket.loadPhotoUrl || '',
+      qtIdImageUrl: ticket.idImageUrl || '',
+      qtSignatureUrl: '',
+      // Inventory to take back out = where the lines' weight counts now (after any reclassification).
+      redoOf: buildRedoOf(ticket, withEffectiveMaterials(ticket, reclassByTicket.get(ticket.id)).materials)
+    };
+    // Not awaited: Quick Ticket reads the draft from this device's cache, so a slow or
+    // offline connection never holds up the window.
+    setDoc(draftRef, draft).catch((err) => {
+      console.error('Error saving redo draft:', err);
+      setNotification({ type: 'error', message: 'Could not start the redo. Nothing was changed.' });
+    });
+    setConfirmAction(null);
+    setSelectedTicket(null);
+    openQuickTicket(draftRef.id);
+  };
+
   const handleDeleteTicket = async (ticket: BuyTicket) => {
     if (!profile || profile.role !== 'manager') return;
 
@@ -621,7 +686,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
           }
         }}
         title="Manager Approval"
-        message={`A Manager PIN is required to ${pendingAction?.type === 'void' ? 'void' : 'permanently delete'} this ticket.`}
+        message={`A Manager PIN is required to ${pendingAction?.type === 'void' ? 'void' : pendingAction?.type === 'redo' ? 'redo (and void)' : 'permanently delete'} this ticket.`}
       />
 
       {/* Confirmation Modal */}
@@ -632,9 +697,11 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
               "w-16 h-16 rounded-3xl flex items-center justify-center mx-auto",
               confirmAction.type === 'void' ? "bg-amber-100 text-amber-600" :
               confirmAction.type === 'paymentMethod' ? "bg-blue-100 text-blue-600" :
+              confirmAction.type === 'redo' ? "bg-violet-100 text-violet-600" :
               "bg-red-100 text-red-600"
             )}>
               {confirmAction.type === 'void' ? <Ban className="w-8 h-8" /> :
+               confirmAction.type === 'redo' ? <RotateCcw className="w-8 h-8" /> :
                confirmAction.type === 'paymentMethod' ? <Edit2 className="w-8 h-8" /> :
                <Trash2 className="w-8 h-8" />}
             </div>
@@ -642,12 +709,15 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
             <div className="text-center space-y-2">
               <h3 className="text-2xl font-black text-slate-900 font-display uppercase tracking-tight">
                 {confirmAction.type === 'void' ? 'Void Ticket?' :
+                 confirmAction.type === 'redo' ? 'Redo With New Price?' :
                  confirmAction.type === 'paymentMethod' ? 'Change Payment Method?' :
                  'Delete Ticket?'}
               </h3>
               <p className="text-sm text-slate-500 font-medium leading-relaxed px-4">
                 {confirmAction.type === 'void'
                   ? 'This will reverse inventory intake but keep a historical record. This action is permanent.'
+                  : confirmAction.type === 'redo'
+                  ? `Quick Ticket opens with this ticket's customer, weights and photos. Fix the prices and have the seller sign. When the new ticket is saved, this one ($${confirmAction.ticket.totalAmount.toFixed(2)}) is voided and the printout shows only the difference to pay.`
                   : confirmAction.type === 'paymentMethod'
                   ? (confirmAction.newPaymentMethod === 'cash'
                       ? `This ticket's $${confirmAction.ticket.totalAmount.toFixed(2)} total will count toward its day's expected cash again.`
@@ -661,12 +731,14 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                 disabled={processing}
                 onClick={() => {
                   if (confirmAction.type === 'void') handleVoidTicket(confirmAction.ticket);
+                  else if (confirmAction.type === 'redo') handleStartRedo(confirmAction.ticket);
                   else if (confirmAction.type === 'paymentMethod' && confirmAction.newPaymentMethod) handleUpdatePaymentMethod(confirmAction.ticket, confirmAction.newPaymentMethod);
                   else handleDeleteTicket(confirmAction.ticket);
                 }}
                 className={cn(
                   "w-full py-4 rounded-2xl font-black uppercase tracking-widest text-sm transition-all active:scale-95 flex items-center justify-center gap-2",
                   confirmAction.type === 'void' ? "bg-amber-600 text-white hover:bg-amber-700" :
+                  confirmAction.type === 'redo' ? "bg-violet-600 text-white hover:bg-violet-700" :
                   confirmAction.type === 'paymentMethod' ? "bg-blue-600 text-white hover:bg-blue-700" :
                   "bg-red-600 text-white hover:bg-red-700",
                   processing && "opacity-50 cursor-not-allowed"
@@ -674,6 +746,7 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
               >
                 {processing ? <Loader2 className="w-5 h-5 animate-spin" /> :
                  confirmAction.type === 'void' ? 'Void Ticket' :
+                 confirmAction.type === 'redo' ? 'Start Redo' :
                  confirmAction.type === 'paymentMethod' ? 'Confirm Change' :
                  'Delete Permanently'}
               </button>
@@ -1138,6 +1211,22 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                   <p className="text-sm font-bold text-red-900 uppercase tracking-tight">This ticket has been {selectedTicket.status}</p>
                 </div>
               )}
+              {selectedTicket.replacedByTicketId && (
+                <div className="p-4 bg-violet-50 border border-violet-200 rounded-2xl flex items-center gap-3">
+                  <RotateCcw className="w-5 h-5 text-violet-600 shrink-0" />
+                  <p className="text-sm font-bold text-violet-900">
+                    Redone with a new price as #{selectedTicket.replacedByTicketId.toUpperCase()}. The customer was paid the difference on that ticket.
+                  </p>
+                </div>
+              )}
+              {selectedTicket.redoOfTicketId && typeof selectedTicket.redoPriorPayout === 'number' && (
+                <div className="p-4 bg-violet-50 border border-violet-200 rounded-2xl flex items-center gap-3">
+                  <RotateCcw className="w-5 h-5 text-violet-600 shrink-0" />
+                  <p className="text-sm font-bold text-violet-900">
+                    Redo of #{selectedTicket.redoOfTicketId.toUpperCase()}: ${selectedTicket.redoPriorPayout.toFixed(2)} was already paid on it, so ${redoDifference(selectedTicket.totalAmount, selectedTicket.redoPriorPayout).toFixed(2)} was paid on this one.
+                  </p>
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-8">
                 <div className="space-y-3">
@@ -1325,6 +1414,22 @@ export default function TicketHistory({ profile }: { profile: UserProfile | null
                     <Shuffle className="w-5 h-5" />
                     Reclassify
                   </button>
+                  {profile.permissions?.canVoidTickets && (
+                    <button
+                      onClick={() => {
+                        setPendingAction({ type: 'redo', ticket: selectedTicket });
+                        setShowPinModal(true);
+                      }}
+                      disabled={processing || !canRedoTicket(selectedTicket) || (selectedTicket.materials || []).length === 0}
+                      title={canRedoTicket(selectedTicket)
+                        ? 'Ring this load up again with corrected prices. This ticket is voided when the new one is saved; the printout shows the difference to pay.'
+                        : "Only today's completed tickets can be redone. For an older ticket, pay the difference as a drawer expense (Ticket adjustment)."}
+                      className="flex items-center gap-2 px-6 py-4 bg-violet-600 text-white border border-violet-700 rounded-2xl font-bold hover:bg-violet-700 transition-all active:scale-95 disabled:opacity-50"
+                    >
+                      <RotateCcw className="w-5 h-5" />
+                      Redo With New Price
+                    </button>
+                  )}
                   {profile.permissions?.canVoidTickets && (
 
                     <button 

@@ -31,6 +31,7 @@ import {
 } from 'firebase/firestore';
 import { db } from '../firebase';
 import { logAuditEvent } from './audit';
+import { voidRedoneOriginal, type RedoOf, type VoidOriginalOutcome } from './ticketRedo';
 
 export interface TicketOutboxEntry {
   ticketId: string;
@@ -47,7 +48,11 @@ export interface TicketOutboxEntry {
   draftId: string | null;
   auditNote: string;
   ticketConfirmed: boolean;
-  issued: { customerUpdate: boolean; inventory: boolean; audit: boolean; draft: boolean };
+  issued: { customerUpdate: boolean; inventory: boolean; audit: boolean; draft: boolean; voidOriginal?: boolean };
+  /** Set when this ticket is a "Redo with new price": the original is voided once this one is confirmed. */
+  redoOf?: RedoOf | null;
+  /** Who is saving the ticket (recorded on the void of the original). */
+  performedBy?: string;
   attempts: number;
   lastError?: string;
 }
@@ -213,6 +218,8 @@ export interface FinishResult {
   error?: string;
   /** A follow-up write (customer / inventory) failed; the ticket itself is saved. */
   followUpFailed?: boolean;
+  /** Redo only: what happened to the original ticket. 'failed' = still completed; the entry is kept and retried. */
+  voidOriginal?: VoidOriginalOutcome | 'failed';
 }
 
 /**
@@ -288,14 +295,37 @@ export async function finishTicket(entry: TicketOutboxEntry, writes: TicketWrite
       }
     }
 
+    // Redo with new price: void the ticket this one replaces. Unlike the groups above, the flag
+    // is set only AFTER success -- voidRedoneOriginal() checks the original is still completed
+    // inside one transaction, so a retry can never reverse its inventory twice. On failure the
+    // outbox entry is kept, and replay tries again.
+    let voidOriginal: FinishResult['voidOriginal'];
+    if (entry.redoOf && !entry.issued.voidOriginal) {
+      try {
+        voidOriginal = await withTimeout(
+          voidRedoneOriginal(entry.redoOf, entry.ticketId, entry.performedBy || 'unknown'),
+          60000,
+          'Void of redone ticket'
+        );
+        entry.issued.voidOriginal = true;
+        await updateEntry(entry);
+      } catch (e: any) {
+        console.error('[TicketOutbox] Could not void redone ticket', entry.redoOf.ticketId, e);
+        entry.lastError = `Void of #${entry.redoOf.ticketId}: ${String(e?.message || e)}`;
+        await updateEntry(entry);
+        voidOriginal = 'failed';
+      }
+    }
+
     if (!entry.issued.draft && entry.draftId) {
       entry.issued.draft = true;
       await updateEntry(entry);
       try { await deleteDoc(doc(db, 'ticketDrafts', entry.draftId)); } catch (e) { console.warn('[TicketOutbox] Draft cleanup failed:', e); }
     }
 
+    if (voidOriginal === 'failed') return { ok: true, followUpFailed, voidOriginal };
     await removeEntry(entry.ticketId);
-    return { ok: true, followUpFailed };
+    return { ok: true, followUpFailed, voidOriginal };
   } finally {
     liveTicketIds.delete(entry.ticketId);
   }
