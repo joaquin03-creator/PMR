@@ -7,6 +7,7 @@ import { BuyTicket, TripTicket, Material, Customer, Invoice, InventoryItem, Dail
 import { COMPANY_NAME, COMPANY_ADDRESS, COMPANY_PHONE, COMPANY_EMAIL, COMPANY_WEBSITE, handleImageError } from '../constants';
 import { isProvisionalSession, getClosingBasis, getCountedOverShort } from '../lib/provisionalCash';
 import { BrandLogo } from '../components/BrandLogo';
+import { WeekdayReportTab } from '../components/WeekdayReportTab';
 import { 
   BarChart3, 
   TrendingUp, 
@@ -93,7 +94,7 @@ export default function Reports({ profile }: { profile: any }) {
   const [submittingReporting, setSubmittingReporting] = useState(false);
   const [timeRange, setTimeRange] = useState<'daily' | 'weekly' | 'monthly' | 'custom'>('weekly');
   const [searchParams] = useSearchParams();
-  const [activeTab, setActiveTab] = useState<'overview' | 'materials' | 'sales' | 'compliance' | 'backups' | 'history' | 'cash_flow'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'materials' | 'sales' | 'weekdays' | 'compliance' | 'backups' | 'history' | 'cash_flow'>('overview');
 
   const location = useLocation();
 
@@ -108,6 +109,8 @@ export default function Reports({ profile }: { profile: any }) {
         setActiveTab('overview');
       } else if (tabParam === 'materials') {
         setActiveTab('materials');
+      } else if (tabParam === 'weekdays' || tabParam === 'days') {
+        setActiveTab('weekdays');
       } else if (tabParam === 'cash_flow' || tabParam === 'daily_closing') {
         setActiveTab('cash_flow');
       } else if (tabParam === 'backups') {
@@ -1415,6 +1418,10 @@ export default function Reports({ profile }: { profile: any }) {
     return currentMat?.salePrice || 0;
   };
 
+  // Days of Week tab: the same sell price lookup, kept stable between renders.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const weekdaySalePriceFor = useCallback(getSellPriceForDay, [materials, dailySnapshots, pricingSnapshots]);
+
   const categoryCasingMap = useMemo(() => {
     const map: Record<string, string> = {};
     materials.forEach(m => {
@@ -2380,7 +2387,8 @@ export default function Reports({ profile }: { profile: any }) {
         </div>
       </div>
 
-      {/* Filters - Hidden on Print */}
+      {/* Filters - Hidden on Print. Days of Week has its own range picker. */}
+      {activeTab !== 'weekdays' && (
       <section className="flex flex-wrap items-center gap-4 bg-white p-4 rounded-2xl border border-slate-200 shadow-sm print:hidden" aria-label="Filters">
         <div className="flex items-center gap-2 text-slate-400 mr-2">
           <Filter className="w-4 h-4" aria-hidden="true" />
@@ -2424,10 +2432,11 @@ export default function Reports({ profile }: { profile: any }) {
           </div>
         )}
       </section>
+      )}
 
       {/* Tab Navigation */}
       <nav className="flex border-b border-slate-200 print:hidden" aria-label="Report sections">
-        {(['overview', 'materials', 'sales', 'cash_flow', 'compliance', 'backups', 'history'] as const).map((tab) => (
+        {(['overview', 'materials', 'sales', 'weekdays', 'cash_flow', 'compliance', 'backups', 'history'] as const).map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -2438,7 +2447,7 @@ export default function Reports({ profile }: { profile: any }) {
                 : "text-slate-400 hover:text-slate-600"
             )}
           >
-            {tab === 'history' ? 'Audit Logs' : tab === 'compliance' ? 'Ohio Compliance & XML' : tab === 'cash_flow' ? 'Cash Flow' : tab === 'sales' ? 'Est. Sales & Profits' : tab}
+            {tab === 'history' ? 'Audit Logs' : tab === 'compliance' ? 'Ohio Compliance & XML' : tab === 'cash_flow' ? 'Cash Flow' : tab === 'sales' ? 'Est. Sales & Profits' : tab === 'weekdays' ? 'Days of Week' : tab}
             {activeTab === tab && (
               <div className="absolute bottom-0 left-0 right-0 h-1 bg-blue-600 rounded-t-full" aria-hidden="true" />
             )}
@@ -2533,6 +2542,8 @@ export default function Reports({ profile }: { profile: any }) {
       </div>
     </>
   )}
+
+      {activeTab === 'weekdays' && <WeekdayReportTab salePriceFor={weekdaySalePriceFor} />}
 
       {activeTab === 'sales' && (
         <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
