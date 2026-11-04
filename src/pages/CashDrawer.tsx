@@ -70,6 +70,7 @@ import { buildLedgerRows, LedgerRow } from '../lib/ledgerRows';
 import { ticketsAfterCount, sameDenominations } from '../lib/countTiming';
 import CashLedgerTable from '../components/CashLedgerTable';
 import { TicketPayoutExpander } from '../components/TicketPayoutExpander';
+import ManagerPinModal from '../components/ManagerPinModal';
 
 interface CashDrawerProps {
   profile: UserProfile | null;
@@ -2542,6 +2543,8 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
 
   const [editingTransaction, setEditingTransaction] = useState<CashTransaction | null>(null);
+  // Entry waiting for a Manager PIN before it is deleted (Balance Sheet and Register Dashboard).
+  const [pendingDeleteTx, setPendingDeleteTx] = useState<CashTransaction | null>(null);
 
   const handleQuickCloseSession = async (session: CashSession) => {
     if (!profile) return;
@@ -3056,10 +3059,16 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     }
   };
 
+  // The Manager PIN prompt is the confirmation. The deleted entry is kept in full in the audit
+  // log; the day's stored expectedCash/overShort follow via the background writer (locked formulas).
+  const requestDeleteTransaction = (id: string) => {
+    const tx = transactions.find(t => t.id === id);
+    if (tx) setPendingDeleteTx(tx);
+  };
+
   const handleDeleteTransaction = async (id: string) => {
     const tx = transactions.find(t => t.id === id);
     if (!tx) return;
-    if (!window.confirm('Are you sure you want to delete this transaction? This will affect your expected balance.')) return;
     try {
       await deleteDoc(doc(db, 'cashTransactions', id));
 
@@ -3069,7 +3078,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         id,
         'delete',
         { before: tx, after: null },
-        `Deleted cash drawer transaction of $${tx.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${tx.type === 'inflow' ? 'Inflow' : 'Expense'} (${tx.category}) originally logged by ${tx.performedBy}`
+        `Deleted cash drawer transaction of $${tx.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${tx.type === 'inflow' ? 'Inflow' : 'Expense'} (${tx.category}) originally logged by ${tx.performedBy} (approved with Manager PIN)`
       );
 
       firestore(
@@ -4404,13 +4413,15 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                     >
                                       <Edit2 className="w-4 h-4" />
                                     </button>
-                                    <button 
-                                      onClick={() => handleDeleteTransaction(tx.id)}
-                                      className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
-                                      title="Delete Transaction"
-                                    >
-                                      <Trash2 className="w-4 h-4" />
-                                    </button>
+                                    {profile?.role === 'manager' && (
+                                      <button
+                                        onClick={() => requestDeleteTransaction(tx.id)}
+                                        className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
+                                        title="Delete Transaction (Manager PIN)"
+                                      >
+                                        <Trash2 className="w-4 h-4" />
+                                      </button>
+                                    )}
                                   </div>
                                 )}
 
@@ -4938,7 +4949,19 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                                       </div>
                                     </td>
                                     <td className="px-2 py-2 text-center font-mono text-[11px] font-black text-slate-400">
-                                      {item.initials || '-'}
+                                      <div className="flex items-center justify-center gap-1">
+                                        <span>{item.initials || '-'}</span>
+                                        {item.id && !item.isTicketPayoutLine && profile?.role === 'manager' && (
+                                          <button
+                                            type="button"
+                                            onClick={() => requestDeleteTransaction(item.id!)}
+                                            className="p-1 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all print:hidden"
+                                            title="Delete entry (Manager PIN)"
+                                          >
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                          </button>
+                                        )}
+                                      </div>
                                     </td>
                                   </tr>
                                 );
@@ -6942,6 +6965,18 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
       
       {/* Edit Transaction Modal */}
+      <ManagerPinModal
+        isOpen={!!pendingDeleteTx}
+        onClose={() => setPendingDeleteTx(null)}
+        onSuccess={() => {
+          if (pendingDeleteTx) handleDeleteTransaction(pendingDeleteTx.id);
+        }}
+        title="Delete Cash Entry"
+        message={pendingDeleteTx
+          ? `Delete the $${pendingDeleteTx.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${pendingDeleteTx.type === 'inflow' ? 'cash in' : 'cash out'} entry (${pendingDeleteTx.category}${pendingDeleteTx.notes ? ` — ${pendingDeleteTx.notes}` : ''}) from ${selectedSession?.date ?? 'this day'}? This changes the day's expected cash. The entry stays in the audit log.`
+          : ''}
+      />
+
       {editingTransaction && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 overflow-y-auto flex items-start justify-center p-4 sm:p-6 md:p-10">
           <div className="bg-white rounded-[2.5rem] p-10 max-w-md w-full shadow-2xl animate-in zoom-in-95 duration-200 border border-slate-200 my-8 sm:my-12">
