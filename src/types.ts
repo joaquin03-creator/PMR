@@ -50,6 +50,8 @@ export interface Material {
   updatedAt: string;
   updatedBy?: string; // user email or name
   updatedByUid?: string;
+  /** Prices the Google Sheet gave this material at the last sync (see lib/priceSyncWarning.ts). */
+  sheetSync?: { at: string; buyPrice: number; salePrice: number };
 }
 
 export interface Customer {

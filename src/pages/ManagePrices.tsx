@@ -13,6 +13,7 @@ import { UserProfile } from '../types';
 
 import { handleFirestoreError, OperationType } from '../lib/firestore-errors';
 import { logAuditEvent } from '../lib/audit';
+import { changedInAppSinceSync, latestSyncTime } from '../lib/priceSyncWarning';
 import { useToast } from '../context/ToastContext';
 
 interface ManagePricesProps {
@@ -69,6 +70,9 @@ export default function ManagePrices({ profile }: ManagePricesProps) {
   const [previewItems, setPreviewItems] = useState<any[] | null>(null);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [committingSync, setCommittingSync] = useState(false);
+  // Prices changed in the app since the last sync keep the app price unless their code is here.
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [overwriteAppCodes, setOverwriteAppCodes] = useState<Set<string>>(new Set());
 
   // Storage Optimization State
   const [optimizing, setOptimizing] = useState(false);
@@ -117,6 +121,7 @@ export default function ManagePrices({ profile }: ManagePricesProps) {
       if (snap.exists() && snap.data().googleSheetUrl) {
         setSheetId(snap.data().googleSheetUrl);
       }
+      setLastSyncedAt(snap.exists() ? snap.data().pricingLastSyncedAt || null : null);
 
     }, (error) => {
       console.warn('System config snapshot failed in ManagePrices (using default/cached config):', error.message);
@@ -422,6 +427,7 @@ To fix this:
       setMappedCategory(discoveredCategory);
       setMappedUnit(discoveredUnit);
 
+      setOverwriteAppCodes(new Set());
       setShowPreviewModal(true);
 
     } catch (error: any) {
@@ -454,15 +460,27 @@ To fix this:
       const batch = writeBatch(db);
       let updatedCount = 0;
       let createdCount = 0;
+      let keptCount = 0;
+      // What the sheet said this time, so the next sync can tell a price changed in the app.
+      const syncedAt = new Date().toISOString();
 
       for (const item of previewItems) {
-        if (item.status === 'ignored' || item.status === 'unchanged') continue;
+        if (item.status === 'ignored') continue;
+        const sheetSync = { at: syncedAt, buyPrice: item.newBuyPrice, salePrice: item.newSalePrice };
 
         const material = materials.find(m => m.code.toUpperCase() === item.code.toUpperCase());
+        if (material && (item.status === 'unchanged' || keepsAppPrice(item))) {
+          batch.update(doc(db, 'materials', material.id), { sheetSync });
+          if (item.status !== 'unchanged') keptCount++;
+          continue;
+        }
+        if (item.status === 'unchanged') continue;
+
         if (material) {
           const updates: any = {
             buyPrice: item.newBuyPrice,
             salePrice: item.newSalePrice,
+            sheetSync,
             updatedAt: new Date().toISOString(),
             updatedBy: profile?.displayName || profile?.email || 'System',
             updatedByUid: profile?.uid || 'system'
@@ -483,6 +501,7 @@ To fix this:
             buyPrice: item.newBuyPrice,
             salePrice: item.newSalePrice,
             unit: item.unit,
+            sheetSync,
             updatedAt: new Date().toISOString(),
             updatedBy: profile?.displayName || profile?.email || 'System',
             updatedByUid: profile?.uid || 'system'
@@ -505,18 +524,20 @@ To fix this:
         console.warn('Unable to persist googleSheetUrl globally, continuing:', e);
       }
 
+      const keptNote = keptCount > 0 ? ` Kept the app price on ${keptCount} changed in the app.` : '';
       firestore(
         'Database Synced',
-        `Google Sheets sync successfully committed to Cloud Firestore: Updated ${updatedCount} and Created ${createdCount} material records.`
+        `Google Sheets sync successfully committed to Cloud Firestore: Updated ${updatedCount} and Created ${createdCount} material records.${keptNote}`
       );
 
-      setSyncStatus({ 
-        type: 'success', 
-        message: `Sync Applied: Updated ${updatedCount} and Created ${createdCount} material records.` 
+      setSyncStatus({
+        type: 'success',
+        message: `Sync Applied: Updated ${updatedCount} and Created ${createdCount} material records.${keptNote}`
       });
       setShowPreviewModal(false);
       setRawParsedRows([]);
       setPreviewItems(null);
+      setOverwriteAppCodes(new Set());
     } catch (err: any) {
       console.error('Error committing sync:', err);
       toastError('Sync Failed', `Google Sheets sync failed: ${err.message || err}`);
@@ -524,6 +545,30 @@ To fix this:
     } finally {
       setCommittingSync(false);
     }
+  };
+
+  // When the sheet last set prices: the stored sync time, or the newest pre-sync snapshot.
+  const syncReferenceTime = useMemo(
+    () => latestSyncTime(lastSyncedAt, snapshots.find(s => s.source === 'google_sheets')?.timestamp),
+    [lastSyncedAt, snapshots]
+  );
+
+  // A price changed in the app since the last sync keeps the app price unless the row is
+  // switched to the sheet's price (2026-11-04: a sync of a stale sheet overwrote 49 hand-set prices).
+  const keepsAppPrice = (item: any) =>
+    item.status === 'update' && item.changedInApp && !overwriteAppCodes.has(String(item.code).toUpperCase());
+  const setUseSheetPrice = (codes: string[], useSheet: boolean) =>
+    setOverwriteAppCodes(prev => {
+      const next = new Set(prev);
+      codes.forEach(c => (useSheet ? next.add(String(c).toUpperCase()) : next.delete(String(c).toUpperCase())));
+      return next;
+    });
+  const appChangeLabel = (item: any) => {
+    const who = item.appUpdatedBy ? String(item.appUpdatedBy).split('@')[0] : '';
+    const when = item.appUpdatedAt && !Number.isNaN(Date.parse(item.appUpdatedAt))
+      ? new Date(item.appUpdatedAt).toLocaleString([], { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+      : '';
+    return [who, when].filter(Boolean).join(' · ');
   };
 
   useEffect(() => {
@@ -562,7 +607,10 @@ To fix this:
             newSalePrice: finalSale,
             isNew: false,
             hasDiff,
-            status: hasDiff ? 'update' : 'unchanged'
+            status: hasDiff ? 'update' : 'unchanged',
+            changedInApp: hasDiff && changedInAppSinceSync(material, syncReferenceTime),
+            appUpdatedBy: material.updatedBy,
+            appUpdatedAt: material.updatedAt
           };
         } else if (isSeedingMode) {
           const finalUnit = (unitVal === 'ton' || unitVal === 'tons') ? 'ton' : 'lb';
@@ -596,7 +644,7 @@ To fix this:
     } else {
       setPreviewItems(null);
     }
-  }, [rawParsedRows, mappedCode, mappedBuy, mappedSale, mappedName, mappedCategory, mappedUnit, isSeedingMode, materials]);
+  }, [rawParsedRows, mappedCode, mappedBuy, mappedSale, mappedName, mappedCategory, mappedUnit, isSeedingMode, materials, syncReferenceTime]);
 
   const revertToSnapshot = async (snapshot: PricingSnapshot) => {
     if (!confirmRevert || confirmRevert.id !== snapshot.id) {
@@ -1724,8 +1772,11 @@ To fix this:
                 <div className="bg-indigo-50 border border-indigo-100/50 p-3 rounded-2xl">
                   <p className="text-[10px] font-bold text-indigo-505 uppercase tracking-wider block">Price Updates</p>
                   <p className="text-xl font-black text-indigo-700">
-                    {previewItems?.filter(i => i.status === 'update').length || 0} items
+                    {previewItems?.filter(i => i.status === 'update' && !keepsAppPrice(i)).length || 0} items
                   </p>
+                  {(previewItems?.filter(keepsAppPrice).length || 0) > 0 && (
+                    <p className="text-[10px] font-bold text-amber-700">+ {previewItems?.filter(keepsAppPrice).length} keeping app price</p>
+                  )}
                 </div>
                 <div className="bg-emerald-50 border border-emerald-100/50 p-3 rounded-2xl">
                   <p className="text-[10px] font-bold text-emerald-600 uppercase tracking-wider block">New Materials</p>
@@ -1740,6 +1791,49 @@ To fix this:
                   </p>
                 </div>
               </div>
+
+              {(() => {
+                const changed = previewItems?.filter(i => i.status === 'update' && i.changedInApp) || [];
+                if (changed.length === 0) return null;
+                const kept = changed.filter(keepsAppPrice).length;
+                return (
+                  <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 flex flex-col md:flex-row md:items-center gap-3 justify-between">
+                    <div className="flex gap-3 items-start">
+                      <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                      <div className="text-xs">
+                        <p className="font-black text-amber-900 uppercase tracking-tight">
+                          {changed.length} price{changed.length === 1 ? ' was' : 's were'} changed in the app since the last sheet sync
+                        </p>
+                        <p className="text-amber-800 font-medium mt-0.5">
+                          The sheet may not have those changes.{' '}
+                          {kept === changed.length
+                            ? 'They keep the app price unless you switch a row to the sheet price.'
+                            : `${changed.length - kept} will take the sheet price; ${kept} keep the app price.`}
+                          {syncReferenceTime && ` Last sync: ${new Date(syncReferenceTime).toLocaleString([], { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })}.`}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setUseSheetPrice(changed.map(i => i.code), false)}
+                        disabled={kept === changed.length}
+                        className="px-3 py-2 bg-white border border-amber-300 text-amber-800 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-amber-100 disabled:opacity-40"
+                      >
+                        Keep All App Prices
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setUseSheetPrice(changed.map(i => i.code), true)}
+                        disabled={kept === 0}
+                        className="px-3 py-2 bg-white border border-indigo-200 text-indigo-700 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-indigo-50 disabled:opacity-40"
+                      >
+                        Use Sheet for All
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Column Override drop-downs (details expandable) */}
               <details className="group bg-slate-50/50 border border-slate-200/60 rounded-2xl p-4 cursor-pointer">
@@ -1850,7 +1944,7 @@ To fix this:
                         className={cn(
                           "hover:bg-slate-50/50 transition-colors",
                           item.status === 'create' ? "bg-emerald-50/15" : "",
-                          item.status === 'update' ? "bg-indigo-50/10" : ""
+                          item.status === 'update' ? (item.changedInApp ? "bg-amber-50/40" : "bg-indigo-50/10") : ""
                         )}
                       >
                         <td className="p-4">
@@ -1866,6 +1960,11 @@ To fix this:
                         <td className="p-4 text-right text-slate-900">
                           {item.status === 'create' ? (
                             <span className="text-emerald-600 font-bold">${item.newBuyPrice.toFixed(2)}</span>
+                          ) : keepsAppPrice(item) && item.currentBuyPrice !== item.newBuyPrice ? (
+                            <div className="flex flex-col items-end">
+                              <span className="text-amber-700 font-bold">${item.currentBuyPrice?.toFixed(2)}</span>
+                              <span className="text-[10px] text-slate-400">sheet ${item.newBuyPrice.toFixed(2)}</span>
+                            </div>
                           ) : item.status === 'update' && item.currentBuyPrice !== item.newBuyPrice ? (
                             <div className="flex flex-col items-end">
                               <span className="text-xs text-slate-400 line-through">${item.currentBuyPrice?.toFixed(2)}</span>
@@ -1878,6 +1977,11 @@ To fix this:
                         <td className="p-4 text-right text-slate-900">
                           {item.status === 'create' ? (
                             <span className="text-emerald-600 font-bold">${item.newSalePrice.toFixed(2)}</span>
+                          ) : keepsAppPrice(item) && item.currentSalePrice !== item.newSalePrice ? (
+                            <div className="flex flex-col items-end">
+                              <span className="text-amber-700 font-bold">${item.currentSalePrice?.toFixed(2)}</span>
+                              <span className="text-[10px] text-slate-400">sheet ${item.newSalePrice.toFixed(2)}</span>
+                            </div>
                           ) : item.status === 'update' && item.currentSalePrice !== item.newSalePrice ? (
                             <div className="flex flex-col items-end">
                               <span className="text-xs text-slate-400 line-through">${item.currentSalePrice?.toFixed(2)}</span>
@@ -1888,7 +1992,26 @@ To fix this:
                           )}
                         </td>
                         <td className="p-4 text-center">
-                          {item.status === 'update' ? (
+                          {item.status === 'update' && item.changedInApp ? (
+                            <div className="flex flex-col items-center gap-1">
+                              <span className={cn(
+                                "inline-block px-3 py-1 border rounded-full text-[10px] font-black uppercase tracking-wider",
+                                keepsAppPrice(item) ? "bg-amber-50 border-amber-200 text-amber-800" : "bg-indigo-50 border-indigo-100 text-indigo-700"
+                              )}>
+                                {keepsAppPrice(item) ? 'Keep App Price' : 'Use Sheet Price'}
+                              </span>
+                              <span className="text-[10px] font-bold text-amber-700">
+                                Changed in app{appChangeLabel(item) ? ` · ${appChangeLabel(item)}` : ''}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setUseSheetPrice([item.code], keepsAppPrice(item))}
+                                className="text-[10px] font-bold text-blue-600 hover:underline"
+                              >
+                                {keepsAppPrice(item) ? 'Use sheet price instead' : 'Keep app price instead'}
+                              </button>
+                            </div>
+                          ) : item.status === 'update' ? (
                             <span className="inline-block px-3 py-1 bg-indigo-50 border border-indigo-100 text-indigo-700 rounded-full text-[10px] font-black uppercase tracking-wider">
                               Update Price
                             </span>
