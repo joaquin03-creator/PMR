@@ -112,6 +112,38 @@ async function startServer() {
     }
   });
 
+  // Public price feed for the website scrap calculator (joaquin03-creator.github.io/PMR_ScrapCal).
+  // Serves ONLY the buy price of the allowlisted material codes -- never sale prices, margins
+  // or any other material. Cached briefly so visitors don't each cost a database read.
+  const PUBLIC_PRICE_CODES = ["2", "3", "4", "611", "6", "42", "250", "8", "81", "13", "14", "20", "18"];
+  const PUBLIC_PRICE_TTL_MS = 60 * 1000;
+  let publicPriceCache: { at: number; body: { asOf: string; prices: Record<string, number> } } | null = null;
+
+  app.get("/api/public-prices", async (_req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    try {
+      if (!publicPriceCache || Date.now() - publicPriceCache.at > PUBLIC_PRICE_TTL_MS) {
+        const snap = await getFirestore(firebaseConfig.firestoreDatabaseId)
+          .collection("materials")
+          .where("code", "in", PUBLIC_PRICE_CODES)
+          .get();
+        const prices: Record<string, number> = {};
+        snap.forEach((d) => {
+          const { code, buyPrice } = d.data();
+          if (typeof code === "string" && typeof buyPrice === "number" && buyPrice > 0) prices[code] = buyPrice;
+        });
+        publicPriceCache = { at: Date.now(), body: { asOf: new Date().toISOString(), prices } };
+      }
+      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=120");
+      res.json(publicPriceCache.body);
+    } catch (error: any) {
+      console.error("Public price feed error:", error.message);
+      res.setHeader("Cache-Control", "no-store");
+      res.status(503).json({ error: "Prices unavailable" });
+    }
+  });
+
   // Secure Camera Proxy to bypass CORS & HTTPS Mixed Content blocks (for public DDNS/Port-Forwarded NVRs)
   app.get("/api/camera-proxy", async (req, res) => {
     const { url } = req.query;
