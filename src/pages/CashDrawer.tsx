@@ -154,6 +154,22 @@ const ensureDenomTotals = (denoms: DenominationCount | undefined | null): Denomi
   return converted;
 };
 
+// The count of record is the stored total (actualCash / openingCash -- over/short is built on
+// it). A bill breakdown only describes that count when the two add up: Quick Cash Input used
+// to save a total and leave an earlier breakdown in place, so older days can carry a breakdown
+// from a different count, or none at all. Display only -- nothing stored is changed.
+const breakdownMatchingTotal = (denoms: DenominationCount | undefined | null, total: number | undefined | null): DenominationCount | null => {
+  if (!denoms) return null;
+  const converted = ensureDenomTotals(denoms);
+  if (total === undefined || total === null) return converted;
+  return Math.abs(lockedDenomTotal(converted) - total) <= 0.01 ? converted : null;
+};
+
+// A closed count with no breakdown that adds up to it ("entered as a total").
+const isTotalOnlyClose = (session: CashSession | null | undefined): boolean =>
+  !!session && !isProvisionalSession(session) && typeof session.actualCash === 'number' &&
+  !breakdownMatchingTotal(session.closingDenominations, session.actualCash);
+
 interface DenominationEditorProps {
   values: DenominationCount;
   onChange: (newValues: DenominationCount) => void;
@@ -673,9 +689,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         }
       }
 
-      // Load opening denominations
-      if (selectedSession.openingDenominations) {
-        setEditedOpeningDenoms(ensureDenomTotals(selectedSession.openingDenominations));
+      // Load opening denominations (only a breakdown that adds up to the opening cash)
+      const openingBreakdown = breakdownMatchingTotal(selectedSession.openingDenominations, selectedSession.openingCash);
+      if (openingBreakdown) {
+        setEditedOpeningDenoms(openingBreakdown);
+      } else if (selectedSession.openingDenominations) {
+        setEditedOpeningDenoms(initialDenominations);
       } else {
         const savedOpeningDraft = localStorage.getItem(`cash_opening_denoms_draft_${selectedSession.id}`);
         if (savedOpeningDraft) {
@@ -689,10 +708,14 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         }
       }
 
-      // Load from Firestore first (single source of truth for physical count)
-      const targetClosing = selectedSession.closingDenominations || (selectedSession.id === activeSession?.id ? activeSession?.closingDenominations : undefined);
+      // Load from Firestore first (single source of truth for physical count). A count entered
+      // as a total shows no breakdown -- never an earlier count's, nor a local draft.
+      const closingSource = selectedSession.closingDenominations ? selectedSession : (selectedSession.id === activeSession?.id ? activeSession : null);
+      const targetClosing = closingSource ? breakdownMatchingTotal(closingSource.closingDenominations, closingSource.actualCash) : null;
       if (targetClosing) {
-        setPhysicalCountDenoms(ensureDenomTotals(targetClosing));
+        setPhysicalCountDenoms(targetClosing);
+      } else if (isTotalOnlyClose(selectedSession)) {
+        setPhysicalCountDenoms(initialDenominations);
       } else {
         // Fallback: check localStorage for local unsaved progress
         const savedDraft = localStorage.getItem(`cash_physical_count_draft_${selectedSession.id}`)
@@ -711,9 +734,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
 
       serverBaselineRef.current = {
         sessionId: selectedSession.id,
-        count: JSON.stringify(targetClosing ? ensureDenomTotals(targetClosing) : initialDenominations),
+        count: JSON.stringify(targetClosing ?? initialDenominations),
         openingCash: selectedSession.openingCash || 0,
-        openingDenoms: JSON.stringify(selectedSession.openingDenominations ? ensureDenomTotals(selectedSession.openingDenominations) : initialDenominations)
+        openingDenoms: JSON.stringify(openingBreakdown ?? initialDenominations)
       };
     } else {
       serverBaselineRef.current = null;
@@ -902,9 +925,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     if (showCloseModal && target) {
       const isCountEmpty = Object.values(physicalCountDenoms).every(v => !v || v === 0);
       if (isCountEmpty) {
-        if (target.closingDenominations) {
-          setPhysicalCountDenoms(ensureDenomTotals(target.closingDenominations));
-        } else {
+        const breakdown = breakdownMatchingTotal(target.closingDenominations, target.actualCash);
+        if (breakdown) {
+          setPhysicalCountDenoms(breakdown);
+        } else if (!isTotalOnlyClose(target)) {
           const saved = localStorage.getItem(`cash_physical_count_draft_${target.id}`)
             || localStorage.getItem(`cash_sheet_denoms_draft_${target.id}`)
             || localStorage.getItem(`cash_close_denoms_draft_${target.id}`);
@@ -946,9 +970,13 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     if (showStartModal && mostRecentClosedSession) {
       // Provisional prior day: carry the ASSUMED figure, and ignore any leftover
       // partial denomination count on it (it was never a completed physical count).
+      // A count entered as a total carries the total only, never an older breakdown.
       const priorBasis = getClosingBasis(mostRecentClosedSession) || 0;
-      if (!isProvisionalSession(mostRecentClosedSession) && mostRecentClosedSession.closingDenominations) {
-        setOpeningDenoms(ensureDenomTotals(mostRecentClosedSession.closingDenominations));
+      const priorBreakdown = isProvisionalSession(mostRecentClosedSession)
+        ? null
+        : breakdownMatchingTotal(mostRecentClosedSession.closingDenominations, mostRecentClosedSession.actualCash);
+      if (priorBreakdown) {
+        setOpeningDenoms(priorBreakdown);
       } else {
         setOpeningDenoms({
           ...initialDenominations,
@@ -1132,18 +1160,22 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     setProcessing(true);
     const openingCash = Math.round(editedOpeningCash * 100) / 100;
     const expectedCashVal = Math.round((openingCash + totalReplenishments - totalPayouts - totalExpenses) * 100) / 100;
-    const actualCash = Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
+    // A count entered as a total with no bills typed here stays that total (never $0.00).
+    const actualCash = keepsEnteredTotal
+      ? Math.round((selectedSession.actualCash ?? 0) * 100) / 100
+      : Math.round(calculateDenomTotal(physicalCountDenoms) * 100) / 100;
     const overShort = Math.round((actualCash - expectedCashVal) * 100) / 100;
     // Only a changed count moves the "counted at" time; saving the same figures again does not.
-    const countChanged = !sameDenominations(physicalCountDenoms, selectedSession.closingDenominations);
+    const countChanged = !keepsEnteredTotal && !sameDenominations(physicalCountDenoms, selectedSession.closingDenominations);
     const countStamp = countChanged ? { closingCountUpdatedAt: new Date().toISOString() } : {};
+    const countFields = keepsEnteredTotal ? {} : { closingDenominations: physicalCountDenoms };
     try {
       await updateDoc(doc(db, 'cashSessions', selectedSession.id), {
         openingCash,
         expectedCash: expectedCashVal,
         actualCash,
         overShort,
-        closingDenominations: physicalCountDenoms,
+        ...countFields,
         ...countStamp
       });
 
@@ -1163,9 +1195,9 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           after: { 
             openingCash,
             expectedCash: expectedCashVal,
-            actualCash, 
+            actualCash,
             overShort,
-            closingDenominations: physicalCountDenoms
+            closingDenominations: keepsEnteredTotal ? (selectedSession.closingDenominations || null) : physicalCountDenoms
           }
         },
         selectedSession.status === 'closed'
@@ -1180,7 +1212,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         expectedCash: expectedCashVal,
         actualCash,
         overShort,
-        closingDenominations: physicalCountDenoms,
+        ...countFields,
         ...countStamp
       } : null);
 
@@ -1946,6 +1978,16 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
   // value: 2026-10-15 autosaved $465,020 for $6,201 entered. ensureDenomTotals stays for
   // loading stored records only.
   const calculateDenomTotal = (denoms: DenominationCount) => lockedDenomTotal(denoms);
+
+  // A day whose count was entered as a total: until bills are typed in, the sheet shows that
+  // total (and the over/short built on it) instead of $0.00 or an earlier count's breakdown.
+  const closeIsTotalOnly = isTotalOnlyClose(selectedSession);
+  const enteredCountTotal = calculateDenomTotal(physicalCountDenoms);
+  const keepsEnteredTotal = closeIsTotalOnly && enteredCountTotal === 0;
+  const shownPhysicalCount = keepsEnteredTotal ? (selectedSession?.actualCash ?? 0) : enteredCountTotal;
+  const totalOnlyCountNote = !closeIsTotalOnly ? null : keepsEnteredTotal
+    ? 'Entered as a total — no bill breakdown on file.'
+    : `Saving replaces the $${(selectedSession?.actualCash ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })} total with this breakdown.`;
 
   // The Finalize Provisional pop-up takes bill/coin COUNTS; convert to dollar amounts
   // before totalling or storing, like every other count form.
@@ -2899,8 +2941,13 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
     e.preventDefault();
     const targetSession = selectedSession || activeSession;
     if (!targetSession || !profile) return;
+    // An empty bill count would replace a total already on file with $0.00.
+    if (useClosingDenoms && isTotalOnlyClose(targetSession) && calculateDenomTotal(physicalCountDenoms) === 0) {
+      toastError('No Bills Entered', `${targetSession.date}'s count of $${(targetSession.actualCash ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })} was entered as a total. Enter the bills, or use Quick Cash Input to keep or change the total.`);
+      return;
+    }
     setProcessing(true);
-    
+
     const formData = new FormData(e.currentTarget);
     let actualCash = 0;
     if (useClosingDenoms) {
@@ -2929,7 +2976,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
           : {})
       };
 
-      await updateDoc(doc(db, 'cashSessions', targetSession.id), closedData);
+      // A typed total is the whole count: an earlier bill breakdown no longer describes it.
+      await updateDoc(doc(db, 'cashSessions', targetSession.id), useClosingDenoms
+        ? closedData
+        : { ...closedData, closingDenominations: deleteField() });
 
       // Track in Audit Log
       await logAuditEvent(
@@ -2943,9 +2993,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
         `Closed and finalized cash drawer session for ${targetSession.date || todayStr}. Actual cash counted: $${actualCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}. Over/Short: $${overShort.toLocaleString(undefined, { minimumFractionDigits: 2 })}. Notes: ${notes || 'None'}`
       );
 
-      setSelectedSession(prev => prev && prev.id === targetSession.id ? { ...prev, ...closedData } : prev);
+      const closedState = useClosingDenoms ? closedData : { ...closedData, closingDenominations: undefined };
+      setSelectedSession(prev => prev && prev.id === targetSession.id ? { ...prev, ...closedState } : prev);
       if (activeSession && activeSession.id === targetSession.id) {
-        setActiveSession(prev => prev ? { ...prev, ...closedData } : null);
+        setActiveSession(prev => prev ? { ...prev, ...closedState } : null);
       }
 
       clearSessionDrafts(targetSession.id);
@@ -4128,7 +4179,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                    <h3 className="text-3xl font-black text-slate-900 font-mono">
                     ${selectedSession.openingCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                   </h3>
-                  {selectedSession.openingDenominations && (
+                  {breakdownMatchingTotal(selectedSession.openingDenominations, selectedSession.openingCash) && (
                     <button
                       onClick={() => setViewingDenoms({
                         title: 'Opening Cash Count Breakdown',
@@ -4522,7 +4573,10 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                               );
                             })()}
                           </div>
-                          {selectedSession.closingDenominations && (
+                          {closeIsTotalOnly && (
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest text-center">Entered as a total — no bill breakdown</p>
+                          )}
+                          {selectedSession.closingDenominations && !closeIsTotalOnly && (
                             <button
                               onClick={() => setViewingDenoms({
                                 title: 'Closing Physical Cash Count Breakdown',
@@ -4593,7 +4647,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mt-0.5">Edit drawer denominations</p>
                       </div>
                       <span className="font-mono font-black text-xs text-slate-900 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200">
-                        ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                        ${shownPhysicalCount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                       </span>
                     </div>
 
@@ -4746,9 +4800,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                       <div className="flex justify-between items-center text-xs">
                         <span className="font-bold text-slate-400 uppercase">Coin & Bill Total</span>
                         <span className="font-mono font-black text-slate-900">
-                          ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                          ${shownPhysicalCount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                         </span>
                       </div>
+                      {totalOnlyCountNote && (
+                        <p className="text-[10px] font-bold text-amber-700 text-right">{totalOnlyCountNote}</p>
+                      )}
                       {isProvisionalSession(selectedSession) ? (
                         <div className="flex justify-between items-center text-xs pb-2">
                           <span className="font-bold text-slate-400 uppercase">Over / Short</span>
@@ -4757,7 +4814,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                           </span>
                         </div>
                       ) : (() => {
-                        const totalCount = calculateDenomTotal(physicalCountDenoms);
+                        const totalCount = shownPhysicalCount;
                         const diff = Math.round((totalCount - expectedCash) * 100) / 100;
                         const status = getShortageStatus(diff, buyTickets.length);
                         return (
@@ -5018,9 +5075,12 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                         <div className="flex justify-between items-center py-1.5 border-t border-dashed border-slate-200 col-span-2">
                           <span className="font-bold text-slate-500 uppercase">Total Cash On-Hand (Physical)</span>
                           <span className="font-mono font-black text-slate-900 text-sm">
-                            ${calculateDenomTotal(physicalCountDenoms).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                            ${shownPhysicalCount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                           </span>
                         </div>
+                        {totalOnlyCountNote && (
+                          <p className="col-span-2 -mt-2 text-[10px] font-bold text-amber-700 text-right print:hidden">{totalOnlyCountNote}</p>
+                        )}
                         {isProvisionalSession(selectedSession) ? (
                           <div className="flex justify-between items-center py-2.5 border-t-2 border-slate-300 col-span-2 bg-white rounded-xl px-4 border border-slate-200">
                             <span className="font-black text-slate-800 uppercase text-xs">Over / Short</span>
@@ -5029,7 +5089,7 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                             </span>
                           </div>
                         ) : (() => {
-                          const totalCount = calculateDenomTotal(physicalCountDenoms);
+                          const totalCount = shownPhysicalCount;
                           const diff = Math.round((totalCount - sheetExpectedCash) * 100) / 100;
                           const status = getShortageStatus(diff, buyTickets.length);
                           return (
@@ -6177,8 +6237,11 @@ export default function CashDrawer({ profile }: CashDrawerProps) {
                   onClick={() => {
                     const priorBasis = getClosingBasis(mostRecentClosedSession) || 0;
                     if (useOpeningDenoms) {
-                      if (!isProvisionalSession(mostRecentClosedSession) && mostRecentClosedSession.closingDenominations) {
-                        setOpeningDenoms(ensureDenomTotals(mostRecentClosedSession.closingDenominations));
+                      const priorBreakdown = isProvisionalSession(mostRecentClosedSession)
+                        ? null
+                        : breakdownMatchingTotal(mostRecentClosedSession.closingDenominations, mostRecentClosedSession.actualCash);
+                      if (priorBreakdown) {
+                        setOpeningDenoms(priorBreakdown);
                       } else {
                         // fallback if no denom breakdown was stored (or prior day is provisional: no count exists)
                         setOpeningDenoms({
