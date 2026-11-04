@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "deploy:backend": "gcloud run deploy pmr-app --source . --region us-central1 --allow-unauthenticated --project gen-lang-client-0857392953",
+    "deploy:backend": "gcloud run deploy pmr-app --source . --region us-central1 --allow-unauthenticated --min-instances=1 --project gen-lang-client-0857392953",
     "deploy:hosting": "npm run build && npx -y firebase-tools deploy --only hosting,firestore:rules,storage --project gen-lang-client-0857392953",
     "deploy:frontend": "npm run build && npx -y firebase-tools deploy --only hosting --project gen-lang-client-0857392953",
     "deploy": "npm run deploy:backend && npm run deploy:hosting"
