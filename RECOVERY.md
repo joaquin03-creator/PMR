@@ -103,9 +103,59 @@ If the original Firebase project is lost or you are deploying to a fresh project
 > **Firestore data is NOT stored in this Git repository.**
 > Data persistence and disaster recovery for transactional records, customer logs, and tickets are managed directly by Google Cloud Firestore.
 
-- **Point-in-Time Recovery (PITR)**: Enabled on the Firestore database instance, providing continuous backup with 7-day retention for instant sub-second rollback.
-- **Scheduled Automated Exports**: Daily automated exports of all Firestore collections are written to a Google Cloud Storage bucket (`gs://<project-id>-firestore-backups/`).
-- **Restoration**: Detailed recovery procedures for restoring Firestore snapshots from Cloud Storage can be found in the system administration cloud run playbooks.
+> [!NOTE]
+> Until 2026-11-19 this section described PITR and nightly exports as already running. That was never verified. They are set up by `scripts/setup_firestore_backups.sh`. Run it in check mode to see what actually exists.
+
+### Setup (one time, owner login)
+
+```bash
+gcloud auth login
+bash scripts/setup_firestore_backups.sh           # check only: lists what exists and what is missing
+bash scripts/setup_firestore_backups.sh --apply   # creates what is missing (safe to re-run)
+gcloud scheduler jobs run pmr-firestore-nightly-export --location=us-central1   # first export now
+```
+
+What it creates in project `gen-lang-client-0857392953`:
+- **Point-in-time recovery** on the app's database (`ai-studio-661b304a-fc5e-4d72-a81e-fdbacdf1964c`): roll back to any minute in the last 7 days.
+- **Nightly export** of every collection at 11:30 PM Eastern (Cloud Scheduler job `pmr-firestore-nightly-export`) into `gs://gen-lang-client-0857392953-firestore-backups/`. Each night is its own timestamped folder.
+- **Retention:** exports are deleted automatically after 400 days. Ohio requires purchase records to be kept for at least one year (ORC 4737.04(C)).
+
+### Check that it is working (monthly, with the Monthly Safety Inspection)
+
+```bash
+gcloud storage ls gs://gen-lang-client-0857392953-firestore-backups/ | tail -3   # last night's folder should be listed
+gcloud scheduler jobs describe pmr-firestore-nightly-export --location=us-central1 --format='value(lastAttemptTime,status)'
+```
+
+### Restore
+
+Never import over the live database by accident. Restore into a separate database first, check it, then decide.
+
+```bash
+# 1. Pick the export folder (one per night)
+gcloud storage ls gs://gen-lang-client-0857392953-firestore-backups/
+
+# 2. Create an empty scratch database in the same location as the live one, and import into it
+gcloud firestore databases create --database=restore-check --location=<same location as live>
+gcloud firestore import gs://gen-lang-client-0857392953-firestore-backups/<FOLDER> --database=restore-check
+
+# 3. Spot-check in the Firebase console: buyTickets count, a known ticket with its photos, cashSessions for a known day.
+# 4. Only if the live data is truly lost: import the same folder into the live database (overwrites documents with the
+#    same ids, keeps everything else), or point firebase-applet-config.json at the restored database.
+# 5. Delete the scratch database when done: gcloud firestore databases delete --database=restore-check
+```
+
+For a mistake in the last 7 days (bad bulk edit, deleted documents), point-in-time recovery is faster: export the
+database as of a past minute with `gcloud firestore export gs://.../pitr-<date> --database=<live> --snapshot-time=<RFC3339>`
+and import only what you need into the scratch database.
+
+### Restore drill
+
+Do the restore steps above into `restore-check` once after setup and then twice a year. Write the date and the result here:
+
+| Date | Export folder | Result | By |
+|---|---|---|---|
+| | | | |
 
 ---
 
